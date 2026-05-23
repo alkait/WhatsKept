@@ -99,6 +99,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/workspace/create", s.handleCreateWorkspace)
 	mux.HandleFunc("POST /api/workspace/open", s.handleOpenWorkspace)
 	mux.HandleFunc("GET /api/workspace/current", s.handleCurrentWorkspace)
+	mux.HandleFunc("DELETE /api/workspace/current", s.handleDeleteWorkspace)
 
 	// Devices + backups
 	mux.HandleFunc("GET /api/devices", s.handleListDevices)
@@ -275,6 +276,55 @@ func (s *server) handleCurrentWorkspace(w http.ResponseWriter, _ *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusOK, describeWorkspace(cur))
+}
+
+// handleDeleteWorkspace permanently removes the active workspace's
+// directory tree (ChatStorage.sqlite, .whatskept.json, views.sql,
+// AGENTS.md, any media/voice/profiles subfolders, the .env, plus
+// anything else the user dropped in), drops it from the recent
+// list, clears the active-workspace pointer, and clears the cached
+// backup password.
+//
+// Refuses while any job is still running: deleting files out from
+// under an in-flight sync would either corrupt the staging DB or
+// leave half-written media on disk, both of which are worse than a
+// 409 telling the user to wait.
+//
+// Returns 204 on success. The frontend is expected to navigate back
+// to the workspace picker after observing the 204 — the in-memory
+// active workspace pointer is empty by then anyway.
+func (s *server) handleDeleteWorkspace(w http.ResponseWriter, _ *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+	if active := s.jobs.activeJob(); active != nil {
+		httpError(w, http.StatusConflict,
+			fmt.Sprintf("a %s job is still running; wait for it to finish before deleting the workspace", active.Task))
+		return
+	}
+
+	// Sanity-guard the path. We never accept a user-supplied path here
+	// (the active workspace was vetted by handleOpenWorkspace /
+	// handleCreateWorkspace), but a future bug could conceivably let
+	// an empty or root-y path through to RemoveAll. Refuse anything
+	// not absolute or suspiciously short — a real workspace path is
+	// always many segments long.
+	abs, err := filepath.Abs(cur)
+	if err != nil || abs != cur || len(strings.Trim(abs, "/")) < 3 {
+		httpError(w, http.StatusInternalServerError, "refusing to delete suspicious workspace path")
+		return
+	}
+
+	if err := os.RemoveAll(cur); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("delete workspace: %v", err))
+		return
+	}
+	removeRecent(cur)
+	s.ws.set("")
+	s.pw.clear()
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ---------------------------------------------------------------------------

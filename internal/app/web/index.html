@@ -177,7 +177,64 @@ function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
   );
 }
 
-// ── DeleteConfirmModal ────────────────────────────────────────────────────
+// ── WorkspaceDeleteModal ──────────────────────────────────────────────────
+// Confirms an os.RemoveAll of the active workspace directory. The
+// language is deliberately concrete ("local copy of WhatsApp data…")
+// rather than abstract ("this workspace") because the destruction is
+// unrecoverable — the next sync re-downloads from the encrypted iOS
+// backup, but anything the user customised in the workspace (notes,
+// agent state) is gone. onDeleted fires after the server's 204.
+function WorkspaceDeleteModal({ workspace, onClose, onDeleted }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const confirm = async () => {
+    setBusy(true);
+    try { await api.del("/api/workspace/current"); onDeleted(); }
+    catch(e) { setError(e.message); setBusy(false); }
+  };
+  const bound = workspace.binding;
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="w-[460px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-full flex items-center justify-center text-red-500" style={{background:'#fee2e2'}}><TrashIcon /></div>
+          <div>
+            <h2 className="text-base font-semibold text-gray-900">Delete workspace?</h2>
+            <p className="text-xs text-gray-500 mt-0.5">This cannot be undone.</p>
+          </div>
+        </div>
+        <div className="rounded-lg px-4 py-3 mb-4" style={{background:'#ECE5DD'}}>
+          {bound && (
+            <p className="text-sm font-medium text-gray-900">
+              {bound.device_name}
+              {bound.owner_jid && <span className="text-gray-500 font-normal ml-2">{phoneFromJID(bound.owner_jid)}</span>}
+            </p>
+          )}
+          <p className={`${bound ? "text-xs text-gray-500 mt-0.5" : "text-sm font-medium text-gray-900"} font-mono break-all`}>
+            {workspace.path}
+          </p>
+        </div>
+        <p className="text-sm text-gray-600 leading-relaxed mb-4">
+          The entire folder above will be permanently removed, including
+          the decrypted <code className="font-mono text-xs bg-gray-100 px-1 rounded">ChatStorage.sqlite</code>,
+          any on-disk media, voice notes, profile pictures, and anything
+          else you've put in there. The original encrypted iOS backup on
+          this Mac is not touched.
+        </p>
+        {error && <p className="text-sm text-red-500 mb-3">{error}</p>}
+        <div className="flex gap-2">
+          <button onClick={onClose} disabled={busy}
+            className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">Cancel</button>
+          <button onClick={confirm} disabled={busy}
+            className="flex-1 rounded-lg bg-red-500 hover:bg-red-600 disabled:opacity-50 px-4 py-2 text-sm font-semibold text-white">
+            {busy ? "Deleting…" : "Delete workspace"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DeleteConfirmModal({ backup, onClose, onDeleted }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -791,6 +848,21 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   const [backupsKey, setBackupsKey] = useState(0);
   const [loading, setLoading]       = useState(true);
   const [deleteTarget, setDeleteTarget] = useState(null);
+  // Header workspace-menu state. menuOpen toggles the dropdown,
+  // deletingWs gates the confirm modal. The menu auto-closes on any
+  // click that lands outside its container (see effect below) so it
+  // behaves like a native popover rather than an always-on UI element.
+  const [menuOpen, setMenuOpen]     = useState(false);
+  const [deletingWs, setDeletingWs] = useState(false);
+  const menuRef = useRef(null);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e) => {
+      if (menuRef.current && !menuRef.current.contains(e.target)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
 
   // jobs: { [key]: { running, done, lines, adopted, pid, startedAt, error } }
   // key = udid for backup jobs, "db:sync" for the messages sync job
@@ -1000,9 +1072,31 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             </>
           )}
         </div>
-        <button onClick={onSwitchWorkspace} className="text-xs text-gray-400 hover:text-gray-600 ml-2">
-          Switch workspace
-        </button>
+        <div className="relative ml-2" ref={menuRef}>
+          <button onClick={() => setMenuOpen(o => !o)} aria-haspopup="menu" aria-expanded={menuOpen}
+            className="text-xs text-gray-400 hover:text-gray-600 px-1.5 py-1 rounded inline-flex items-center gap-1">
+            Workspace
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
+          </button>
+          {menuOpen && (
+            <div role="menu"
+              className="absolute right-0 top-full mt-1 w-48 rounded-lg bg-white border shadow-lg py-1 z-40"
+              style={{borderColor:'#DCF8C6'}}>
+              <button role="menuitem"
+                onClick={() => { setMenuOpen(false); onSwitchWorkspace(); }}
+                className="w-full text-left px-3 py-2 text-sm text-gray-700 hover:bg-gray-50">
+                Switch workspace
+              </button>
+              <button role="menuitem"
+                onClick={() => { setMenuOpen(false); setDeletingWs(true); }}
+                className="w-full text-left px-3 py-2 text-sm text-red-600 hover:bg-red-50">
+                Delete workspace…
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
       {/* Tab bar */}
@@ -1119,6 +1213,14 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
           backup={deleteTarget}
           onClose={() => setDeleteTarget(null)}
           onDeleted={() => { setDeleteTarget(null); setBackupsKey(k => k + 1); }}
+        />
+      )}
+
+      {deletingWs && (
+        <WorkspaceDeleteModal
+          workspace={workspace}
+          onClose={() => setDeletingWs(false)}
+          onDeleted={() => { setDeletingWs(false); onSwitchWorkspace(); }}
         />
       )}
     </div>

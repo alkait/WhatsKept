@@ -132,6 +132,20 @@ func addRecent(path string) {
 	_ = saveRecent(out)
 }
 
+// removeRecent drops `path` from the recent-workspaces list. No-op if
+// the path isn't in the list. Called when the user explicitly deletes
+// a workspace so its now-stale entry doesn't linger in the picker.
+func removeRecent(path string) {
+	paths := loadRecent()
+	out := paths[:0]
+	for _, p := range paths {
+		if p != path {
+			out = append(out, p)
+		}
+	}
+	_ = saveRecent(out)
+}
+
 // writeBackupPasswordEnv writes a `.env` file containing
 // `BACKUP_PASSWORD=<password>` into the workspace directory. The file is
 // created with mode 0600 so it isn't world-readable. Mirrors the Python
