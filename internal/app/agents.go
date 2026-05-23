@@ -19,6 +19,13 @@ type agentSpec struct {
 	Name        string // human-readable display name
 	Description string // one-sentence pitch shown on the card
 	AppName     string // ".app" basename to look for under /Applications
+
+	// IgnoreFile is the dotfile name this agent (or its inline assistant)
+	// reads to know which workspace paths NOT to feed to a model. Written
+	// into the workspace by postprocess.WriteAssets to keep multi-MB
+	// `media/`, `voice/`, and `profiles/` trees out of token budgets.
+	// Empty if the agent has no documented ignore mechanism.
+	IgnoreFile string
 }
 
 // agentRegistry is the single source of truth for which agents the
@@ -29,13 +36,36 @@ var agentRegistry = []agentSpec{
 		Name:        "Windsurf",
 		Description: "Cascade-powered IDE that reads AGENTS.md natively.",
 		AppName:     "Windsurf",
+		IgnoreFile:  ".windsurfignore",
 	},
 	{
 		ID:          "vscode",
 		Name:        "VS Code",
 		Description: "Microsoft's editor — pair with GitHub Copilot or any AGENTS.md-aware extension.",
 		AppName:     "Visual Studio Code",
+		IgnoreFile:  ".copilotignore", // honoured by GitHub Copilot's content-exclusion plumbing
 	},
+}
+
+// AgentIgnoreFiles returns the deduplicated list of dotfile names the
+// known agents read to skip files. Consumed by postprocess.WriteAssets
+// so the `media/`, `voice/`, and `profiles/` trees never make it into
+// a model's token budget. Exported so the postprocess package can
+// import it without depending on the rest of `app`.
+func AgentIgnoreFiles() []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(agentRegistry))
+	for _, a := range agentRegistry {
+		if a.IgnoreFile == "" {
+			continue
+		}
+		if _, dup := seen[a.IgnoreFile]; dup {
+			continue
+		}
+		seen[a.IgnoreFile] = struct{}{}
+		out = append(out, a.IgnoreFile)
+	}
+	return out
 }
 
 // agentInfo is what the React UI sees over JSON. Field naming uses

@@ -1,0 +1,489 @@
+# WhatsApp chat workspace
+
+You have a SQLite copy of the user's WhatsApp history (extracted from an iOS
+backup), with SQL views, an FTS5 index, and—if the optional indexers ran—on-disk
+images (OCR'd), voice notes (transcribed), and contact avatars. Answer the
+user's questions by running SQL against the database.
+
+## Layout
+
+```
+./ChatStorage.sqlite     # the main DB — your primary tool
+./views.sql              # views + FTS5 definitions (already applied)
+./media/<rowid>.jpg      # full-res images (if `whatskept-media-index` ran)
+./voice/<rowid>.<ext>    # voice notes, usually .opus (if `whatskept-voice-index` ran)
+./profiles/whatsapp/<jid>.jpg   # WhatsApp avatars (if `whatskept-profiles-sync` ran)
+./profiles/ios/<jid>.jpg        # iOS Contacts avatar thumbnails — fallback
+                                # when no WhatsApp avatar exists (if
+                                # `whatskept-contacts-sync` ran). JID '@'
+                                # encoded as '_at_' for both.
+./notes/                 # optional scratchpad — see end of file
+```
+
+`<rowid>` everywhere = `v_messages.rowid` = `ZWAMESSAGE.Z_PK`. That's the only
+join key you need across `media/`, `voice/`, `wa_image_text`, `wa_voice_text`.
+
+- **DB tool**: shell out to `sqlite3 ./ChatStorage.sqlite "..."`. Don't load it
+  into Python unless the user asks.
+- **No RAG, no embeddings, no scraping.** SQL is your retrieval engine.
+
+## ⭐ Hard rule: "search for X" means ALL surfaces
+
+`messages_fts` already concatenates and indexes **every text-shaped surface**:
+
+| surface              | source                                       | requires                      |
+|----------------------|----------------------------------------------|-------------------------------|
+| typed text           | `ZWAMESSAGE.ZTEXT`                           | always                        |
+| screenshots / photos | `wa_image_text.ocr_text` + `labels`          | `whatskept-media-index` ran   |
+| voice notes          | `wa_voice_text.transcript`                   | `whatskept-voice-index` ran   |
+| attached documents   | `wa_document.filename`                       | always                        |
+| shared links         | `ZWAMEDIAITEM.ZTITLE` (preview headline)     | always                        |
+
+So *any* topical lookup is a single `messages_fts MATCH` joined back to
+`v_messages`. **Never** answer "X isn't in the chats" from
+`WHERE text LIKE '%X%'` — that misses screenshots, voice notes, OCR'd
+receipts, and attachment filenames, which is usually where the answer is.
+
+For media hits, `v_messages.text` is `NULL`; pull the matching text from the
+side tables so you can quote it:
+
+```sql
+SELECT m.rowid, m.ts, m.chat_title, m.sender_name, m.message_type_name,
+       COALESCE(
+           NULLIF(m.text, ''),
+           NULLIF(t.ocr_text, ''),
+           NULLIF(v.transcript, ''),
+           d.filename,
+           m.link_title
+       )                                                AS hit_text,
+       snippet(messages_fts, 0, '[[', ']]', '…', 12)    AS hit_snippet,
+       t.labels                                         AS image_labels,
+       m.link_url, m.link_title
+FROM   messages_fts f
+JOIN   v_messages    m ON m.rowid = f.rowid
+LEFT JOIN wa_image_text t ON t.rowid = m.rowid
+LEFT JOIN wa_voice_text v ON v.rowid = m.rowid
+LEFT JOIN wa_document  d ON d.rowid = m.rowid
+WHERE  messages_fts MATCH :query
+ORDER  BY m.ts DESC
+LIMIT  50;
+```
+
+If `wa_image_text` or `wa_voice_text` doesn't exist yet (optional indexers
+never ran), drop that `LEFT JOIN` — SQLite will error on a missing table,
+not silently null it.
+
+## ⛔ Hard rule: do NOT ingest `./media/*`, `./voice/*`, `./profiles/*`, or `.env`
+
+Those folders hold tens of thousands of JPEGs, opus clips, and avatar
+images. The OCR and transcription steps exist *specifically* so you never
+need the raw bytes — every text-shaped thing about them is already in
+`wa_image_text`, `wa_voice_text`, and `messages_fts`. If you want to read
+a `.jpg` or `.opus`, write a better SQL query first.
+
+**Rules:**
+
+1. **Never** read `.env`. It holds the user's iOS backup password.
+2. **Never** read, `cat`, `base64`, attach, or otherwise pipe a
+   `./media/*`, `./voice/*`, or `./profiles/**/*` file into your context.
+   Not one. Not "just to check". (`open <path>` to show the user is a
+   different operation — see next section.)
+3. The workspace ships a `.windsurfignore` covering those folders. If
+   your tooling lets you bypass it silently, **don't**.
+4. Only ingest raw media into a multimodal model when the user
+   **explicitly** asks for analysis beyond OCR/transcript ("describe the
+   background", "tell me the tone of this clip"). Even then:
+   - First show what you already know from `wa_image_text` / `wa_voice_text`.
+   - Confirm with the user before sending bytes to a remote model.
+   - Read **only that one file** — never a directory listing or batch.
+5. **Embedding media in generated files (HTML, posters, etc.):** if a
+   script you write needs avatar/media bytes, the **script itself** reads
+   them at runtime via the path from `v_avatar` / `v_messages`. Do not
+   pipe bytes through a shell command whose output reaches your context.
+
+## Showing an image or playing a voice note
+
+The user will say *"open that receipt from Sarah last Tuesday"*, not *"open
+rowid 12345"*. Your job is to turn the description into a rowid, then hand
+the file to macOS.
+
+1. **Resolve to a rowid.** Use `v_messages` + `messages_fts MATCH` against
+   OCR text, labels, transcripts; filter by sender / chat / date. Project
+   `rowid`, `ts`, `sender_name`, and a short preview.
+2. **Disambiguate.** If multiple rows match, list candidates and ask which
+   one. **Never** `open` several files in a row — one Preview/QuickTime
+   window per file is rude.
+3. **Check the file exists** (not every message has been indexed):
+   - Image: `test -f ./media/<rowid>.jpg` or `media_index.status = 'described'`.
+   - Voice: `ls ./voice/<rowid>.*` (codec varies) or `voice_index.status = 'transcribed'`.
+   - Avatar: `SELECT path FROM v_avatar WHERE jid = ?` — may be NULL.
+4. **Hand off to macOS:**
+
+   ```bash
+   open ./media/<rowid>.jpg
+   open ./voice/<rowid>.opus
+   open ./profiles/whatsapp/<jid>.jpg
+   ```
+
+   The OS launches the right app; your context stays clean.
+
+If a previous turn already listed candidates and the user says "open the
+second one", reuse that rowid — don't re-run the search.
+
+## Use the views, not the raw `Z*` tables
+
+`views.sql` exposes `v_chats`, `v_messages`, `v_avatar`, `wa_jid_alias`, and
+`messages_fts`. They handle Cocoa-epoch conversion, the SAVED→PUSH→JID
+sender resolution, the LID↔phone bridge, and reply joins for you. **Prefer
+them over `Z*` tables.**
+
+### `v_chats` — one row per chat session
+
+| column            | meaning                                                          |
+|-------------------|------------------------------------------------------------------|
+| `chat_id`         | Primary key. Joins to `v_messages.chat_id`.                      |
+| `jid`             | `<digits>@s.whatsapp.net` for DMs, `<id>@g.us` for groups.       |
+| `title`           | Group title, or DM partner's resolved name.                      |
+| `kind`            | `'dm'` or `'group'`.                                             |
+| `message_count`   | Total messages in the chat.                                      |
+| `last_message_at` | UTC ISO timestamp of the most recent message.                    |
+| `archived`        | `1` if archived, else `0`.                                       |
+
+### `v_messages` — flattened message view
+
+| column              | meaning                                                                |
+|---------------------|------------------------------------------------------------------------|
+| `rowid`             | Primary key (= `ZWAMESSAGE.Z_PK`).                                     |
+| `chat_id`           | FK to `v_chats.chat_id`.                                               |
+| `chat_title`        | Convenience copy of the chat's title.                                  |
+| `chat_kind`         | `'dm'` or `'group'`.                                                   |
+| `ts`                | UTC ISO timestamp. **Already epoch-converted — do not transform.**     |
+| `ts_cocoa`          | Raw Cocoa-epoch seconds (rarely useful).                               |
+| `is_from_me`        | `1` if the user sent it, `0` if received.                              |
+| `sender_name`       | Best-effort display name. `'me'` for outgoing. See Pitfalls.           |
+| `sender_jid`        | Sender's JID (phone or LID).                                           |
+| `message_type`      | Integer code from `ZWAMESSAGE.ZMESSAGETYPE`.                           |
+| `message_type_name` | Human label: `text`, `image`, `video`, `audio`, `link`, `document`, `sticker`, `call`, `system`, `deleted`, `contact`, `location`, `other`. |
+| `text`              | `ZWAMESSAGE.ZTEXT`. **`NULL` for most media** — see Pitfalls.          |
+| `reply_to_id`       | FK back to `v_messages.rowid` for quoted replies.                      |
+| `stanza_id`         | WhatsApp's internal message id (rarely needed).                        |
+| `link_url`          | For `message_type_name = 'link'`: the shared URL.                      |
+| `link_title`        | For `message_type_name = 'link'`: WhatsApp's fetched preview headline (folded into `messages_fts`). |
+
+### `messages_fts` — full-text search
+
+FTS5 virtual table. `rowid` joins to `v_messages.rowid`. Diacritics folded
+(`café` matches `cafe`). One indexed column (`text`); see the surfaces
+table at the top of this file for what's concatenated in.
+
+FTS5 syntax cheatsheet: `"exact phrase"`, `term1 AND term2`, `term1 OR term2`,
+`NOT`, `NEAR/N`, prefix wildcard `pizz*`.
+
+### `wa_contact` — iOS Address Book mapping
+
+Optional. Populated by `whatskept-contacts-sync`. Maps a 1:1 JID to the
+display name the *user* saved in iOS Contacts.
+
+| column         | meaning                                                      |
+|----------------|--------------------------------------------------------------|
+| `jid`          | `<digits>@s.whatsapp.net`. Joins to `v_messages.sender_jid`. |
+| `display_name` | The label the user picked in Contacts (e.g. `Mom`).          |
+| `source`       | Always `'ios-contacts'` for now.                             |
+| `synced_at`    | UTC ISO timestamp of the last sync.                          |
+
+**You normally don't need to query this directly** — `v_messages.sender_name`
+and `v_chats.title` already return the iOS-Contacts label when one exists.
+Hit `wa_contact` directly only for reverse lookups:
+
+```sql
+-- Every message Mom ever sent, across all chats.
+SELECT m.ts, m.chat_title, m.text
+FROM   v_messages m
+JOIN   wa_contact c ON c.jid = m.sender_jid
+WHERE  c.display_name = 'Mom'
+ORDER  BY m.ts DESC
+LIMIT  50;
+```
+
+### `wa_document` — attached-file metadata
+
+Always present (derived by `views.sql`). One row per document message
+(`message_type_name = 'document'`, `ZMESSAGETYPE = 8`). Metadata only — we
+don't extract document content.
+
+| column      | meaning                                                                  |
+|-------------|--------------------------------------------------------------------------|
+| `rowid`     | Joins to `v_messages.rowid`.                                             |
+| `filename`  | Original filename (e.g. `Estimate_2021.pdf`); sometimes `NULL` when WhatsApp didn't preserve it. |
+| `ext`       | Lowercased extension (`'pdf'`, `'docx'`, `'xlsx'`, ...).                 |
+| `file_size` | Bytes (`ZWAMEDIAITEM.ZFILESIZE`).                                        |
+
+Filenames are folded into `messages_fts`, so `MATCH 'passport'` hits a
+message whose attached document is called `SCANNED PASSPORT.pdf`.
+
+```sql
+-- All PDFs anyone sent whose filename mentions "contract".
+SELECT m.ts, m.chat_title, m.sender_name, d.filename,
+       ROUND(d.file_size/1024.0, 1) AS kb
+FROM   v_messages   m
+JOIN   wa_document  d ON d.rowid = m.rowid
+WHERE  d.ext = 'pdf'
+  AND  LOWER(d.filename) LIKE '%contract%'
+ORDER  BY m.ts DESC;
+```
+
+Document bytes are **not** on disk (they stay in the encrypted iOS backup).
+If the user asks to view a document, surface its `(rowid, filename, ts,
+sender_name)` and tell them extraction-to-disk isn't currently supported.
+
+### `v_avatar` — contact avatars
+
+One row per JID with **some** avatar. Two sources, in priority order:
+
+1. **WhatsApp profile picture** (`whatskept-profiles-sync`) →
+   `./profiles/whatsapp/<jid>.jpg`.
+2. **iOS Contacts thumbnail** (`whatskept-contacts-sync`) →
+   `./profiles/ios/<jid>.jpg`. Used as fallback when no WhatsApp avatar.
+
+**⛔ Always start with `v_avatar`. Never glob `./profiles/` yourself.**
+The view handles the LID↔phone bridge for both sources, so
+`<digits>@lid` and `<digits>@s.whatsapp.net` both resolve.
+
+**⭐ Hard rule: avatar lookups are multi-surface.**
+Never conclude "no profile picture exists" from a single query.
+Check all three surfaces in order:
+
+1. `v_avatar` view — the fast path.
+2. `wa_profile_picture` raw table — WhatsApp's own cache index
+   (`jid`, `whatsapp_path`, `whatsapp_picture_id`).
+3. `profiles/whatsapp/<jid>.jpg` on disk — file placed by
+   `whatskept-profiles-sync` (use `_safe_jid_filename`: `@` → `_at_`).
+   **Check file existence only — do NOT read image bytes into context.**
+
+A hit on **any** surface means the picture is available.
+Only after all three return nothing should you say "no display picture found."
+
+| column      | meaning                                                     |
+|-------------|-------------------------------------------------------------|
+| `jid`       | `<digits>@s.whatsapp.net` or `<digits>@lid`.                |
+| `path`      | Workspace-relative path to the `.jpg`.                      |
+| `source`    | `'whatsapp'` or `'ios'` — which source the path came from.  |
+| `synced_at` | UTC ISO timestamp of the most recent sync touching this JID.|
+
+```sql
+-- Avatar for a given message's sender (WhatsApp first, iOS fallback):
+SELECT m.sender_name, a.path, a.source
+FROM   v_messages m
+LEFT JOIN v_avatar a ON a.jid = m.sender_jid
+WHERE  m.rowid = :rowid;
+```
+
+Avatars are pixel bytes — the no-ingest hard rule still applies. To show
+the user, `open <path>`; don't read it.
+
+### `wa_image_text` — image OCR + labels
+
+Optional. Populated by `whatskept-media-index` (Apple Vision, on-device).
+
+| column         | meaning                                                            |
+|----------------|--------------------------------------------------------------------|
+| `rowid`        | Joins to `v_messages.rowid`.                                       |
+| `ocr_text`     | Recognized text (may be empty).                                    |
+| `labels`       | Comma-separated classification labels (e.g. `document,screenshot`).|
+| `label_scores` | JSON `{label: confidence}`.                                        |
+| `generated_at` | UTC ISO timestamp.                                                 |
+
+Companion `media_index(rowid, status)` tracks resume state; `status` ∈
+`described | missing | error`. Used for existence checks (see "Showing an
+image").
+
+### `wa_voice_text` — voice-note transcripts
+
+Optional. Populated by `whatskept-voice-index` (mlx-whisper on Apple
+Silicon; default model `whisper-large-v3-turbo`).
+
+| column          | meaning                                                          |
+|-----------------|------------------------------------------------------------------|
+| `rowid`         | Joins to `v_messages.rowid`.                                     |
+| `transcript`    | Full transcript (may be empty for silent/noisy clips).           |
+| `language`      | ISO-639-1 code Whisper detected (e.g. `'ar'`, `'en'`).           |
+| `duration_sec`  | Clip length (from `ZWAMEDIAITEM.ZMOVIEDURATION`).                |
+| `segments_json` | JSON `[{start,end,text}, ...]` per Whisper segment.              |
+| `generated_at`  | UTC ISO timestamp.                                               |
+
+Companion `voice_index(rowid, status)` tracks resume state; `status` ∈
+`transcribed | missing | error | skipped`. `'skipped'` means the clip
+exceeded the duration cap (default 10 min).
+
+## Pitfalls — read these before writing your first query
+
+1. **Cocoa epoch.** `ZMESSAGEDATE` / `ZLASTMESSAGEDATE` are seconds since
+   `2001-01-01 UTC`; convert with `datetime(col + 978307200, 'unixepoch')`.
+   `v_messages.ts` already does this. Use it.
+
+2. **`text` is `NULL` for media.** Images, videos, voice notes, stickers,
+   etc. all have `v_messages.text IS NULL`. `messages_fts` covers OCR and
+   transcripts (when those indexers ran), so MATCH still finds them.
+   **Videos remain unsearchable.**
+
+3. **`sender_name` resolution (SAVED → PUSH → JID).** `v_messages` already
+   resolves senders in this order:
+   - **Saved:** iOS Contacts (`wa_contact`), direct and via the
+     `wa_jid_alias` LID↔phone bridge — so a saved name surfaces even in
+     groups where the sender arrives as `<digits>@lid`. Groups also fall
+     back to `ZWAGROUPMEMBER.ZCONTACTNAME` / `ZFIRSTNAME`; DMs to
+     `ZWACHATSESSION.ZPARTNERNAME` (skipped when it's a bare phone string).
+   - **Push name:** `ZWAPROFILEPUSHNAME`, looked up under both the JID
+     and its LID alias.
+   - **Raw JID** as last resort. `'me'` short-circuits all of this.
+
+   ⚠️ **Do not use `ZWAMESSAGE.ZPUSHNAME`** — in current iOS WhatsApp
+   builds that column holds opaque protobuf bytes, not a name. The real
+   push names live in `ZWAPROFILEPUSHNAME(ZJID, ZPUSHNAME)`, which
+   `v_messages` already joins.
+
+   If `sender_name` comes back as a raw phone JID and the user insists
+   they know who it is, check for a push name we haven't surfaced:
+
+   ```sql
+   SELECT p.ZJID, p.ZPUSHNAME
+   FROM   ZWACHATSESSION cs
+   JOIN   ZWAPROFILEPUSHNAME p
+          ON p.ZJID IN (cs.ZCONTACTJID, cs.ZCONTACTIDENTIFIER)
+   WHERE  cs.ZCONTACTJID = :the_jid;
+   ```
+
+   Use `sender_jid`, not `sender_name`, as a canonical identifier.
+
+4. **Group vs DM.** `chat_kind = 'group'`, or `jid LIKE '%@g.us'`.
+
+5. **Reply chains.** `reply_to_id` is a self-FK to `v_messages.rowid`.
+   Walk with a recursive CTE — see idiom below.
+
+6. **Deleted messages.** `message_type_name = 'deleted'` (type 14): user
+   deleted the message; `text` is `NULL`. Still occupies a rowid.
+
+7. **System messages.** `system` / `call` / etc. are protocol events
+   (joins, leaves, calls, encryption notices). Filter out for "what was
+   said" questions.
+
+8. **Result-size discipline.** Always `LIMIT`, aggregate, or paginate. A
+   naked `SELECT * FROM v_messages` dumps tens of thousands of rows into
+   your context. **Aggregate first**, drill down with `LIMIT`.
+
+9. **Citing your work.** Cite `(rowid, ts, chat_title, sender_name)` so
+   the user can verify with `SELECT * FROM v_messages WHERE rowid = ?`.
+
+10. **No mutations.** This DB is the user's only copy. Read-only — never
+    `INSERT`, `UPDATE`, `DELETE`, or `DROP`.
+
+## Query idioms
+
+**Top chats by activity (last 90 days).**
+
+```sql
+SELECT chat_title, chat_kind, COUNT(*) AS n
+FROM   v_messages
+WHERE  ts >= datetime('now', '-90 days')
+GROUP  BY chat_id
+ORDER  BY n DESC
+LIMIT  20;
+```
+
+**Reconstruct a reply thread from a known rowid.**
+
+```sql
+WITH RECURSIVE thread(rowid, ts, sender_name, text, depth) AS (
+    SELECT rowid, ts, sender_name, text, 0
+    FROM   v_messages WHERE rowid = :start_rowid
+    UNION ALL
+    SELECT m.rowid, m.ts, m.sender_name, m.text, t.depth + 1
+    FROM   v_messages m JOIN thread t ON m.reply_to_id = t.rowid
+)
+SELECT * FROM thread ORDER BY ts;
+```
+
+**Per-sender stats inside one group.**
+
+```sql
+SELECT sender_name, COUNT(*) AS msgs,
+       SUM(message_type_name = 'text')  AS texts,
+       SUM(message_type_name = 'image') AS images
+FROM   v_messages
+WHERE  chat_title = 'Roommates'
+GROUP  BY sender_jid
+ORDER  BY msgs DESC;
+```
+
+**Slice a conversation as a transcript** (placeholder for media):
+
+```sql
+SELECT ts, sender_name, message_type_name,
+       COALESCE(text, '<' || message_type_name || '>')
+FROM   v_messages
+WHERE  chat_title = 'Alice'
+  AND  ts BETWEEN '2024-06-01' AND '2024-06-30'
+ORDER  BY ts ASC
+LIMIT  500;
+```
+
+**Find images by classification label.** `wa_image_text.labels` is a
+comma-separated list; wrap both sides with commas for exact-token matching:
+
+```sql
+SELECT m.ts, m.chat_title, m.sender_name, t.labels,
+       SUBSTR(t.ocr_text, 1, 100) AS ocr_preview,
+       './media/' || m.rowid || '.jpg' AS image_path
+FROM   v_messages   m
+JOIN   wa_image_text t ON t.rowid = m.rowid
+WHERE  ',' || t.labels || ',' LIKE '%,receipt,%'
+  AND  m.ts >= datetime('now', '-180 days')
+ORDER  BY m.ts DESC
+LIMIT  20;
+```
+
+Apple Vision labels include `document`, `screenshot`, `handwriting`,
+`receipt`, `map`, `qr_code`, `text`, `photo`, `selfie`, `food`, `landscape`,
+`outdoor` — not exhaustive.
+
+## Workflow
+
+1. **Understand the question.** What chats, what time range, what shape of
+   answer (count? list? transcript? comparison?).
+2. **Pick the right tool.** Aggregate → `GROUP BY` on `v_messages`. "Did
+   anyone mention / send / talk about X?" → `messages_fts MATCH`, always
+   (see the surfaces table at top). Specific thread → recursive CTE.
+3. **Run the query.** `sqlite3 -readonly ./ChatStorage.sqlite "..."` — the
+   `-readonly` flag enforces pitfall 10.
+4. **Synthesize.** Summarize in plain language. When a hit came from OCR
+   / a transcript / a filename rather than typed text, **say so**
+   ("from a screenshot Sarah sent…", "in a voice note from Khalid…",
+   "attached as `passport_v2.pdf`…"). Cite `(rowid, ts, chat_title,
+   sender_name)`.
+5. **Iterate.** Too broad → narrow. Too narrow → loosen the FTS terms
+   (prefix `term*`, `NEAR/N`, synonyms) or widen the date range **before**
+   concluding the topic isn't in the chats.
+
+## Optional: the `notes/` folder
+
+If you discover something the user is likely to ask about again — a
+recurring pattern, a nickname, the date range of a key event — file it
+under `./notes/<topic>.md`. Keep notes short, cite the messages you used,
+and only write ones that save real work next time. Opt-in scratchpad, not
+a maintained wiki.
+
+## Escape hatch
+
+If a view query fails or returns something obviously wrong (missing column,
+type mismatch, suspicious zero results), the schema may have drifted
+between WhatsApp versions:
+
+1. Run `.schema` (or `.schema ZWAMESSAGE`) to inspect the real layout.
+2. **Don't guess column names.** Verify each one exists.
+3. Rewrite against raw `Z*` tables, applying the Cocoa-epoch and
+   media-text rules from Pitfalls.
+4. Tell the user the views may need updating.
+
+Raw tables of interest: `ZWAMESSAGE`, `ZWACHATSESSION`, `ZWAGROUPMEMBER`,
+`ZWAMEDIAITEM`, `ZWAPROFILEPUSHNAME` (JID → push-name, also keyed by LID
+aliases). Everything else is rarely needed for text-level questions.
