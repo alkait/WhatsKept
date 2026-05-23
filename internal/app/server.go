@@ -2,9 +2,11 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -17,6 +19,9 @@ import (
 	"whatskept/internal/app/web"
 	"whatskept/internal/backup"
 	"whatskept/internal/helpers"
+	"whatskept/internal/postprocess"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // server is the HTTP backend. It mirrors the Python FastAPI surface
@@ -102,11 +107,12 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/jobs/active", s.handleActiveJob)
 	mux.HandleFunc("GET /api/stream/{job_id}", s.handleStreamJob)
 
-	// Database routes — Database tab is hidden in this iteration but the
-	// React code probes /api/database/status on mount; return a safe
-	// "nothing to see here" rather than 404.
+	// Database routes — the Database tab fetches /status on mount and
+	// POSTs /sync to kick off the messages pipeline. /sync runs the
+	// work in-process (no CLI re-exec) and streams progress through
+	// the same SSE machinery as backups.
 	mux.HandleFunc("GET /api/database/status", s.handleDatabaseStatus)
-	mux.HandleFunc("POST /api/database/run", s.handleRunDatabaseTask)
+	mux.HandleFunc("POST /api/database/sync", s.handleSyncDatabase)
 
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
@@ -472,19 +478,151 @@ func (s *server) handleStreamJob(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Database handlers (Database tab hidden; routes return safe shapes)
+// Database handlers
 // ---------------------------------------------------------------------------
 
+// databaseStatus is the JSON shape consumed by the Database tab. It
+// gives the UI enough state to:
+//   - Show row counts when the DB exists.
+//   - Distinguish "never synced" vs "synced once but a newer backup
+//     exists" vs "fully up to date" (via the is_stale flag, computed
+//     server-side so the UI doesn't need to parse two timestamps).
+//   - Tell the user to run a backup first when has_backups is false.
 type databaseStatus struct {
-	DBExists     bool `json:"db_exists"`
-	MessageCount *int `json:"message_count,omitempty"`
-	FTSCount     *int `json:"fts_count,omitempty"`
+	DBExists       bool   `json:"db_exists"`
+	DBPath         string `json:"db_path,omitempty"`
+	MessageCount   *int   `json:"message_count,omitempty"`
+	FTSCount       *int   `json:"fts_count,omitempty"`
+	LastSyncedAt   string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
+	LatestBackupAt string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
+	IsStale        bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
+	HasBackups     bool   `json:"has_backups"`                // any encrypted backup found at all
 }
 
 func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, databaseStatus{DBExists: false})
+	out := databaseStatus{}
+
+	// Latest backup timestamp is workspace-independent — even with no
+	// workspace open we can tell the UI "you have a backup ready".
+	if infos, err := backup.Discover(backup.DefaultRoot()); err == nil {
+		var latest time.Time
+		for _, b := range infos {
+			if !b.IsEncrypted {
+				continue
+			}
+			out.HasBackups = true
+			if b.LastBackup.After(latest) {
+				latest = b.LastBackup
+			}
+		}
+		if !latest.IsZero() {
+			out.LatestBackupAt = latest.Format(time.RFC3339)
+		}
+	}
+
+	cur := s.ws.get()
+	if cur == "" {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	st, err := os.Stat(dbPath)
+	if err != nil {
+		// Workspace exists but no DB yet. Stale = there's a backup we
+		// haven't ingested.
+		out.IsStale = out.HasBackups
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	out.DBExists = true
+	out.DBPath = dbPath
+	out.LastSyncedAt = st.ModTime().Format(time.RFC3339)
+
+	// is_stale: a newer backup exists than our last sync. Compare in
+	// time.Time space to avoid string-comparison subtleties (RFC3339
+	// happens to be lexicographically comparable, but only for the
+	// same offset — relying on that is fragile).
+	if out.LatestBackupAt != "" {
+		if t, err := time.Parse(time.RFC3339, out.LatestBackupAt); err == nil {
+			if st.ModTime().Before(t) {
+				out.IsStale = true
+			}
+		}
+	}
+
+	// Best-effort counts. A failure here doesn't sink the response —
+	// the UI just hides those fields.
+	msgs, fts := readDBCounts(dbPath)
+	if msgs >= 0 {
+		out.MessageCount = &msgs
+	}
+	if fts >= 0 {
+		out.FTSCount = &fts
+	}
+
+	writeJSON(w, http.StatusOK, out)
 }
 
-func (s *server) handleRunDatabaseTask(w http.ResponseWriter, _ *http.Request) {
-	httpError(w, http.StatusServiceUnavailable, "Database tasks are not available in this build.")
+// readDBCounts opens dbPath read-only and returns (messages, fts).
+// Returns (-1, -1) entirely on open failure; either field returns -1
+// individually if its table is missing (FTS may be absent on a DB
+// that has been decrypted but not yet had views applied).
+func readDBCounts(dbPath string) (msgs, fts int) {
+	msgs, fts = -1, -1
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM ZWAMESSAGE`).Scan(&n); err == nil {
+		msgs = n
+	}
+	var f int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts`).Scan(&f); err == nil {
+		fts = f
+	}
+	return
+}
+
+type syncDatabaseRequest struct {
+	Password string `json:"password"`
+}
+
+// handleSyncDatabase kicks off postprocess.SyncMessages as an
+// in-process SSE job. No `task` discriminator — there's exactly
+// one operation this endpoint runs.
+//
+// The UI subscribes to /api/stream/{job_id} immediately and renders
+// each "line" event in the Database card's live log.
+func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+
+	var req syncDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Password == "" {
+		httpError(w, http.StatusBadRequest, "backup password is required")
+		return
+	}
+
+	jobID := s.jobs.startInProcess("messages-sync", func(log func(string)) error {
+		_, err := postprocess.SyncMessages(
+			backup.DefaultRoot(),
+			cur,
+			req.Password,
+			AgentIgnoreFiles(),
+			log,
+		)
+		return err
+	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }

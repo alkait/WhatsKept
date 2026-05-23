@@ -171,6 +171,40 @@ func (m *jobManager) activeJob() *activeJobInfo {
 	return nil
 }
 
+// startInProcess registers a new job whose work runs as a Go function
+// (no subprocess), streaming each `log` line as a "line" jobEvent.
+// `work` returns nil on success or an error whose .Error() string
+// is suitable for direct UI display.
+//
+// Used by the Database tab's Sync button — postprocess.SyncMessages
+// runs entirely in-process so we don't need to re-exec ourselves
+// the way the Python implementation did.
+//
+// The returned job ID can be subscribed to via /api/stream/{id}
+// immediately; the work goroutine is launched before this returns.
+func (m *jobManager) startInProcess(task string, work func(log func(string)) error) string {
+	j := &job{
+		id:        uuid.NewString(),
+		task:      task,
+		startedAt: time.Now(),
+	}
+	m.put(j)
+
+	go func() {
+		log := func(s string) {
+			j.emit(jobEvent{Type: "line", Data: s})
+		}
+		err := work(log)
+		if err != nil {
+			j.emit(jobEvent{Type: "done", Status: "error", Error: err.Error()})
+			return
+		}
+		j.emit(jobEvent{Type: "done", Status: "ok", Code: 0})
+	}()
+
+	return j.id
+}
+
 // startBackup spawns a backup subprocess and registers it. The caller
 // gets back the new job's ID; subscribers (SSE) can connect via
 // /api/stream/{id} immediately afterwards.
