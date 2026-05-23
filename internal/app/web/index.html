@@ -103,21 +103,80 @@ function ElapsedTimer({ isRunning, startedAt }) {
   return <span className="tabular-nums">{m}:{s}</span>;
 }
 
+// formatBytes: human-readable size for the dir-stats line.
+function formatBytes(b) {
+  if (b == null || isNaN(b)) return null;
+  if (b < 1024)            return `${b} B`;
+  if (b < 1024 ** 2)       return `${(b / 1024).toFixed(1)} KB`;
+  if (b < 1024 ** 3)       return `${(b / 1024 ** 2).toFixed(1)} MB`;
+  return `${(b / 1024 ** 3).toFixed(2)} GB`;
+}
+
+// parseBackupProgress: idevicebackup2 prints lines like
+//   "[01/12] Receiving file Snapshot/AppDomain-com.foo/Library/..."
+// once the receive phase starts. We walk `lines` from the end and
+// return the first match so the UI shows the freshest progress.
+// Earlier phases (negotiation, "Sending '...'") have no [N/M] — we
+// return null and the card falls back to the polled dir-stats line.
+function parseBackupProgress(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^\[(\d+)\/(\d+)\]\s*(.*)$/);
+    if (m) {
+      const n = parseInt(m[1], 10);
+      const total = parseInt(m[2], 10);
+      if (!total) continue;
+      return { n, total, pct: Math.min(100, (n / total) * 100), detail: (m[3] || "").trim() };
+    }
+  }
+  return null;
+}
+
 // ── BackupProgressCard ────────────────────────────────────────────────────
 // runningLabel/successLabel/failureLabel let the caller customise
 // the headline. The default copy is the Backups-tab wording so
 // existing call sites work unchanged; the Database tab passes
 // sync-specific strings.
-function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
+//
+// `dirStats` (optional) is the latest /api/backup/{udid}/dir-stats
+// response, polled by App. Used only for backup jobs — the database
+// sync doesn't have a meaningful dir-size signal.
+function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt, dirStats,
                               runningLabel = "Backing up…",
                               successLabel = "Backup complete.",
                               failureLabel = "Backup failed." }) {
   const [expanded, setExpanded] = useState(false);
   const bottomRef = useRef(null);
   useEffect(() => { if (expanded) bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [lines, expanded]);
-  const lastLine = [...lines].reverse().find(l => l.trim()) || "";
 
-  if (adopted && isRunning) return (
+  const progress = isRunning ? parseBackupProgress(lines) : null;
+
+  // Polled dir-stats line: "12,345 files · 287 MB written".
+  // Hidden once parsed [N/M] is available because that line is more
+  // precise — keeping both would just be noise.
+  const writtenLine = (() => {
+    if (!dirStats || !dirStats.exists) return null;
+    if (progress) return null;
+    const parts = [];
+    if (dirStats.file_count) parts.push(`${dirStats.file_count.toLocaleString()} files`);
+    const sz = formatBytes(dirStats.total_bytes);
+    if (sz) parts.push(`${sz} written`);
+    return parts.length ? parts.join(" · ") : null;
+  })();
+
+  // Subline inside the headline area, in priority order:
+  //   1. Parsed "Receiving 1,234 / 5,678" + truncated current file
+  //   2. Polled dir-stats summary
+  //   3. Last raw stdout line (early-phase backups, after-the-fact log tail)
+  const lastLine = [...lines].reverse().find(l => l.trim()) || "";
+  const subline = progress
+    ? `Receiving ${progress.n.toLocaleString()} / ${progress.total.toLocaleString()} files`
+    : (writtenLine || lastLine);
+
+  // Adopted backups never get stdout, so we can't parse [N/M] — but
+  // dirStats works the same way. If we have it, render the same rich
+  // card the freshly-started branch uses; otherwise fall back to the
+  // PID + elapsed minimalist card.
+  if (adopted && isRunning && !dirStats?.exists) return (
     <div className="mt-4 rounded-xl p-4" style={{background:'#DCF8C6',border:'1px solid #128C7E'}}>
       <div className="flex items-center gap-3">
         <span className="relative flex h-3 w-3">
@@ -150,8 +209,16 @@ function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
         }
         <div className="min-w-0 flex-1">
           {isRunning
-            ? <><p className="text-sm font-medium" style={{color:'#075E54'}}>{runningLabel}</p>
-                {lastLine && <p className="text-xs text-gray-500 truncate mt-0.5">{lastLine}</p>}</>
+            ? <>
+                <p className="text-sm font-medium flex items-center gap-2" style={{color:'#075E54'}}>
+                  <span>{runningLabel}</span>
+                  {adopted && <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>resumed · pid {pid}</span>}
+                </p>
+                {subline && <p className="text-xs text-gray-500 truncate mt-0.5">{subline}</p>}
+                {progress && progress.detail && (
+                  <p className="text-[11px] text-gray-400 truncate mt-0.5 font-mono">{progress.detail}</p>
+                )}
+              </>
             : <p className={`text-sm font-medium ${done ? "text-green-600" : "text-red-500"}`}>
                 {done ? successLabel : failureLabel}
               </p>
@@ -167,6 +234,20 @@ function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
           )}
         </div>
       </div>
+      {/* Progress bar fills the full card width below the headline,
+          cleanly visible whether or not the log is expanded. */}
+      {isRunning && progress && (
+        <div className="px-4 pb-3 -mt-1">
+          <div className="h-1.5 w-full rounded-full overflow-hidden" style={{background:'#ECE5DD'}}>
+            <div className="h-full transition-all duration-500 ease-out"
+                 style={{width:`${progress.pct}%`,background:'#25D366'}}></div>
+          </div>
+          <div className="flex justify-between text-[10px] text-gray-400 mt-1 tabular-nums">
+            <span>{Math.round(progress.pct)}%</span>
+            {writtenLineIfDifferent(dirStats, progress)}
+          </div>
+        </div>
+      )}
       {expanded && lines.length > 0 && (
         <div className="border-t p-3 max-h-48 overflow-y-auto" style={{borderColor:'#DCF8C6',background:'#f9fafb'}}>
           {lines.map((l, i) => <div key={i} className="log-line text-gray-600 leading-5">{l || "\u00a0"}</div>)}
@@ -175,6 +256,19 @@ function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
       )}
     </div>
   );
+}
+
+// Render the polled dir-stats below the progress bar as a secondary
+// hint (so the user can correlate "1,234 / 5,678 files" with disk
+// usage). Returns a span so it slots into the right-aligned flex row.
+function writtenLineIfDifferent(dirStats, progress) {
+  if (!dirStats || !dirStats.exists) return null;
+  const parts = [];
+  if (dirStats.file_count) parts.push(`${dirStats.file_count.toLocaleString()} files`);
+  const sz = formatBytes(dirStats.total_bytes);
+  if (sz) parts.push(sz);
+  if (!parts.length) return null;
+  return <span>{parts.join(" · ")}</span>;
 }
 
 // ── WorkspaceDeleteModal ──────────────────────────────────────────────────
@@ -403,6 +497,7 @@ function DeviceRow({ device, job, onStart, hasSessionPassword, onForgetPassword 
         isRunning={isRunning}
         done={done}
         startedAt={j.startedAt}
+        dirStats={j.dirStats}
       />
       {prompting && (
         <PasswordPromptModal
@@ -913,12 +1008,39 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     return () => document.removeEventListener("mousedown", onDown);
   }, [menuOpen]);
 
-  // jobs: { [key]: { running, done, lines, adopted, pid, startedAt, error } }
+  // jobs: { [key]: { running, done, lines, adopted, pid, startedAt, error,
+  //                   dirStats: { exists, file_count, total_bytes } } }
   // key = udid for backup jobs, "db:sync" for the messages sync job
   const [jobs, setJobs] = useState({});
 
   const patchJob = (key, patch) =>
     setJobs(prev => ({ ...prev, [key]: { ...(prev[key] || {}), ...patch } }));
+
+  // ── backup directory polling ──────────────────────────────────────────
+  // Single interval that re-reads from a ref so we don't tear down/rebuild
+  // it every time `jobs` mutates (which happens on every streamed log
+  // line). For each running backup job we GET /api/backup/{udid}/dir-stats
+  // every two seconds and stash the result on the job. The Backups card
+  // renders this so adopted backups (where stdout was already lost) and
+  // freshly-started backups both show "N files · X MB written" even
+  // before idevicebackup2's stdout starts emitting [N/M] progress lines.
+  const jobsRef = useRef(jobs);
+  useEffect(() => { jobsRef.current = jobs; }, [jobs]);
+  useEffect(() => {
+    const tick = () => {
+      const cur = jobsRef.current || {};
+      Object.entries(cur).forEach(([key, j]) => {
+        if (key === "db:sync") return;
+        if (!j || !j.running) return;
+        api.get(`/api/backup/${key}/dir-stats`)
+           .then(stats => patchJob(key, { dirStats: stats }))
+           .catch(() => {});
+      });
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => clearInterval(id);
+  }, []);
 
   // ── database status ───────────────────────────────────────────────────
   const [dbStatus, setDbStatus] = useState(null);

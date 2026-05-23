@@ -110,6 +110,11 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/backup/run", s.handleRunBackup)
 	mux.HandleFunc("GET /api/jobs/active", s.handleActiveJob)
 	mux.HandleFunc("GET /api/stream/{job_id}", s.handleStreamJob)
+	// Live size/file-count of a backup directory. Polled by the UI
+	// every couple of seconds while a backup job is running so we
+	// can show progress for both freshly-started AND adopted (after
+	// app restart) backups, where stdout has already been missed.
+	mux.HandleFunc("GET /api/backup/{udid}/dir-stats", s.handleBackupDirStats)
 
 	// Database routes — the Database tab fetches /status on mount and
 	// POSTs /sync to kick off the messages pipeline. /sync runs the
@@ -457,6 +462,60 @@ func (s *server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// backupDirStats is the live size/file-count snapshot of a backup
+// directory. The UI polls this every couple of seconds while a
+// backup job is running so we can render progress for both:
+//   - freshly-started backups: alongside parsed [N/M] lines from
+//     idevicebackup2 stdout, and
+//   - adopted backups (the app was restarted while idevicebackup2
+//     was still running): the only signal we have, since stdout
+//     of that process is owned by whoever launched it.
+type backupDirStats struct {
+	Exists     bool  `json:"exists"`
+	FileCount  int64 `json:"file_count"`
+	TotalBytes int64 `json:"total_bytes"`
+}
+
+func (s *server) handleBackupDirStats(w http.ResponseWriter, r *http.Request) {
+	udid := r.PathValue("udid")
+	if udid == "" {
+		httpError(w, http.StatusBadRequest, "udid is required")
+		return
+	}
+	// Reject anything that isn't a clean basename so a request like
+	// `../../etc/passwd` can't escape the backup root. Same defence
+	// as handleDeleteBackup's filepath.Dir check.
+	if udid != filepath.Base(udid) {
+		httpError(w, http.StatusBadRequest, "Invalid udid")
+		return
+	}
+	dir := filepath.Join(backup.DefaultRoot(), udid)
+	out := backupDirStats{}
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		writeJSON(w, http.StatusOK, out) // not started yet — zeroes
+		return
+	}
+	out.Exists = true
+	// Recursive walk. Typical iOS backups have ~10–100k files in
+	// hash-keyed subdirs; this finishes in well under a second on
+	// any SSD. Errors on individual entries are silently skipped so
+	// a transient ENOENT (idevicebackup2 just rotated a temp file)
+	// doesn't sink the whole response.
+	_ = filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		fi, ferr := d.Info()
+		if ferr != nil {
+			return nil
+		}
+		out.FileCount++
+		out.TotalBytes += fi.Size()
+		return nil
+	})
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---------------------------------------------------------------------------
