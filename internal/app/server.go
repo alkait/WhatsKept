@@ -108,6 +108,11 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/database/status", s.handleDatabaseStatus)
 	mux.HandleFunc("POST /api/database/run", s.handleRunDatabaseTask)
 
+	// Agents — list supported agents (with installed flag) and launch
+	// one with the current workspace as its working folder.
+	mux.HandleFunc("GET /api/agents", s.handleListAgents)
+	mux.HandleFunc("POST /api/agents/{id}/open", s.handleOpenAgent)
+
 	// Static files (the embedded React UI). Must be registered last so
 	// /api/* takes precedence on the same mux.
 	sub, err := fs.Sub(web.FS, ".")

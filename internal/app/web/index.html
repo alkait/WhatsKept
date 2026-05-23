@@ -460,6 +460,81 @@ function WorkspaceScreen({ onOpen }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// AgentsPanel — Agents tab content
+// ═══════════════════════════════════════════════════════════════════════════
+function AgentsPanel({ workspace }) {
+  const [agents, setAgents] = useState(null); // null = loading
+  const [openingId, setOpeningId] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => { api.get("/api/agents").then(setAgents).catch(e => setError(e.message)); }, []);
+
+  const launch = async (agent) => {
+    setOpeningId(agent.id); setError("");
+    try { await api.post(`/api/agents/${agent.id}/open`, { path: workspace.path }); }
+    catch(e) { setError(e.message); }
+    finally { setOpeningId(null); }
+  };
+
+  if (agents === null) return <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>;
+
+  return (
+    <section className="space-y-4">
+      {!workspace.has_chat && (
+        <div className="rounded-xl border p-4 text-sm" style={{borderColor:'#f4c542',background:'#FFF8E1',color:'#7a5b00'}}>
+          <div className="font-medium mb-1">Workspace is empty</div>
+          <div className="text-xs leading-relaxed">
+            <code>ChatStorage.sqlite</code> and <code>AGENTS.md</code> haven't been generated yet.
+            Run a backup from the <span className="font-medium">Backups</span> tab, then come back —
+            the agent will have a documented database to query.
+          </div>
+        </div>
+      )}
+
+      <div>
+        <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Open in agent</h2>
+        <div className="space-y-3">
+          {agents.map(a => (
+            <div key={a.id} className="rounded-xl border bg-white p-4 flex items-center gap-4" style={{borderColor:'#DCF8C6'}}>
+              <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{background:'#DCF8C6',border:'1px solid #128C7E'}}>
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#075E54" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+                </svg>
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <p className="text-sm font-semibold" style={{color:'#075E54'}}>{a.name}</p>
+                  {a.installed
+                    ? <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>Installed</span>
+                    : <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Not installed</span>}
+                </div>
+                <p className="text-xs text-gray-500 mt-0.5">{a.description}</p>
+                {a.installed && a.app_path && (
+                  <p className="text-[11px] text-gray-400 mt-0.5 font-mono truncate">{a.app_path}</p>
+                )}
+              </div>
+              <button onClick={() => launch(a)} disabled={!a.installed || openingId === a.id}
+                className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
+                style={{background:'#075E54'}}
+                title={a.installed ? `Open this workspace in ${a.name}` : `${a.name} is not installed in /Applications`}>
+                {openingId === a.id ? "Opening…" : `Open in ${a.name}`}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {error && <p className="text-sm text-red-500">{error}</p>}
+
+      <p className="text-[11px] text-gray-400 leading-relaxed">
+        Agents are launched detached via <code>open -a</code>; closing WhatsKept doesn't affect them.
+        Support for more agents (Cursor, Claude Code, Codex CLI) lands as we test each integration.
+      </p>
+    </section>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // SCREEN 2 — Backup Manager
 // ═══════════════════════════════════════════════════════════════════════════
 function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
@@ -567,7 +642,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   // Database tab is intentionally hidden in this iteration; will return
   // when the postprocess pipeline is ported.
   const tabs = [
-    { id: "backups",  label: "Backups"  },
+    { id: "backups", label: "Backups" },
+    { id: "agents",  label: "Agents"  },
   ];
 
   return (
@@ -658,6 +734,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
             )}
           </section>
         </>)}
+
+        {/* ══ AGENTS TAB ══ */}
+        {tab === "agents" && <AgentsPanel workspace={workspace} />}
 
         {/* ══ DATABASE TAB ══ */}
         {tab === "database" && (<>
