@@ -225,7 +225,12 @@ function BackupCard({ backup, onDelete }) {
 }
 
 // ── PasswordPromptModal ───────────────────────────────────────────────────
-function PasswordPromptModal({ device, onConfirm, onCancel }) {
+// The same iOS-backup password is needed for two different operations:
+//   • Running idevicebackup2 (Backups tab) — "Start backup".
+//   • Decrypting an existing backup for sync (Database tab) — "Sync now".
+// Both reuse this modal; `confirmLabel` lets the caller name the action
+// so the button doesn't lie about what's about to happen.
+function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Start backup" }) {
   const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
   const inputRef = useRef(null);
@@ -234,7 +239,7 @@ function PasswordPromptModal({ device, onConfirm, onCancel }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
       <div className="w-[380px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
-        <h2 className="text-base font-semibold text-gray-900 mb-1">Backup password</h2>
+        <h2 className="text-base font-semibold text-gray-900 mb-1">iPhone backup password</h2>
         <p className="text-xs text-gray-500 mb-4">
           Enter the encryption password for <span className="font-medium text-gray-800">{device.name}</span>.
         </p>
@@ -258,7 +263,7 @@ function PasswordPromptModal({ device, onConfirm, onCancel }) {
           <button onClick={submit} disabled={!password}
             className="flex-1 rounded-lg text-white disabled:opacity-40 px-4 py-2 text-sm font-semibold"
             style={{background:'#128C7E'}}>
-            Start backup
+            {confirmLabel}
           </button>
         </div>
       </div>
@@ -605,6 +610,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
           device={{ name: "the latest iPhone backup" }}
           onConfirm={pw => { setPrompting(false); onSync(pw); }}
           onCancel={() => setPrompting(false)}
+          confirmLabel="Sync messages"
         />
       )}
     </section>
