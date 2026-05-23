@@ -29,6 +29,7 @@ in a separate repository.`,
 
 	root.AddCommand(newListCmd())
 	root.AddCommand(newExtractCmd())
+	root.AddCommand(newAppCmd())
 
 	return root
 }

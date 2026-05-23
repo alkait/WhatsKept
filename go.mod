@@ -5,6 +5,7 @@ go 1.22.1
 require (
 	github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9
 	github.com/spf13/cobra v1.10.2
+	github.com/webview/webview_go v0.0.0-20240831120633-6173450d4dd6
 	howett.net/plist v1.0.1
 )
 
