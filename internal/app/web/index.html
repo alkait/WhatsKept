@@ -460,6 +460,148 @@ function WorkspaceScreen({ onOpen }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// DatabaseTab — Messages sync card
+// ═══════════════════════════════════════════════════════════════════════════
+// One card. Smart copy off `dbStatus`. Re-uses PasswordPromptModal for
+// the backup password (same encryption password as `idevicebackup2`,
+// since postprocess.SyncMessages decrypts from the latest backup on
+// disk).
+function relativeTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const sec = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (sec < 60)   return "just now";
+  if (sec < 3600) return `${Math.floor(sec/60)} min ago`;
+  if (sec < 86400) return `${Math.floor(sec/3600)} h ago`;
+  return `${Math.floor(sec/86400)} d ago`;
+}
+
+function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
+  const [prompting, setPrompting] = useState(false);
+  const j = job || {};
+  const isRunning = !!j.running;
+  const hasDone = j.done !== undefined && j.done !== null;
+
+  // Re-fetch status when a sync finishes so message/fts counts and
+  // last_synced_at refresh without the user having to click Refresh.
+  useEffect(() => {
+    if (hasDone && j.done === true) reloadDbStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasDone, j.done]);
+
+  if (!dbStatus) {
+    return <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>;
+  }
+
+  // Derive the four states.
+  const hasBackups = !!dbStatus.has_backups;
+  const dbExists   = !!dbStatus.db_exists;
+  const isStale    = !!dbStatus.is_stale;
+  const msgCount   = dbStatus.message_count;
+  const ftsCount   = dbStatus.fts_count;
+  const lastSynced = dbStatus.last_synced_at;
+  const latestBkp  = dbStatus.latest_backup_at;
+
+  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
+  if (!hasBackups) {
+    title         = "No iOS backups found";
+    subtitle      = "Run a backup from the Backups tab first.";
+    buttonLabel   = "Sync messages";
+    buttonPrimary = false;
+    statusDot     = "#9ca3af"; // gray
+  } else if (!dbExists) {
+    title         = "Ready for first sync";
+    subtitle      = `Latest backup taken ${relativeTime(latestBkp)}. Click to decrypt and index messages.`;
+    buttonLabel   = "Sync messages";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b"; // amber
+  } else if (isStale) {
+    title         = "New messages available";
+    subtitle      = `Last synced ${relativeTime(lastSynced)} · newer backup taken ${relativeTime(latestBkp)}.`;
+    buttonLabel   = "Sync now";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  } else {
+    title         = "Up to date";
+    const parts = [];
+    if (msgCount != null) parts.push(`${msgCount.toLocaleString()} messages`);
+    if (ftsCount != null) parts.push(`${ftsCount.toLocaleString()} in FTS`);
+    parts.push(`synced ${relativeTime(lastSynced)}`);
+    subtitle      = parts.join(" · ");
+    buttonLabel   = "Sync again";
+    buttonPrimary = false;
+    statusDot     = "#25D366"; // green
+  }
+
+  const buttonDisabled = isRunning || !hasBackups;
+
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Messages database</h2>
+        <button onClick={reloadDbStatus} className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1">
+          <RefreshIcon /> Refresh
+        </button>
+      </div>
+
+      <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
+              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+              {isStale && !isRunning && (
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded animate-pulse"
+                      style={{background:'#fef3c7', color:'#92400e'}}>
+                  Action needed
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+            {dbExists && dbStatus.db_path && (
+              <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{dbStatus.db_path}</p>
+            )}
+          </div>
+          <button onClick={() => setPrompting(true)} disabled={buttonDisabled}
+            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}
+            title={!hasBackups ? "No iOS backups available yet" : ""}>
+            <RefreshIcon />
+            {isRunning ? "Syncing…" : buttonLabel}
+          </button>
+        </div>
+
+        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
+
+        <BackupProgressCard
+          lines={j.lines || []}
+          adopted={!!j.adopted}
+          pid={j.pid}
+          isRunning={isRunning}
+          done={hasDone ? j.done : null}
+          startedAt={j.startedAt}
+        />
+      </div>
+
+      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
+        Decrypts the latest backup's ChatStorage.sqlite into your workspace, applies the SQL view layer
+        (chats, messages, FTS5 index), and writes <code>AGENTS.md</code> plus per-agent ignore files.
+        Voice transcription and image OCR are separate, opt-in stages that will land in a future update.
+      </p>
+
+      {prompting && (
+        <PasswordPromptModal
+          device={{ name: "the latest iPhone backup" }}
+          onConfirm={pw => { setPrompting(false); onSync(pw); }}
+          onCancel={() => setPrompting(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // AgentsPanel — Agents tab content
 // ═══════════════════════════════════════════════════════════════════════════
 function AgentsPanel({ workspace }) {
@@ -627,23 +769,22 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
     }
   };
 
-  // ── start database task ───────────────────────────────────────────────
-  const startDbTask = async (task) => {
-    const key = `db:${task}`;
+  // ── start messages sync ────────────────────────────────────────────────
+  const startSync = async (password) => {
+    const key = "db:sync";
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
-      const { job_id } = await api.post("/api/database/run", { task });
+      const { job_id } = await api.post("/api/database/sync", { password });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
     }
   };
 
-  // Database tab is intentionally hidden in this iteration; will return
-  // when the postprocess pipeline is ported.
   const tabs = [
-    { id: "backups", label: "Backups" },
-    { id: "agents",  label: "Agents"  },
+    { id: "backups",  label: "Backups"  },
+    { id: "database", label: "Database" },
+    { id: "agents",   label: "Agents"   },
   ];
 
   return (
@@ -739,60 +880,14 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
         {tab === "agents" && <AgentsPanel workspace={workspace} />}
 
         {/* ══ DATABASE TAB ══ */}
-        {tab === "database" && (<>
-          <section>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Database</h2>
-              <button onClick={reloadDbStatus} className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1">
-                <RefreshIcon /> Refresh
-              </button>
-            </div>
-
-            {/* Messages card */}
-            {(() => {
-              const j = jobs["db:update"] || {};
-              const isRunning = !!j.running;
-              const hasDone = j.done !== undefined && j.done !== null;
-              const msgCount = dbStatus?.message_count;
-              const ftsCount = dbStatus?.fts_count;
-              const hasDb = dbStatus?.db_exists;
-              return (
-                <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
-                  <div className="flex items-start justify-between gap-4">
-                    <div>
-                      <p className="font-semibold text-gray-900 text-sm">Messages</p>
-                      <p className="text-xs text-gray-400 mt-0.5">Pulls new messages from the latest iOS backup</p>
-                      {hasDb && msgCount != null && (
-                        <div className="flex gap-3 mt-2">
-                          <span className="text-xs font-mono" style={{color:'#075E54'}}>{msgCount.toLocaleString()} messages</span>
-                          {ftsCount != null && <span className="text-xs text-gray-400">{ftsCount.toLocaleString()} in FTS index</span>}
-                        </div>
-                      )}
-                      {!hasDb && <p className="text-xs text-amber-500 mt-1">ChatStorage.sqlite not found — run whatskept first</p>}
-                    </div>
-                    <button
-                      onClick={() => startDbTask("update")}
-                      disabled={isRunning || !hasDb}
-                      className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-50 px-4 py-2 text-sm font-semibold transition-colors"
-                      style={{background: isRunning ? '#128C7E' : '#075E54'}}>
-                      <RefreshIcon />
-                      {isRunning ? "Updating…" : hasDone ? "Update again" : "Update"}
-                    </button>
-                  </div>
-                  {j.error && <p className="text-sm text-red-500 mt-2">{j.error}</p>}
-                  <BackupProgressCard
-                    lines={j.lines || []}
-                    adopted={!!j.adopted}
-                    pid={j.pid}
-                    isRunning={isRunning}
-                    done={hasDone ? j.done : null}
-                    startedAt={j.startedAt}
-                  />
-                </div>
-              );
-            })()}
-          </section>
-        </>)}
+        {tab === "database" && (
+          <DatabaseTab
+            dbStatus={dbStatus}
+            reloadDbStatus={reloadDbStatus}
+            job={jobs["db:sync"]}
+            onSync={startSync}
+          />
+        )}
 
       </main>
 
