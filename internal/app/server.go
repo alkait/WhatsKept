@@ -182,8 +182,7 @@ func (s *server) handleRecentWorkspaces(w http.ResponseWriter, _ *http.Request) 
 }
 
 type createWorkspaceRequest struct {
-	Path           string `json:"path"`
-	BackupPassword string `json:"backup_password"`
+	Path string `json:"path"`
 }
 
 func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
@@ -205,12 +204,13 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, fmt.Sprintf("Cannot create directory: %v", err))
 		return
 	}
-	if req.BackupPassword != "" {
-		if err := writeBackupPasswordEnv(abs, req.BackupPassword); err != nil {
-			httpError(w, http.StatusInternalServerError, fmt.Sprintf("Cannot write .env: %v", err))
-			return
-		}
-	}
+	// Note: workspace creation deliberately writes nothing else into the
+	// directory. ChatStorage.sqlite, views.sql, and AGENTS.md are produced
+	// later by `whatskept extract` and the postprocess step. Backup
+	// password persistence happens on demand from the password modal,
+	// not here, since (a) most users don't know what it is at create
+	// time, and (b) the modal already exists for the only operation
+	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
