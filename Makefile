@@ -6,7 +6,7 @@ VERSION ?= 0.0.0-dev
 
 build: $(BIN)
 
-$(BIN): $(shell find . -name '*.go' -not -path './dist/*')
+$(BIN): $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -path './internal/helpers/bundle/*' \) -not -path './dist/*' -not -path './.git/*')
 	@mkdir -p dist
 	go build -ldflags "-X main.Version=$(VERSION)" -o $(BIN) $(PKG)
 	@chmod +x build/sign.sh

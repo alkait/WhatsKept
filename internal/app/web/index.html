@@ -495,8 +495,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   const patchJob = (key, patch) =>
     setJobs(prev => ({ ...prev, [key]: { ...(prev[key] || {}), ...patch } }));
 
-  const anyRunning = Object.values(jobs).some(j => j.running);
-
   // ── database status ───────────────────────────────────────────────────
   const [dbStatus, setDbStatus] = useState(null);
   const reloadDbStatus = () => api.get("/api/database/status").then(setDbStatus).catch(() => {});
@@ -603,15 +601,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
           <p className="text-xs font-semibold leading-none" style={{color:'#075E54'}}>WhatsKept</p>
           <p className="text-xs text-gray-400 truncate mt-0.5">{workspace.path.replace(/^\/Users\/[^/]+/, "~")}</p>
         </div>
-        {anyRunning && (
-          <span className="flex items-center gap-1.5 text-xs rounded-full px-3 py-1 text-white" style={{background:'#128C7E'}}>
-            <span className="relative flex h-1.5 w-1.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-white"></span>
-            </span>
-            In progress
-          </span>
-        )}
         <button onClick={onSwitchWorkspace} className="text-xs text-gray-400 hover:text-gray-600 ml-2">
           Switch workspace
         </button>

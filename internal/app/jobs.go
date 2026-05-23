@@ -301,7 +301,7 @@ func (m *jobManager) adoptOrphans() {
 		j := &job{
 			id:        uuid.NewString(),
 			udid:      udid,
-			startedAt: time.Now(),
+			startedAt: processStartTime(pid),
 			pid:       pid,
 			adopted:   true,
 		}
@@ -309,6 +309,29 @@ func (m *jobManager) adoptOrphans() {
 		j.emit(jobEvent{Type: "adopted", PID: pid})
 		go m.watchAdopted(j)
 	}
+}
+
+// processStartTime returns the wall-clock time at which the given pid
+// was launched, by parsing `ps -p PID -o lstart=` (e.g.
+// "Sat May 23 12:30:45 2026" — matches Go's time.ANSIC layout).
+//
+// This is what makes the elapsed-time counter survive an app restart:
+// if whatskept was killed at T+1m15s and reopens 15 s later, the GUI
+// still shows T+1m30s for the adopted backup, not a fresh 0:00.
+//
+// Falls back to time.Now() on any failure (lookup, parse, etc.) so a
+// missing column or format change doesn't break adoption.
+func processStartTime(pid int) time.Time {
+	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "lstart=").Output()
+	if err != nil {
+		return time.Now()
+	}
+	s := strings.TrimSpace(string(out))
+	t, err := time.ParseInLocation(time.ANSIC, s, time.Local)
+	if err != nil {
+		return time.Now()
+	}
+	return t
 }
 
 // watchAdopted polls an adopted PID until it exits, emitting "ping"
