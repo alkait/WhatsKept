@@ -9,12 +9,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"whatskept/internal/app/web"
 	"whatskept/internal/backup"
+	"whatskept/internal/helpers"
 )
 
 // server is the HTTP backend. It mirrors the Python FastAPI surface
@@ -252,9 +254,63 @@ type deviceItem struct {
 	Name string `json:"name"`
 }
 
-func (s *server) handleListDevices(w http.ResponseWriter, _ *http.Request) {
-	// Phase A: empty list. Phase C will exec the embedded `idevice_id`.
-	writeJSON(w, http.StatusOK, []deviceItem{})
+func (s *server) handleListDevices(w http.ResponseWriter, r *http.Request) {
+	network := r.URL.Query().Get("network") == "true"
+
+	args := []string{"-l"}
+	if network {
+		args = append(args, "-n")
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	cmd, err := helpers.Command(ctx, helpers.IdeviceID, args...)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("idevice_id unavailable: %v", err))
+		return
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		var exitErr *exec.ExitError
+		stderr := ""
+		if errors.As(err, &exitErr) {
+			stderr = strings.TrimSpace(string(exitErr.Stderr))
+		}
+		httpError(w, http.StatusInternalServerError,
+			fmt.Sprintf("idevice_id failed: %v %s", err, stderr))
+		return
+	}
+
+	udids := strings.Split(strings.TrimSpace(string(out)), "\n")
+	items := make([]deviceItem, 0, len(udids))
+	for _, u := range udids {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		items = append(items, deviceItem{UDID: u, Name: deviceName(r.Context(), u)})
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+// deviceName runs `idevice_id <udid>` to get the device's display name.
+// Returns the UDID if the lookup fails (for any reason).
+func deviceName(ctx context.Context, udid string) string {
+	subCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd, err := helpers.Command(subCtx, helpers.IdeviceID, udid)
+	if err != nil {
+		return udid
+	}
+	out, err := cmd.Output()
+	if err != nil {
+		return udid
+	}
+	name := strings.TrimSpace(string(out))
+	if name == "" {
+		return udid
+	}
+	return name
 }
 
 type backupItem struct {
@@ -343,9 +399,9 @@ func (s *server) handleStreamJob(w http.ResponseWriter, _ *http.Request) {
 // ---------------------------------------------------------------------------
 
 type databaseStatus struct {
-	DBExists     bool  `json:"db_exists"`
-	MessageCount *int  `json:"message_count,omitempty"`
-	FTSCount     *int  `json:"fts_count,omitempty"`
+	DBExists     bool `json:"db_exists"`
+	MessageCount *int `json:"message_count,omitempty"`
+	FTSCount     *int `json:"fts_count,omitempty"`
 }
 
 func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
