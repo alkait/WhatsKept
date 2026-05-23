@@ -457,6 +457,23 @@ func (s *server) handleStreamJob(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	sub := j.subscribe()
+
+	// SSE heartbeat. Without this, a long-running in-process step that
+	// emits no log lines (e.g. ApplyViews populating a 250k-row FTS5
+	// index, which is a single blocking SQLite call) will let the
+	// connection sit silent for tens of seconds. WebKit / intermediate
+	// buffers can close idle SSE streams, which manifests in the UI
+	// as a false "sync failed" — the goroutine actually completed,
+	// but the browser EventSource fired onerror before the terminal
+	// "done" event arrived.
+	//
+	// SSE comment lines (anything starting with ":") are silently
+	// dropped by EventSource clients, so they're free to use as
+	// keepalives — they don't show up in the log, but they keep the
+	// TCP pipe warm and give us a write to detect a client hangup.
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+
 	for {
 		select {
 		case ev, ok := <-sub:
@@ -469,6 +486,11 @@ func (s *server) handleStreamJob(w http.ResponseWriter, r *http.Request) {
 			}
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
 				return // client disconnected
+			}
+			flusher.Flush()
+		case <-heartbeat.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return // client disconnected; bail so we stop emitting
 			}
 			flusher.Flush()
 		case <-r.Context().Done():

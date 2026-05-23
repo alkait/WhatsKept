@@ -85,7 +85,14 @@ function ElapsedTimer({ isRunning, startedAt }) {
 }
 
 // ── BackupProgressCard ────────────────────────────────────────────────────
-function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt }) {
+// runningLabel/successLabel/failureLabel let the caller customise
+// the headline. The default copy is the Backups-tab wording so
+// existing call sites work unchanged; the Database tab passes
+// sync-specific strings.
+function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt,
+                              runningLabel = "Backing up…",
+                              successLabel = "Backup complete.",
+                              failureLabel = "Backup failed." }) {
   const [expanded, setExpanded] = useState(false);
   const bottomRef = useRef(null);
   useEffect(() => { if (expanded) bottomRef.current?.scrollIntoView({ behavior:"smooth" }); }, [lines, expanded]);
@@ -124,10 +131,10 @@ function BackupProgressCard({ lines, adopted, pid, isRunning, done, startedAt })
         }
         <div className="min-w-0 flex-1">
           {isRunning
-            ? <><p className="text-sm font-medium" style={{color:'#075E54'}}>Backing up…</p>
+            ? <><p className="text-sm font-medium" style={{color:'#075E54'}}>{runningLabel}</p>
                 {lastLine && <p className="text-xs text-gray-500 truncate mt-0.5">{lastLine}</p>}</>
             : <p className={`text-sm font-medium ${done ? "text-green-600" : "text-red-500"}`}>
-                {done ? "Backup complete." : "Backup failed."}
+                {done ? successLabel : failureLabel}
               </p>
           }
         </div>
@@ -581,6 +588,9 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
           isRunning={isRunning}
           done={hasDone ? j.done : null}
           startedAt={j.startedAt}
+          runningLabel="Syncing messages…"
+          successLabel="Sync complete."
+          failureLabel="Sync failed."
         />
       </div>
 
