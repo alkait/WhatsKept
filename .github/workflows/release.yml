@@ -1,0 +1,208 @@
+# Release workflow
+#
+# What it does:
+#   - On every push to main: build the macOS arm64 binary, package it as
+#     a zip with the build/sign.sh re-sign step that the Makefile
+#     already requires, and publish a GitHub pre-release tagged
+#     `dev-<run_number>` so each push gives you a clean download URL.
+#   - On every push of a tag matching `v*.*.*` (e.g. `v0.1.0`): the same
+#     build pipeline, but published as a regular (non-pre-release)
+#     release at that tag. Use this for the handful of "real" cuts you
+#     want to point people at.
+#
+# What it does NOT do (intentionally, until you decide):
+#   - amd64 / Intel builds. internal/helpers/bundle/ currently ships
+#     arm64-only Mach-Os for idevicebackup2 + the libimobiledevice
+#     dylibs. Producing an Intel build means re-bundling those for
+#     x86_64 first (build/bundle-helpers.sh). Wire that in and the
+#     matrix below just gains a second entry.
+#   - Developer-ID signing or notarization. The build/sign.sh step
+#     produces the same ad-hoc signature you sign with locally, so
+#     recipients see "cannot be opened because the developer cannot
+#     be verified" the first time they double-click. They can
+#     right-click \xe2\x86\x92 Open to override. If/when you add a
+#     Developer ID Apple account, drop the cert+API-key into the
+#     secrets named below and uncomment the sign/notarize block at
+#     the bottom of the build job.
+#
+# Required secrets:
+#   (none) for unsigned releases.
+#
+# Optional secrets for signed + notarized releases:
+#   APPLE_CERT_BASE64            base64-encoded .p12 with the
+#                                "Developer ID Application" cert
+#   APPLE_CERT_PASSWORD          .p12 password
+#   APPLE_NOTARY_KEY_BASE64      base64-encoded App Store Connect API key
+#                                (.p8 file from
+#                                https://appstoreconnect.apple.com/access/api)
+#   APPLE_NOTARY_KEY_ID          10-char Key ID from the same page
+#   APPLE_NOTARY_ISSUER_ID       UUID also from the same page
+
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+
+# Single in-flight release build per ref. A second push to main while
+# the first is still running cancels the first \xe2\x80\x94 the second is
+# strictly newer.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write   # required to create releases + upload assets
+
+jobs:
+  build:
+    name: macOS arm64
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # version logic below uses tag history
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Derive a human-readable version string.
+      #   - tag push     -> the tag itself (e.g. v0.1.0)
+      #   - branch push  -> 0.0.0-dev.<run_number>+<short-sha>
+      # The Makefile bakes whatever we pass via VERSION= into the binary
+      # via -ldflags "-X main.Version=...".
+      - name: Compute version
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/}"
+          else
+            sha="${GITHUB_SHA::7}"
+            v="0.0.0-dev.${GITHUB_RUN_NUMBER}+${sha}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building version: $v"
+
+      - name: Build
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          make build
+          file dist/whatskept
+          ls -lh dist/whatskept
+
+      # Re-sign the embedded helpers too. The Makefile only re-signs the
+      # outer binary; the libimobiledevice tools inside
+      # internal/helpers/bundle are already ad-hoc-signed when checked
+      # in, but on a fresh runner they may have lost xattrs that the
+      # extraction step relies on. Re-running sign on them is idempotent.
+      - name: Verify ad-hoc signature
+        run: |
+          codesign -vv dist/whatskept
+          codesign -d -vv dist/whatskept 2>&1 | grep -E 'Format|Signature|adhoc'
+
+      # ---- Optional: Developer ID signing + notarization. ----
+      # Uncomment the next two steps once you've added the secrets
+      # listed at the top of this file. Without them, the unsigned
+      # binary above is what ships.
+      #
+      # - name: Import Developer ID cert
+      #   if: ${{ secrets.APPLE_CERT_BASE64 != '' }}
+      #   env:
+      #     APPLE_CERT_BASE64:   ${{ secrets.APPLE_CERT_BASE64 }}
+      #     APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+      #   run: |
+      #     KEYCHAIN="$RUNNER_TEMP/build.keychain"
+      #     KEYCHAIN_PASSWORD=$(uuidgen)
+      #     security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+      #     security set-keychain-settings -lut 21600 "$KEYCHAIN"
+      #     security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+      #     echo "$APPLE_CERT_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
+      #     security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+      #       -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+      #     security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | xargs)
+      #     security set-key-partition-list -S apple-tool:,apple: \
+      #       -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+      #     IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+      #       | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+      #     echo "ident=$IDENT" >> "$GITHUB_ENV"
+      #     codesign --force --options runtime --timestamp \
+      #       --sign "$IDENT" dist/whatskept
+      #
+      # - name: Notarize
+      #   if: ${{ secrets.APPLE_NOTARY_KEY_BASE64 != '' }}
+      #   env:
+      #     APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_BASE64 }}
+      #     APPLE_NOTARY_KEY_ID:     ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      #     APPLE_NOTARY_ISSUER_ID:  ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      #   run: |
+      #     echo "$APPLE_NOTARY_KEY_BASE64" | base64 -d > "$RUNNER_TEMP/key.p8"
+      #     ditto -c -k --keepParent dist/whatskept "$RUNNER_TEMP/notary.zip"
+      #     xcrun notarytool submit "$RUNNER_TEMP/notary.zip" \
+      #       --key      "$RUNNER_TEMP/key.p8" \
+      #       --key-id   "$APPLE_NOTARY_KEY_ID" \
+      #       --issuer   "$APPLE_NOTARY_ISSUER_ID" \
+      #       --wait
+      #     # The CLI binary itself can't be stapled (only .app bundles
+      #     # and .dmg can). Recipients re-validate online on first
+      #     # launch; that works as long as they have an internet
+      #     # connection that day.
+
+      # Package as zip so the GitHub release asset preserves the
+      # executable bit. A raw upload of the Mach-O loses +x and forces
+      # users to chmod after download.
+      - name: Package
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p out
+          cp dist/whatskept "out/whatskept"
+          cp README.md      "out/README.md"
+          (cd out && zip -9 "../whatskept-darwin-arm64-${VERSION}.zip" whatskept README.md)
+          ls -lh whatskept-darwin-arm64-*.zip
+          shasum -a 256 whatskept-darwin-arm64-*.zip | tee SHA256SUMS
+
+      # Branch pushes get a pre-release at a stable, rolling tag so the
+      # "latest dev build" URL never changes. The previous asset is
+      # replaced in place.
+      - name: Publish dev pre-release
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name:        "Dev build ${{ steps.ver.outputs.version }}"
+          tag_name:    "dev-${{ github.run_number }}"
+          prerelease:  true
+          body: |
+            Automatically built from commit `${{ github.sha }}` on `main`.
+
+            **Not a stable release.** Useful for testing fresh changes;
+            expect breakage. Tagged semver releases live under the
+            Releases tab's regular (non-pre-release) entries.
+
+            macOS arm64 (Apple Silicon) only for now.
+            The binary is ad-hoc signed; on first launch macOS may show
+            "cannot be opened because the developer cannot be verified".
+            Right-click \xe2\x86\x92 Open to bypass.
+          files: |
+            whatskept-darwin-arm64-*.zip
+            SHA256SUMS
+
+      # Tag pushes get a real release.
+      - name: Publish tagged release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          name:       "WhatsKept ${{ steps.ver.outputs.version }}"
+          tag_name:   ${{ github.ref_name }}
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            whatskept-darwin-arm64-*.zip
+            SHA256SUMS
