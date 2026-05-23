@@ -924,6 +924,15 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   const [dbStatus, setDbStatus] = useState(null);
   const reloadDbStatus = () => api.get("/api/database/status").then(setDbStatus).catch(() => {});
   useEffect(() => { reloadDbStatus(); }, []);
+  // Re-fetch every time the user lands on the Database tab. Without this,
+  // a backup deleted/created from the Backups tab leaves the Database tab
+  // showing stale state (button still enabled though no backup exists,
+  // or "No backups found" though the user just made one) until the next
+  // explicit Refresh click or app restart.
+  useEffect(() => {
+    if (tab === "database") reloadDbStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
 
   // ── session-cached backup password ────────────────────────────────────
   // The server caches the iOS-backup password in RAM for the lifetime
