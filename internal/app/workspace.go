@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"whatskept/internal/binding"
 )
 
 // recentMax is the max number of entries we keep in the recent-workspaces list.
@@ -52,12 +53,15 @@ func (w *workspaceState) set(path string) {
 }
 
 // workspaceInfo is the JSON shape returned by /api/workspace/* routes.
-// Field names match the Python implementation so the existing React code
-// works unchanged.
+// Binding carries the device + WhatsApp account identity the workspace
+// is tied to (nil for never-synced workspaces). The frontend uses it
+// for the header label, the bound-device backup badge, and the
+// Run Backup picker filter.
 type workspaceInfo struct {
-	Path    string `json:"path"`
-	Exists  bool   `json:"exists"`
-	HasChat bool   `json:"has_chat"`
+	Path    string           `json:"path"`
+	Exists  bool             `json:"exists"`
+	HasChat bool             `json:"has_chat"`
+	Binding *binding.Binding `json:"binding,omitempty"`
 }
 
 func describeWorkspace(path string) workspaceInfo {
@@ -67,6 +71,11 @@ func describeWorkspace(path string) workspaceInfo {
 	if info.Exists {
 		_, err := os.Stat(filepath.Join(path, "ChatStorage.sqlite"))
 		info.HasChat = err == nil
+		// Binding errors are non-fatal (corrupt or missing file just
+		// means the workspace is treated as unbound).
+		if b, _ := binding.Load(path); b != nil {
+			info.Binding = b
+		}
 	}
 	return info
 }

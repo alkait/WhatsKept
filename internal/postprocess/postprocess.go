@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"whatskept/internal/backup"
+	"whatskept/internal/binding"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -130,20 +131,29 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 
 // SyncMessages is the high-level "Sync messages" pipeline:
 //
-//  1. Discover encrypted iOS backups under backupRoot, pick the
-//     most recently taken one.
-//  2. Decrypt its WhatsApp ChatStorage.sqlite into the workspace.
-//  3. Apply views.sql (creates v_messages, v_chats, messages_fts, …).
-//  4. Write AGENTS.md (if missing), views.sql, and the per-agent
-//     ignore files.
-//  5. Return a SyncResult with final row counts.
+//  1. Discover encrypted iOS backups. If the workspace already has a
+//     binding, filter the pool to that device's UDID; otherwise the
+//     latest backup of any device is fair game (first-sync case).
+//  2. Decrypt into a staging file (ChatStorage.sqlite.new) — the
+//     live DB is never touched until identity is verified.
+//  3. Probe the staging DB for the WhatsApp owner JID + a chat-
+//     session fingerprint.
+//  4. First sync: persist a fresh binding from {UDID, device name,
+//     JID, fingerprint}. Subsequent sync: compare against the bound
+//     identity — JID mismatch returns *ErrIdentityMismatch and
+//     leaves the live DB untouched.
+//  5. Atomic rename: staging → live ChatStorage.sqlite.
+//  6. Apply views.sql, write AGENTS.md (if missing), views.sql, and
+//     the per-agent ignore files.
+//  7. Return a SyncResult with final row counts.
 //
 // `log` is invoked with one human-readable status line per major
 // step. Pass nil for headless operation.
 //
 // Errors are returned with enough context to render directly in the
 // UI ("no encrypted iOS backups found — …", "backup password
-// required …", etc.).
+// required …", etc.). The mismatch case is a typed *ErrIdentityMismatch
+// so the API layer can render it differently from a generic failure.
 func SyncMessages(
 	backupRoot string,
 	workspace string,
@@ -153,6 +163,11 @@ func SyncMessages(
 ) (*SyncResult, error) {
 	if log == nil {
 		log = func(string) {}
+	}
+
+	existing, err := binding.Load(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("read workspace binding: %w", err)
 	}
 
 	log("Discovering iOS backups…")
@@ -172,24 +187,108 @@ func SyncMessages(
 	sort.SliceStable(encrypted, func(i, j int) bool {
 		return encrypted[i].LastBackup.After(encrypted[j].LastBackup)
 	})
-	latest := encrypted[0]
+
+	// Pick the latest backup. When the workspace is already bound,
+	// constrain the pool to its UDID so a stray backup from another
+	// phone (e.g. the user plugging in a friend's device) can't ever
+	// be selected, even silently.
+	var latest backup.Info
+	if existing != nil {
+		var matches []backup.Info
+		for _, b := range encrypted {
+			if filepath.Base(b.Path) == existing.UDID {
+				matches = append(matches, b)
+			}
+		}
+		if len(matches) == 0 {
+			return nil, fmt.Errorf(
+				"this workspace is bound to %s (UDID %s) but no backup of that device is on this Mac. "+
+					"Plug it in and run a backup from the Backups tab.",
+				existing.DeviceName, existing.UDID,
+			)
+		}
+		latest = matches[0]
+	} else {
+		latest = encrypted[0]
+	}
 	log(fmt.Sprintf("Latest backup: %s (taken %s)", latest.DisplayName(), latest.LastBackupString()))
 
 	if password == "" {
 		return nil, errors.New("backup password required (the latest backup is encrypted)")
 	}
 
-	dbPath := filepath.Join(workspace, "ChatStorage.sqlite")
+	livePath := filepath.Join(workspace, "ChatStorage.sqlite")
+	tempPath := livePath + ".new"
+	// Defensive: a previous crashed sync may have left a stale
+	// staging file. Don't trust its contents.
+	_ = os.Remove(tempPath)
 
 	log("Decrypting ChatStorage.sqlite from backup…")
-	n, err := backup.ExtractChatStorage(latest, password, dbPath)
+	n, err := backup.ExtractChatStorage(latest, password, tempPath)
 	if err != nil {
+		_ = os.Remove(tempPath)
 		return nil, fmt.Errorf("decrypt: %w", err)
 	}
-	log(fmt.Sprintf("Wrote %s (%d bytes)", dbPath, n))
+	log(fmt.Sprintf("Decrypted %d bytes to staging file", n))
+
+	log("Verifying WhatsApp account identity…")
+	fresh, err := ReadIdentity(tempPath, latest)
+	if err != nil {
+		_ = os.Remove(tempPath)
+		return nil, err
+	}
+
+	if existing == nil {
+		// First sync. Whatever identity we just read becomes the
+		// binding — there's nothing prior to compare against.
+		fresh.BoundAt = time.Now().UTC()
+		fresh.LastSyncedAt = fresh.BoundAt
+		if err := binding.Save(workspace, fresh); err != nil {
+			_ = os.Remove(tempPath)
+			return nil, fmt.Errorf("save workspace binding: %w", err)
+		}
+		log(fmt.Sprintf("Bound workspace to %s%s", fresh.DeviceName, phoneSuffix(fresh)))
+	} else {
+		// Subsequent sync. JID mismatch is a hard stop — the live DB
+		// must not be overwritten with a different account's data.
+		if err := CompareIdentity(existing, fresh); err != nil {
+			_ = os.Remove(tempPath)
+			return nil, err
+		}
+		// Refresh dynamic fields (device name and OS version may have
+		// changed; OwnerJID becomes available if a previously
+		// signal-less account now has groups; fingerprint always
+		// drifts as the chat list evolves). UDID stays bound to what
+		// the workspace was originally tied to — the filter above
+		// guarantees we never confuse it with another device.
+		updated := *existing
+		updated.DeviceName = fresh.DeviceName
+		updated.ProductType = fresh.ProductType
+		if fresh.OwnerJID != "" {
+			updated.OwnerJID = fresh.OwnerJID
+		}
+		if fresh.Fingerprint != "" {
+			updated.Fingerprint = fresh.Fingerprint
+		}
+		updated.LastSyncedAt = time.Now().UTC()
+		if err := binding.Save(workspace, &updated); err != nil {
+			_ = os.Remove(tempPath)
+			return nil, fmt.Errorf("save workspace binding: %w", err)
+		}
+		log(fmt.Sprintf("Identity verified: %s%s", existing.DeviceName, phoneSuffix(existing)))
+	}
+
+	// Identity OK — atomically promote staging to live. After this
+	// point a partial failure leaves us with a fresh DB that just
+	// hasn't had views re-applied; ApplyViews is idempotent, so the
+	// user re-clicking Sync resolves it.
+	if err := os.Rename(tempPath, livePath); err != nil {
+		_ = os.Remove(tempPath)
+		return nil, fmt.Errorf("promote staging db: %w", err)
+	}
 
 	log("Applying views and FTS5 index…")
-	if err := ApplyViews(dbPath); err != nil {
+	if err := ApplyViews(livePath); err != nil {
 		return nil, err
 	}
 
@@ -201,7 +300,7 @@ func SyncMessages(
 	// Final counts — best-effort. A failure here doesn't unwind the
 	// sync (the DB is on disk and applied), so swallow the error
 	// and report 0 instead.
-	msgCount, ftsCount := readCounts(dbPath)
+	msgCount, ftsCount := readCounts(livePath)
 	log(fmt.Sprintf("Done. %d messages indexed (%d in FTS).", msgCount, ftsCount))
 
 	_, agentsErr := os.Stat(filepath.Join(workspace, "AGENTS.md"))
@@ -209,13 +308,23 @@ func SyncMessages(
 	return &SyncResult{
 		BackupPath:     latest.Path,
 		BackupTakenAt:  latest.LastBackup,
-		DBPath:         dbPath,
+		DBPath:         livePath,
 		BytesExtracted: n,
 		MessageCount:   msgCount,
 		FTSCount:       ftsCount,
 		AgentsMDExists: agentsErr == nil,
 		IgnoreFiles:    agentIgnoreFiles,
 	}, nil
+}
+
+// phoneSuffix is a tiny formatting helper so the log lines read
+// naturally: "Bound workspace to Aiman's iPhone (+971504320432)" if
+// we have a JID, or just "Bound workspace to Aiman's iPhone" if not.
+func phoneSuffix(b *binding.Binding) string {
+	if p := b.Phone(); p != "" {
+		return " (" + p + ")"
+	}
+	return ""
 }
 
 // readCounts opens dbPath read-only and returns (messages, fts_rows).

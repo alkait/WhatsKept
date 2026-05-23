@@ -18,6 +18,7 @@ import (
 
 	"whatskept/internal/app/web"
 	"whatskept/internal/backup"
+	"whatskept/internal/binding"
 	"whatskept/internal/helpers"
 	"whatskept/internal/postprocess"
 
@@ -126,6 +127,11 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// (e.g. after a typo). The password value is never returned.
 	mux.HandleFunc("GET /api/session/password", s.handleSessionPasswordStatus)
 	mux.HandleFunc("DELETE /api/session/password", s.handleSessionPasswordClear)
+
+	// Workspace binding — the on-disk identity record (.whatskept.json).
+	// Only DELETE is exposed; reads come back as part of /api/workspace/current
+	// so the UI gets binding and workspace state in one round-trip.
+	mux.HandleFunc("DELETE /api/binding", s.handleForgetBinding)
 
 	// Static files (the embedded React UI). Must be registered last so
 	// /api/* takes precedence on the same mux.
@@ -543,12 +549,24 @@ type databaseStatus struct {
 func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	out := databaseStatus{}
 
-	// Latest backup timestamp is workspace-independent — even with no
-	// workspace open we can tell the UI "you have a backup ready".
+	cur := s.ws.get()
+
+	// If the workspace is bound, scope "latest backup" and "has backups"
+	// to that device's UDID. An iPad backup taken five minutes ago is
+	// not relevant to a workspace bound to an iPhone, and surfacing it
+	// as "new data available" would be misleading.
+	var bound *binding.Binding
+	if cur != "" {
+		bound, _ = binding.Load(cur)
+	}
+
 	if infos, err := backup.Discover(backup.DefaultRoot()); err == nil {
 		var latest time.Time
 		for _, b := range infos {
 			if !b.IsEncrypted {
+				continue
+			}
+			if bound != nil && filepath.Base(b.Path) != bound.UDID {
 				continue
 			}
 			out.HasBackups = true
@@ -561,7 +579,6 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 
-	cur := s.ws.get()
 	if cur == "" {
 		writeJSON(w, http.StatusOK, out)
 		return
@@ -689,5 +706,26 @@ func (s *server) handleSessionPasswordStatus(w http.ResponseWriter, _ *http.Requ
 // failure that was likely a wrong-password error.
 func (s *server) handleSessionPasswordClear(w http.ResponseWriter, _ *http.Request) {
 	s.pw.clear()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Workspace binding
+// ---------------------------------------------------------------------------
+
+// handleForgetBinding removes the active workspace's .whatskept.json.
+// The next sync will re-bind from whatever the latest backup says.
+// This is the user-facing escape hatch behind the "Forget this
+// workspace's identity" link in the mismatch modal.
+func (s *server) handleForgetBinding(w http.ResponseWriter, _ *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+	if err := binding.Delete(cur); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("forget binding: %v", err))
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

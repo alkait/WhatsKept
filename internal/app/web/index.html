@@ -58,6 +58,25 @@ const BackIcon       = () => <Svg size={15} d="M19 12H5M12 19l-7-7 7-7" />;
 const LockIcon       = () => <Svg size={13} d="M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2zM7 11V7a5 5 0 0 1 10 0v4" />;
 const UnlockIcon     = () => <Svg size={13} d="M19 11H5a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2zM7 11V7a5 5 0 0 1 9.9-1" />;
 
+// ── identity helpers ──────────────────────────────────────────────────────
+// phoneFromJID turns "971504320432@s.whatsapp.net" into "+971504320432".
+// Returns "" for anything that isn't a phone-number JID. Mirrors
+// internal/binding.Binding.Phone on the server side.
+function phoneFromJID(jid) {
+  if (!jid) return "";
+  const at = jid.indexOf("@");
+  if (at <= 0) return "";
+  const digits = jid.slice(0, at);
+  if (!/^[0-9]+$/.test(digits)) return "";
+  return "+" + digits;
+}
+// shortUDID compacts a 40-hex-char iOS backup UDID into "XXXXXXXX…XXXX"
+// so it can sit in a header line without crowding everything else out.
+function shortUDID(u) {
+  if (!u || u.length < 12) return u || "";
+  return u.slice(0, 8) + "…" + u.slice(-4);
+}
+
 // ── API ───────────────────────────────────────────────────────────────────
 const api = {
   get:  url => fetch(url).then(r => { if (!r.ok) return r.json().then(e => { throw new Error(e.detail||r.statusText); }); return r.json(); }),
@@ -197,12 +216,19 @@ function DeleteConfirmModal({ backup, onClose, onDeleted }) {
 }
 
 // ── BackupCard ────────────────────────────────────────────────────────────
-function BackupCard({ backup, onDelete }) {
+function BackupCard({ backup, onDelete, isBound }) {
   return (
-    <div className="rounded-xl bg-white border px-5 py-4 flex items-center gap-4" style={{borderColor:'#DCF8C6'}}>
+    <div className="rounded-xl bg-white border px-5 py-4 flex items-center gap-4"
+         style={{borderColor: isBound ? '#128C7E' : '#DCF8C6', opacity: isBound ? 1 : 0.7}}>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <p className="font-semibold text-gray-900 truncate">{backup.device_name}</p>
+          {isBound && (
+            <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded-full font-semibold"
+                  style={{background:'#075E54',color:'#fff'}}>
+              This workspace
+            </span>
+          )}
           <span className={`flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full border`}
             style={backup.is_encrypted
               ? {background:'#DCF8C6',borderColor:'#128C7E',color:'#075E54'}
@@ -506,7 +532,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword, onForgetPassword }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -614,8 +640,14 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword
         {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
         {j.error && hasSessionPassword && (
           <button onClick={tryDifferentPassword}
-            className="text-xs text-gray-500 hover:text-gray-800 mt-1 underline">
+            className="text-xs text-gray-500 hover:text-gray-800 mt-1 underline mr-3">
             Use a different password
+          </button>
+        )}
+        {j.error && binding && (
+          <button onClick={onForgetBinding}
+            className="text-xs text-gray-500 hover:text-red-600 mt-1 underline">
+            Forget this workspace's identity
           </button>
         )}
 
@@ -728,7 +760,7 @@ function AgentsPanel({ workspace }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // SCREEN 2 — Backup Manager
 // ═══════════════════════════════════════════════════════════════════════════
-function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
+function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) {
   const [tab, setTab]               = useState("backups");
   const [devices, setDevices]       = useState([]);
   const [backups, setBackups]       = useState([]);
@@ -759,6 +791,23 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   const forgetSessionPassword = async () => {
     try { await api.del("/api/session/password"); } catch(e) {}
     setHasSessionPassword(false);
+  };
+
+  // ── forget workspace binding (the escape hatch behind the ────────────
+  // "Forget this workspace's identity" link in the Database card).
+  // Deletes .whatskept.json so the next sync re-binds from whatever
+  // the latest backup says. Refreshes workspace + dbStatus so the
+  // header and Sync card both reflect the unbound state.
+  const forgetBinding = async () => {
+    if (!window.confirm(
+      "Forget this workspace's identity?\n\n" +
+      "The .whatskept.json file will be deleted. The next sync will rebind " +
+      "the workspace to whichever backup it decrypts \u2014 use this only when you " +
+      "genuinely intend to repoint the workspace at a different WhatsApp account."
+    )) return;
+    try { await api.del("/api/binding"); } catch(e) {}
+    await reloadWorkspace();
+    await reloadDbStatus();
   };
 
   // ── load backups ──────────────────────────────────────────────────────
@@ -810,6 +859,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
       }));
       if (msg.type === "done") {
         const ok = msg.status === "ok";
+        // Every completed messages-sync may have written a fresh
+        // .whatskept.json (first sync) or refreshed LastSyncedAt
+        // (subsequent). Pull the new binding so the header label
+        // updates without the user having to switch workspaces.
+        if (isDbTask) setTimeout(reloadWorkspace, 500);
         // Plumb the server-side error string through to j.error so the
         // card can render WHY a sync failed instead of just "Sync failed."
         // with no context. msg.error is set by jobManager.startInProcess
@@ -885,8 +939,27 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
           </svg>
         </div>
         <div className="flex-1 min-w-0">
-          <p className="text-xs font-semibold leading-none" style={{color:'#075E54'}}>WhatsKept</p>
-          <p className="text-xs text-gray-400 truncate mt-0.5">{workspace.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+          {workspace.binding ? (
+            <>
+              <p className="text-sm font-semibold leading-tight text-gray-900 truncate">
+                {workspace.binding.device_name || "iPhone"}
+                {workspace.binding.owner_jid && (
+                  <span className="text-gray-500 font-normal ml-2">
+                    {phoneFromJID(workspace.binding.owner_jid)}
+                  </span>
+                )}
+              </p>
+              <p className="text-[11px] text-gray-400 truncate mt-0.5">
+                {workspace.path.replace(/^\/Users\/[^/]+/, "~")}
+                <span className="font-mono ml-2">{shortUDID(workspace.binding.udid)}</span>
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="text-xs font-semibold leading-none" style={{color:'#075E54'}}>WhatsKept</p>
+              <p className="text-xs text-gray-400 truncate mt-0.5">{workspace.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+            </>
+          )}
         </div>
         <button onClick={onSwitchWorkspace} className="text-xs text-gray-400 hover:text-gray-600 ml-2">
           Switch workspace
@@ -940,7 +1013,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
             ) : (
               <div className="space-y-3">
                 {backups.map(b => (
-                  <BackupCard key={b.udid} backup={b} onDelete={setDeleteTarget} />
+                  <BackupCard key={b.udid} backup={b} onDelete={setDeleteTarget}
+                    isBound={!!(workspace.binding && workspace.binding.udid === b.udid)} />
                 ))}
               </div>
             )}
@@ -954,14 +1028,31 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
                 <span>📱</span>
                 <span>No device detected. Plug in your iPhone or iPad via USB, unlock it, and trust this Mac.</span>
               </div>
-            ) : (
-              <div className="space-y-3">
-                {devices.map(d => (
-                  <DeviceRow key={d.udid} device={d} job={jobs[d.udid]} onStart={startBackup}
-                    hasSessionPassword={hasSessionPassword} onForgetPassword={forgetSessionPassword} />
-                ))}
-              </div>
-            )}
+            ) : (() => {
+              // Once the workspace is bound, the Run Backup picker is
+              // scoped to that one device. Plugging in someone else's
+              // iPhone shouldn't offer to back it up into this workspace.
+              const allowed = workspace.binding
+                ? devices.filter(d => d.udid === workspace.binding.udid)
+                : devices;
+              if (workspace.binding && allowed.length === 0) {
+                return (
+                  <div className="rounded-xl border border-dashed p-4 text-sm flex items-center gap-3"
+                       style={{borderColor:'#128C7E',background:'#fff',color:'#128C7E'}}>
+                    <span>🔌</span>
+                    <span>Connect <span className="font-semibold">{workspace.binding.device_name}</span> via USB and unlock it to run a backup.</span>
+                  </div>
+                );
+              }
+              return (
+                <div className="space-y-3">
+                  {allowed.map(d => (
+                    <DeviceRow key={d.udid} device={d} job={jobs[d.udid]} onStart={startBackup}
+                      hasSessionPassword={hasSessionPassword} onForgetPassword={forgetSessionPassword} />
+                  ))}
+                </div>
+              );
+            })()}
           </section>
         </>)}
 
@@ -977,6 +1068,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
             onSync={startSync}
             hasSessionPassword={hasSessionPassword}
             onForgetPassword={forgetSessionPassword}
+            binding={workspace.binding}
+            onForgetBinding={forgetBinding}
           />
         )}
 
@@ -1000,6 +1093,19 @@ function App() {
   const [workspace, setWorkspace] = useState(null);
   const [checking, setChecking]   = useState(true);
 
+  // reloadWorkspace re-fetches /api/workspace/current and refreshes
+  // the active workspace's binding without dropping to the picker
+  // screen. Triggered after each sync (so a freshly-written
+  // .whatskept.json shows up in the header immediately) and after
+  // the Forget-identity action (so the label switches back to the
+  // unbound state without a page reload).
+  const reloadWorkspace = async () => {
+    try {
+      const ws = await api.get("/api/workspace/current");
+      if (ws) setWorkspace(ws);
+    } catch(e) {}
+  };
+
   useEffect(() => {
     api.get("/api/workspace/current")
       .then(ws => { if (ws) setWorkspace(ws); })
@@ -1011,7 +1117,9 @@ function App() {
     <div className="min-h-screen flex items-center justify-center text-sm" style={{background:'#ECE5DD',color:'#128C7E'}}>Loading…</div>
   );
   if (!workspace) return <WorkspaceScreen onOpen={setWorkspace} />;
-  return <BackupManagerScreen workspace={workspace} onSwitchWorkspace={() => setWorkspace(null)} />;
+  return <BackupManagerScreen workspace={workspace}
+           onSwitchWorkspace={() => setWorkspace(null)}
+           reloadWorkspace={reloadWorkspace} />;
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
