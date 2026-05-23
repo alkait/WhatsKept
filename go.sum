@@ -3,6 +3,8 @@ github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9 h1:y/vHUusS1xEnKGr
 github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9/go.mod h1:B4yeke0t54lzvHGLMoQaHjweT8Yt0DgES3WrZGuRTzk=
 github.com/dunhamsteve/plist v0.0.0-20211213035615-a528b51ff82f h1:isN+gnW3pKSwhwGiENPfVy960FJ3uOI2K+x4X3r57AE=
 github.com/dunhamsteve/plist v0.0.0-20211213035615-a528b51ff82f/go.mod h1:wYdaZYuFSWCziwZl3+0BNSnBCw1FKv4/V2JtV+RA6Xc=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/inconshreveable/mousetrap v1.1.0 h1:wN+x4NVGpMsO7ErUn/mUI3vEoE6Jt13X2s0bqwp9tc8=
 github.com/inconshreveable/mousetrap v1.1.0/go.mod h1:vpF70FUmC8bwa3OWnCshd2FqLfsEA9PFc4w1p2J65bw=
 github.com/jessevdk/go-flags v1.4.0/go.mod h1:4FA24M0QyGHXBuZZK/XkWh8h0e1EYbRYJSGM75WSRxI=

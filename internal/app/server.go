@@ -59,6 +59,10 @@ func newServer() (*server, error) {
 }
 
 // Start begins serving in a background goroutine and returns immediately.
+//
+// Also kicks off a background scan for orphan idevicebackup2 processes
+// (e.g. one left running by a previous app crash). Any orphan found is
+// adopted into the job manager so the UI can re-attach to it.
 func (s *server) Start() {
 	go func() {
 		if err := s.httpServer.Serve(s.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -67,6 +71,7 @@ func (s *server) Start() {
 			fmt.Fprintln(os.Stderr, "app server error:", err)
 		}
 	}()
+	go s.jobs.adoptOrphans()
 }
 
 // Shutdown gracefully stops the HTTP server.
@@ -378,20 +383,87 @@ func (s *server) handleDeleteBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------------------------------------------------------------------
-// Job handlers (Phase A: stubs)
+// Job handlers
 // ---------------------------------------------------------------------------
 
-func (s *server) handleRunBackup(w http.ResponseWriter, _ *http.Request) {
-	httpError(w, http.StatusServiceUnavailable,
-		"Run-backup is not yet wired in this build. Coming in the next iteration once `idevicebackup2` is embedded.")
+type runBackupRequest struct {
+	UDID     string `json:"udid"`
+	Network  bool   `json:"network"`
+	Password string `json:"password"`
+}
+
+type jobResponse struct {
+	JobID string `json:"job_id"`
+}
+
+func (s *server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
+	var req runBackupRequest
+	if err := decodeJSON(r, &req); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	root := backup.DefaultRoot()
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("cannot create backup root: %v", err))
+		return
+	}
+
+	jobID, err := s.jobs.startBackup(req.UDID, req.Network, req.Password, root, helpers.Command)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, jobResponse{JobID: jobID})
 }
 
 func (s *server) handleActiveJob(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, s.jobs.activeJob())
 }
 
-func (s *server) handleStreamJob(w http.ResponseWriter, _ *http.Request) {
-	httpError(w, http.StatusNotFound, "no such job")
+// handleStreamJob serves a Server-Sent Events feed of one job's
+// output. Subscribes to the job's event broadcaster, writes each
+// event as `data: <json>\n\n`, flushes, and closes when the channel
+// closes (i.e. the job finishes) or the client disconnects.
+func (s *server) handleStreamJob(w http.ResponseWriter, r *http.Request) {
+	jobID := r.PathValue("job_id")
+	j, ok := s.jobs.get(jobID)
+	if !ok {
+		httpError(w, http.StatusNotFound, "no such job")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpError(w, http.StatusInternalServerError, "streaming not supported by this server")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	sub := j.subscribe()
+	for {
+		select {
+		case ev, ok := <-sub:
+			if !ok {
+				return // job done; channel closed by jobManager
+			}
+			payload, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+				return // client disconnected
+			}
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
