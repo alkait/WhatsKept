@@ -688,7 +688,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   const [deleteTarget, setDeleteTarget] = useState(null);
 
   // jobs: { [key]: { running, done, lines, adopted, pid, startedAt, error } }
-  // key = udid for backup jobs, "db:update" for database tasks
+  // key = udid for backup jobs, "db:sync" for the messages sync job
   const [jobs, setJobs] = useState({});
 
   const patchJob = (key, patch) =>
