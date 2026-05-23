@@ -55,14 +55,15 @@ var ignoreEntries = []string{
 // (and ultimately the React UI). All fields are JSON-tagged for
 // direct re-use in the SSE "done" payload.
 type SyncResult struct {
-	BackupPath     string    `json:"backup_path"`
-	BackupTakenAt  time.Time `json:"backup_taken_at"`
-	DBPath         string    `json:"db_path"`
-	BytesExtracted int64     `json:"bytes_extracted"`
-	MessageCount   int       `json:"message_count"`
-	FTSCount       int       `json:"fts_count"`
-	AgentsMDExists bool      `json:"agents_md_exists"`
-	IgnoreFiles    []string  `json:"ignore_files"`
+	BackupPath     string            `json:"backup_path"`
+	BackupTakenAt  time.Time         `json:"backup_taken_at"`
+	DBPath         string            `json:"db_path"`
+	BytesExtracted int64             `json:"bytes_extracted"`
+	MessageCount   int               `json:"message_count"`
+	FTSCount       int               `json:"fts_count"`
+	AgentsMDExists bool              `json:"agents_md_exists"`
+	IgnoreFiles    []string          `json:"ignore_files"`
+	ProfileSync    *ProfileSyncStats `json:"profile_sync,omitempty"`
 }
 
 // ApplyViews opens the SQLite database at dbPath and runs the whole
@@ -223,8 +224,14 @@ func SyncMessages(
 	// staging file. Don't trust its contents.
 	_ = os.Remove(tempPath)
 
+	log("Unlocking iOS backup…")
+	bundle, err := backup.Open(latest, password)
+	if err != nil {
+		return nil, fmt.Errorf("unlock backup: %w", err)
+	}
+
 	log("Decrypting ChatStorage.sqlite from backup…")
-	n, err := backup.ExtractChatStorage(latest, password, tempPath)
+	n, err := backup.ExtractChatStorageFrom(bundle, tempPath)
 	if err != nil {
 		_ = os.Remove(tempPath)
 		return nil, fmt.Errorf("decrypt: %w", err)
@@ -292,6 +299,26 @@ func SyncMessages(
 		return nil, err
 	}
 
+	// Profile-avatar sync. Non-fatal: a failure here doesn't unwind
+	// the message sync — the DB is already on disk and applied. The
+	// stats (and any per-file errors) are surfaced in the SyncResult
+	// so the UI can render "X avatars synced, Y failed" without
+	// blowing up the success path.
+	log("Syncing WhatsApp profile pictures…")
+	profileStats, profileErr := SyncProfiles(bundle, workspace, livePath, log)
+	if profileErr != nil {
+		log(fmt.Sprintf("Profile sync failed: %v", profileErr))
+		profileStats = &ProfileSyncStats{
+			Errors: []string{profileErr.Error()},
+		}
+	} else if profileStats != nil {
+		if profileStats.Failed > 0 {
+			log(fmt.Sprintf("Wrote %d avatars (%d failed).", profileStats.Extracted, profileStats.Failed))
+		} else {
+			log(fmt.Sprintf("Wrote %d avatars.", profileStats.Extracted))
+		}
+	}
+
 	log("Writing AGENTS.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err
@@ -314,6 +341,7 @@ func SyncMessages(
 		FTSCount:       ftsCount,
 		AgentsMDExists: agentsErr == nil,
 		IgnoreFiles:    agentIgnoreFiles,
+		ProfileSync:    profileStats,
 	}, nil
 }
 

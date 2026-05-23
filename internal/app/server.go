@@ -608,6 +608,7 @@ type databaseStatus struct {
 	DBPath         string `json:"db_path,omitempty"`
 	MessageCount   *int   `json:"message_count,omitempty"`
 	FTSCount       *int   `json:"fts_count,omitempty"`
+	AvatarCount    *int   `json:"avatar_count,omitempty"`     // wa_profile_picture row count
 	LastSyncedAt   string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
 	LatestBackupAt string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
 	IsStale        bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
@@ -679,23 +680,27 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 
 	// Best-effort counts. A failure here doesn't sink the response —
 	// the UI just hides those fields.
-	msgs, fts := readDBCounts(dbPath)
+	msgs, fts, avatars := readDBCounts(dbPath)
 	if msgs >= 0 {
 		out.MessageCount = &msgs
 	}
 	if fts >= 0 {
 		out.FTSCount = &fts
 	}
+	if avatars >= 0 {
+		out.AvatarCount = &avatars
+	}
 
 	writeJSON(w, http.StatusOK, out)
 }
 
-// readDBCounts opens dbPath read-only and returns (messages, fts).
-// Returns (-1, -1) entirely on open failure; either field returns -1
-// individually if its table is missing (FTS may be absent on a DB
-// that has been decrypted but not yet had views applied).
-func readDBCounts(dbPath string) (msgs, fts int) {
-	msgs, fts = -1, -1
+// readDBCounts opens dbPath read-only and returns (messages, fts,
+// avatars). Returns (-1, -1, -1) entirely on open failure; any field
+// returns -1 individually if its table is missing (FTS may be absent
+// on a DB that has been decrypted but not yet had views applied;
+// wa_profile_picture is absent until the first sync run).
+func readDBCounts(dbPath string) (msgs, fts, avatars int) {
+	msgs, fts, avatars = -1, -1, -1
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return
@@ -708,6 +713,10 @@ func readDBCounts(dbPath string) (msgs, fts int) {
 	var f int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts`).Scan(&f); err == nil {
 		fts = f
+	}
+	var a int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM wa_profile_picture`).Scan(&a); err == nil {
+		avatars = a
 	}
 	return
 }
