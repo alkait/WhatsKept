@@ -272,12 +272,23 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
 }
 
 // ── DeviceRow ─────────────────────────────────────────────────────────────
-function DeviceRow({ device, job, onStart }) {
+function DeviceRow({ device, job, onStart, hasSessionPassword, onForgetPassword }) {
   const j = job || {};
   const isRunning = !!j.running;
   const done = j.done !== undefined ? j.done : null;
   const started = (j.lines || []).length > 0 || isRunning || done !== null;
   const [prompting, setPrompting] = useState(false);
+  // When the server already holds a cached password for this session,
+  // skip the modal entirely and reuse it. Saves a click per backup
+  // after the first one in a session.
+  const launch = () => {
+    if (hasSessionPassword) onStart(device, "");
+    else setPrompting(true);
+  };
+  const tryDifferentPassword = async () => {
+    await onForgetPassword();
+    setPrompting(true);
+  };
   return (
     <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
       <div className="flex items-center justify-between gap-4">
@@ -288,7 +299,7 @@ function DeviceRow({ device, job, onStart }) {
           </div>
           <p className="text-xs text-gray-400 mt-0.5 font-mono truncate">{device.udid}</p>
         </div>
-        <button onClick={() => setPrompting(true)} disabled={isRunning}
+        <button onClick={launch} disabled={isRunning}
           className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-50 px-4 py-2 text-sm font-semibold transition-colors"
           style={{background: isRunning ? '#128C7E' : '#075E54'}}>
           <RefreshIcon />
@@ -296,6 +307,12 @@ function DeviceRow({ device, job, onStart }) {
         </button>
       </div>
       {j.error && <p className="text-sm text-red-400 mt-2">{j.error}</p>}
+      {j.error && hasSessionPassword && (
+        <button onClick={tryDifferentPassword}
+          className="text-xs text-gray-500 hover:text-gray-800 mt-1 underline">
+          Use a different password
+        </button>
+      )}
       <BackupProgressCard
         lines={j.lines || []}
         adopted={!!j.adopted}
@@ -489,8 +506,18 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword, onForgetPassword }) {
   const [prompting, setPrompting] = useState(false);
+  // Same UX rule as DeviceRow: if the server already has a cached
+  // password for this session, skip the modal.
+  const launch = () => {
+    if (hasSessionPassword) onSync("");
+    else setPrompting(true);
+  };
+  const tryDifferentPassword = async () => {
+    await onForgetPassword();
+    setPrompting(true);
+  };
   const j = job || {};
   const isRunning = !!j.running;
   const hasDone = j.done !== undefined && j.done !== null;
@@ -575,7 +602,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
               <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{dbStatus.db_path}</p>
             )}
           </div>
-          <button onClick={() => setPrompting(true)} disabled={buttonDisabled}
+          <button onClick={launch} disabled={buttonDisabled}
             className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
             style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}
             title={!hasBackups ? "No iOS backups available yet" : ""}>
@@ -585,6 +612,12 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync }) {
         </div>
 
         {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
+        {j.error && hasSessionPassword && (
+          <button onClick={tryDifferentPassword}
+            className="text-xs text-gray-500 hover:text-gray-800 mt-1 underline">
+            Use a different password
+          </button>
+        )}
 
         <BackupProgressCard
           lines={j.lines || []}
@@ -715,6 +748,19 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   const reloadDbStatus = () => api.get("/api/database/status").then(setDbStatus).catch(() => {});
   useEffect(() => { reloadDbStatus(); }, []);
 
+  // ── session-cached backup password ────────────────────────────────────
+  // The server caches the iOS-backup password in RAM for the lifetime
+  // of the process (cleared on workspace switch). Knowing whether one
+  // is cached lets the UI skip the modal on subsequent runs.
+  const [hasSessionPassword, setHasSessionPassword] = useState(false);
+  const reloadSessionPassword = () =>
+    api.get("/api/session/password").then(r => setHasSessionPassword(!!(r && r.has))).catch(() => {});
+  useEffect(() => { reloadSessionPassword(); }, []);
+  const forgetSessionPassword = async () => {
+    try { await api.del("/api/session/password"); } catch(e) {}
+    setHasSessionPassword(false);
+  };
+
   // ── load backups ──────────────────────────────────────────────────────
   const [backupsError, setBackupsError] = useState(null);
   const reloadBackups = useCallback(async () => {
@@ -795,11 +841,15 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
   };
 
   // ── start backup ──────────────────────────────────────────────────────
+  // `password` may be "" when the caller knows the server already has
+  // one cached for this session. The server falls back to its cache
+  // and, if a fresh non-empty password is provided, replaces it.
   const startBackup = async (device, password) => {
     const key = device.udid;
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
       const { job_id } = await api.post("/api/backup/run", { udid: key, password: password || null });
+      if (password) setHasSessionPassword(true);
       streamJob(job_id, key, false);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -812,6 +862,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
       const { job_id } = await api.post("/api/database/sync", { password });
+      if (password) setHasSessionPassword(true);
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -906,7 +957,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
             ) : (
               <div className="space-y-3">
                 {devices.map(d => (
-                  <DeviceRow key={d.udid} device={d} job={jobs[d.udid]} onStart={startBackup} />
+                  <DeviceRow key={d.udid} device={d} job={jobs[d.udid]} onStart={startBackup}
+                    hasSessionPassword={hasSessionPassword} onForgetPassword={forgetSessionPassword} />
                 ))}
               </div>
             )}
@@ -923,6 +975,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
             reloadDbStatus={reloadDbStatus}
             job={jobs["db:sync"]}
             onSync={startSync}
+            hasSessionPassword={hasSessionPassword}
+            onForgetPassword={forgetSessionPassword}
           />
         )}
 

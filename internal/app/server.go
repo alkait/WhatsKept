@@ -35,6 +35,7 @@ type server struct {
 
 	ws   *workspaceState
 	jobs *jobManager
+	pw   *passwordStore // session-only iOS-backup password cache
 }
 
 // newServer binds a free localhost TCP port, builds the route table,
@@ -51,6 +52,7 @@ func newServer() (*server, error) {
 		url:      fmt.Sprintf("http://127.0.0.1:%d/", port),
 		ws:       newWorkspaceState(),
 		jobs:     newJobManager(),
+		pw:       newPasswordStore(),
 	}
 
 	mux := http.NewServeMux()
@@ -118,6 +120,12 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// one with the current workspace as its working folder.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
 	mux.HandleFunc("POST /api/agents/{id}/open", s.handleOpenAgent)
+
+	// Session password — lets the UI skip the modal when a backup
+	// password is already cached, and lets it explicitly forget one
+	// (e.g. after a typo). The password value is never returned.
+	mux.HandleFunc("GET /api/session/password", s.handleSessionPasswordStatus)
+	mux.HandleFunc("DELETE /api/session/password", s.handleSessionPasswordClear)
 
 	// Static files (the embedded React UI). Must be registered last so
 	// /api/* takes precedence on the same mux.
@@ -223,6 +231,7 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// time, and (b) the modal already exists for the only operation
 	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
+	s.pw.clear()
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -248,6 +257,7 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.ws.set(abs)
+	s.pw.clear()
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -420,7 +430,16 @@ func (s *server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobID, err := s.jobs.startBackup(req.UDID, req.Network, req.Password, root, helpers.Command)
+	// Update the session cache when a new password is supplied, then
+	// pull whatever's now cached. The cache stays empty for unencrypted
+	// backups (req.Password == "" and nothing previously stored), which
+	// matches idevicebackup2's expectation.
+	if req.Password != "" {
+		s.pw.set(req.Password)
+	}
+	password := s.pw.get()
+
+	jobID, err := s.jobs.startBackup(req.UDID, req.Network, password, root, helpers.Command)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -630,7 +649,11 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.Password == "" {
+	if req.Password != "" {
+		s.pw.set(req.Password)
+	}
+	password := s.pw.get()
+	if password == "" {
 		httpError(w, http.StatusBadRequest, "backup password is required")
 		return
 	}
@@ -639,7 +662,7 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 		_, err := postprocess.SyncMessages(
 			backup.DefaultRoot(),
 			cur,
-			req.Password,
+			password,
 			AgentIgnoreFiles(),
 			log,
 		)
@@ -647,4 +670,24 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 	})
 
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// ---------------------------------------------------------------------------
+// Session password handlers
+// ---------------------------------------------------------------------------
+
+// handleSessionPasswordStatus returns whether the session cache is
+// currently populated. The password itself is never sent to the UI —
+// only a boolean. The frontend uses this to decide whether to skip the
+// password modal before kicking off a backup or sync.
+func (s *server) handleSessionPasswordStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"has": s.pw.has()})
+}
+
+// handleSessionPasswordClear forgets the cached password. Called when
+// the user clicks "Use a different password" after a sync/backup
+// failure that was likely a wrong-password error.
+func (s *server) handleSessionPasswordClear(w http.ResponseWriter, _ *http.Request) {
+	s.pw.clear()
+	w.WriteHeader(http.StatusNoContent)
 }
