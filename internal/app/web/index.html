@@ -764,13 +764,34 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace }) {
       }));
       if (msg.type === "done") {
         const ok = msg.status === "ok";
-        patchJob(key, { running: false, done: ok });
+        // Plumb the server-side error string through to j.error so the
+        // card can render WHY a sync failed instead of just "Sync failed."
+        // with no context. msg.error is set by jobManager.startInProcess
+        // for in-process job errors, and by pumpProcess for non-zero
+        // subprocess exits.
+        patchJob(key, {
+          running: false,
+          done: ok,
+          error: ok ? "" : (msg.error || "")
+        });
         es.close();
         if (ok && isDbTask) setTimeout(reloadDbStatus, 1000);
         if (ok && !isDbTask) setTimeout(() => setBackupsKey(k => k + 1), 1500);
       }
     };
-    es.onerror = () => { patchJob(key, { running: false, done: false }); es.close(); };
+    es.onerror = () => {
+      // Distinct from a real "done:error". A transport drop here means
+      // we lost the connection without ever seeing a terminal event —
+      // the goroutine MAY still be running and MAY still write the DB
+      // successfully. Mark indeterminate and ask the user to refresh
+      // rather than slam "Sync failed."
+      patchJob(key, {
+        running: false,
+        done: false,
+        error: "Lost connection to the sync stream. Click Refresh to verify whether it actually completed."
+      });
+      es.close();
+    };
   };
 
   // ── start backup ──────────────────────────────────────────────────────
