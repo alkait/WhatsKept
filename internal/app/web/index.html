@@ -463,38 +463,61 @@ function WorkspaceScreen({ onOpen }) {
         <p className="text-gray-500 mt-1 text-sm">A searchable copy of your WhatsApp history</p>
       </div>
 
-      {mode === null && (
-        <div className="w-full max-w-sm space-y-3">
-          <button onClick={() => setMode("create")}
-            className="w-full flex items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors text-white"
-            style={{background:'#075E54'}}>
-            <FolderPlusIcon />
-            <div>
-              <p className="font-semibold text-sm">New workspace</p>
-              <p className="text-xs mt-0.5" style={{color:'#DCF8C6'}}>Set up a fresh workspace folder</p>
-            </div>
-          </button>
-          <button onClick={() => setMode("open")}
-            className="w-full flex items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors bg-white border hover:bg-gray-50"
-            style={{borderColor:'#128C7E',color:'#075E54'}}>
-            <FolderOpenIcon />
-            <div>
-              <p className="font-semibold text-sm">Open existing workspace</p>
-              <p className="text-gray-500 text-xs mt-0.5">Continue from a previous session</p>
-            </div>
-          </button>
-          {recent.filter(r => r.exists).length > 0 && (
-            <div className="mt-6">
-              <p className="text-xs text-gray-400 uppercase tracking-wider mb-2 px-1">Recent</p>
+      {mode === null && (() => {
+        // /api/workspace/recent may include entries whose directory has
+        // since been moved or deleted — filter them out so we never
+        // render a button that would 404 on click. The first survivor
+        // (most-recently-opened, by saveRecent's ordering) becomes the
+        // primary CTA in the green WhatsKept brand colour; the rest
+        // stack underneath in the lighter card style.
+        const existingRecent = recent.filter(r => r.exists);
+        const [top, ...rest] = existingRecent;
+        const hasRecent      = !!top;
+        // When there's no recent at all (first run, or every recent
+        // was deleted), "New workspace" inherits the primary green
+        // slot so the screen still has a clear default action. When
+        // there IS a recent, "New workspace" demotes to the same
+        // secondary style as "Open existing".
+        const newIsPrimary = !hasRecent;
+        return (
+          <div className="w-full max-w-sm space-y-3">
+            {top && (
+              <button onClick={() => open(top.path)}
+                className="w-full flex items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors text-white"
+                style={{background:'#075E54'}}>
+                <FolderOpenIcon />
+                <div className="min-w-0 flex-1">
+                  {top.binding ? (
+                    <>
+                      <p className="font-semibold text-sm truncate">
+                        {top.binding.device_name || "iPhone"}
+                        {top.binding.owner_jid && (
+                          <span className="font-normal ml-2" style={{color:'#DCF8C6'}}>{phoneFromJID(top.binding.owner_jid)}</span>
+                        )}
+                      </p>
+                      <p className="text-xs mt-0.5 truncate" style={{color:'#DCF8C6'}}>
+                        {top.path.replace(/^\/Users\/[^/]+/, "~")}
+                      </p>
+                    </>
+                  ) : (
+                    <>
+                      <p className="font-semibold text-sm truncate">{top.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+                      <p className="text-xs mt-0.5" style={{color:'#DCF8C6'}}>
+                        {top.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}
+                      </p>
+                    </>
+                  )}
+                </div>
+              </button>
+            )}
+
+            {rest.length > 0 && (
               <div className="space-y-1.5">
-                {recent.filter(r => r.exists).map(r => {
-                  // /api/workspace/recent runs describeWorkspace on each
-                  // entry, so r.binding is present iff a previous sync
-                  // wrote a .whatskept.json. Bound entries surface device
-                  // name + phone as the primary label — the bare path is
-                  // not actionable information when you have eight
-                  // workspaces. Unbound entries fall back to the legacy
-                  // path + status display.
+                {rest.map(r => {
+                  // Bound entries surface device + phone as the primary
+                  // label — the bare path isn't actionable when you have
+                  // eight workspaces. Unbound entries fall back to the
+                  // legacy path + status display.
                   const bound = r.binding;
                   return (
                     <button key={r.path} onClick={() => open(r.path)}
@@ -523,10 +546,34 @@ function WorkspaceScreen({ onOpen }) {
                   );
                 })}
               </div>
-            </div>
-          )}
-        </div>
-      )}
+            )}
+
+            <button onClick={() => setMode("open")}
+              className="w-full flex items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors bg-white border hover:bg-gray-50"
+              style={{borderColor:'#128C7E',color:'#075E54'}}>
+              <FolderOpenIcon />
+              <div>
+                <p className="font-semibold text-sm">Open existing workspace</p>
+                <p className="text-gray-500 text-xs mt-0.5">Browse for a workspace folder</p>
+              </div>
+            </button>
+
+            <button onClick={() => setMode("create")}
+              className={`w-full flex items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors ${newIsPrimary ? "text-white" : "bg-white border hover:bg-gray-50"}`}
+              style={newIsPrimary
+                ? {background:'#075E54'}
+                : {borderColor:'#128C7E',color:'#075E54'}}>
+              <FolderPlusIcon />
+              <div>
+                <p className="font-semibold text-sm">New workspace</p>
+                <p className="text-xs mt-0.5" style={newIsPrimary ? {color:'#DCF8C6'} : {color:'#6b7280'}}>
+                  Set up a fresh workspace folder
+                </p>
+              </div>
+            </button>
+          </div>
+        );
+      })()}
 
       {mode === "create" && (
         <div className="w-full max-w-sm">
