@@ -430,17 +430,41 @@ function WorkspaceScreen({ onOpen }) {
             <div className="mt-6">
               <p className="text-xs text-gray-400 uppercase tracking-wider mb-2 px-1">Recent</p>
               <div className="space-y-1.5">
-                {recent.filter(r => r.exists).map(r => (
-                  <button key={r.path} onClick={() => open(r.path)}
-                    className="w-full flex items-center gap-3 rounded-lg bg-white hover:bg-gray-50 border px-4 py-3 text-left transition-colors"
-                    style={{borderColor:'#DCF8C6'}}>
-                    <div style={{color:'#128C7E'}}><FolderOpenIcon /></div>
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-gray-800 truncate">{r.path.replace(/^\/Users\/[^/]+/, "~")}</p>
-                      <p className="text-xs text-gray-400 mt-0.5">{r.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}</p>
-                    </div>
-                  </button>
-                ))}
+                {recent.filter(r => r.exists).map(r => {
+                  // /api/workspace/recent runs describeWorkspace on each
+                  // entry, so r.binding is present iff a previous sync
+                  // wrote a .whatskept.json. Bound entries surface device
+                  // name + phone as the primary label — the bare path is
+                  // not actionable information when you have eight
+                  // workspaces. Unbound entries fall back to the legacy
+                  // path + status display.
+                  const bound = r.binding;
+                  return (
+                    <button key={r.path} onClick={() => open(r.path)}
+                      className="w-full flex items-center gap-3 rounded-lg bg-white hover:bg-gray-50 border px-4 py-3 text-left transition-colors"
+                      style={{borderColor:'#DCF8C6'}}>
+                      <div style={{color:'#128C7E'}}><FolderOpenIcon /></div>
+                      <div className="min-w-0 flex-1">
+                        {bound ? (
+                          <>
+                            <p className="text-sm font-medium text-gray-800 truncate">
+                              {bound.device_name || "iPhone"}
+                              {bound.owner_jid && (
+                                <span className="text-gray-500 font-normal ml-2">{phoneFromJID(bound.owner_jid)}</span>
+                              )}
+                            </p>
+                            <p className="text-xs text-gray-400 mt-0.5 truncate">{r.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+                          </>
+                        ) : (
+                          <>
+                            <p className="text-sm font-medium text-gray-800 truncate">{r.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+                            <p className="text-xs text-gray-400 mt-0.5">{r.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}</p>
+                          </>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           )}
@@ -864,6 +888,15 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         // (subsequent). Pull the new binding so the header label
         // updates without the user having to switch workspaces.
         if (isDbTask) setTimeout(reloadWorkspace, 500);
+        // Reconcile with the server's session-password truth. The
+        // server only commits a password to its cache AFTER the job
+        // succeeds, so on success `has` flips to true and on failure
+        // it stays whatever it was before (typically false). This is
+        // what fixes the "wrong password gets stuck" bug: a failed
+        // attempt leaves hasSessionPassword=false on the client, so
+        // the next button click re-opens the password modal instead
+        // of silently retrying with the same bad password.
+        reloadSessionPassword();
         // Plumb the server-side error string through to j.error so the
         // card can render WHY a sync failed instead of just "Sync failed."
         // with no context. msg.error is set by jobManager.startInProcess
@@ -903,7 +936,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
       const { job_id } = await api.post("/api/backup/run", { udid: key, password: password || null });
-      if (password) setHasSessionPassword(true);
+      // Don't flip hasSessionPassword=true here — the server hasn't
+      // verified the password yet. The streamJob "done" handler will
+      // reconcile from /api/session/password once the backup either
+      // succeeds (server commits the cache) or fails (server leaves
+      // it untouched, so the modal re-opens on retry).
       streamJob(job_id, key, false);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -916,7 +953,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
       const { job_id } = await api.post("/api/database/sync", { password });
-      if (password) setHasSessionPassword(true);
+      // See startBackup: server-side cache commit is deferred to the
+      // job's success, so we read it back from /api/session/password
+      // on "done" rather than assuming it took.
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });

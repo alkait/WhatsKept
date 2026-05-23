@@ -208,7 +208,12 @@ func (m *jobManager) startInProcess(task string, work func(log func(string)) err
 // startBackup spawns a backup subprocess and registers it. The caller
 // gets back the new job's ID; subscribers (SSE) can connect via
 // /api/stream/{id} immediately afterwards.
-func (m *jobManager) startBackup(udid string, network bool, password, backupRoot string, helperCmd helperCommandFunc) (string, error) {
+// onDone is invoked from pumpProcess once the subprocess has exited
+// and the final status is known. It runs *before* the "done" event
+// is emitted to subscribers, so any state mutation it performs (e.g.
+// caching a verified backup password) is visible to anything that
+// reacts to the "done" event. Pass nil if no post-exit hook is needed.
+func (m *jobManager) startBackup(udid string, network bool, password, backupRoot string, helperCmd helperCommandFunc, onDone func(ok bool)) (string, error) {
 	args := []string{}
 	if udid != "" {
 		args = append(args, "-u", udid)
@@ -254,7 +259,7 @@ func (m *jobManager) startBackup(udid string, network bool, password, backupRoot
 	}
 	m.put(j)
 
-	go m.pumpProcess(j, cmd, stdout, cancel)
+	go m.pumpProcess(j, cmd, stdout, cancel, onDone)
 	return j.id, nil
 }
 
@@ -265,7 +270,10 @@ type helperCommandFunc func(ctx context.Context, tool string, args ...string) (*
 
 // pumpProcess scans the merged stdout/stderr pipe line by line,
 // emitting "line" events, then waits for the process and emits "done".
-func (m *jobManager) pumpProcess(j *job, cmd *exec.Cmd, output io.ReadCloser, cancel context.CancelFunc) {
+// onDone, if non-nil, is called with ok=true iff the process exited
+// cleanly (exit code 0). It runs synchronously before the "done"
+// event so subscribers observe a consistent post-exit world.
+func (m *jobManager) pumpProcess(j *job, cmd *exec.Cmd, output io.ReadCloser, cancel context.CancelFunc, onDone func(ok bool)) {
 	defer cancel()
 	defer output.Close()
 
@@ -289,6 +297,9 @@ func (m *jobManager) pumpProcess(j *job, cmd *exec.Cmd, output io.ReadCloser, ca
 			code = -1
 		}
 		status = "error"
+	}
+	if onDone != nil {
+		onDone(status == "ok")
 	}
 	j.emit(jobEvent{Type: "done", Status: status, Code: code})
 }

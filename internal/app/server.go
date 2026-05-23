@@ -436,16 +436,34 @@ func (s *server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the session cache when a new password is supplied, then
-	// pull whatever's now cached. The cache stays empty for unencrypted
-	// backups (req.Password == "" and nothing previously stored), which
-	// matches idevicebackup2's expectation.
-	if req.Password != "" {
-		s.pw.set(req.Password)
+	// Determine the password to attempt without yet committing to the
+	// session cache. If the user supplied one, prefer it (this is the
+	// "retry with a different password" path); otherwise fall back to
+	// whatever's currently cached from a previous successful run.
+	//
+	// We deliberately do NOT call s.pw.set(req.Password) here. Caching
+	// before idevicebackup2 has verified the password means a typo
+	// poisons the cache: the modal-skip logic on the frontend then
+	// short-circuits subsequent attempts straight to the same wrong
+	// password, with no way for the user to enter a correct one
+	// without manually clicking "Use a different password".
+	attempted := req.Password
+	if attempted == "" {
+		attempted = s.pw.get()
 	}
-	password := s.pw.get()
 
-	jobID, err := s.jobs.startBackup(req.UDID, req.Network, password, root, helpers.Command)
+	// Commit the password to the session cache only once the backup
+	// process exits cleanly (status=="ok"). pumpProcess invokes this
+	// hook synchronously between the wait-returns and the SSE "done"
+	// event, so the GET /api/session/password call the frontend
+	// issues on "done" observes the post-success state.
+	onDone := func(ok bool) {
+		if ok && attempted != "" {
+			s.pw.set(attempted)
+		}
+	}
+
+	jobID, err := s.jobs.startBackup(req.UDID, req.Network, attempted, root, helpers.Command, onDone)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -666,11 +684,15 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	if req.Password != "" {
-		s.pw.set(req.Password)
+	// Same defer-cache rule as handleRunBackup: a freshly-supplied
+	// password is only persisted to the session cache after the sync
+	// (which decrypts the backup as its very first step) succeeds.
+	// Caching upfront let typos lock the user out of retrying.
+	attempted := req.Password
+	if attempted == "" {
+		attempted = s.pw.get()
 	}
-	password := s.pw.get()
-	if password == "" {
+	if attempted == "" {
 		httpError(w, http.StatusBadRequest, "backup password is required")
 		return
 	}
@@ -679,10 +701,13 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 		_, err := postprocess.SyncMessages(
 			backup.DefaultRoot(),
 			cur,
-			password,
+			attempted,
 			AgentIgnoreFiles(),
 			log,
 		)
+		if err == nil {
+			s.pw.set(attempted)
+		}
 		return err
 	})
 
