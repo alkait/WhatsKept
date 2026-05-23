@@ -2,7 +2,7 @@ BIN := dist/whatskept
 PKG := ./cmd/whatskept
 VERSION ?= 0.0.0-dev
 
-.PHONY: build run list extract clean tidy fmt vet test
+.PHONY: build run list extract app clean tidy fmt vet test
 
 build: $(BIN)
 
@@ -30,6 +30,9 @@ list: build
 
 extract: build
 	$(BIN) extract
+
+app: build
+	$(BIN) app
 
 tidy:
 	go mod tidy
