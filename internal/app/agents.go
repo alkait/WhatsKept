@@ -30,6 +30,12 @@ var agentRegistry = []agentSpec{
 		Description: "Cascade-powered IDE that reads AGENTS.md natively.",
 		AppName:     "Windsurf",
 	},
+	{
+		ID:          "vscode",
+		Name:        "VS Code",
+		Description: "Microsoft's editor — pair with GitHub Copilot or any AGENTS.md-aware extension.",
+		AppName:     "Visual Studio Code",
+	},
 }
 
 // agentInfo is what the React UI sees over JSON. Field naming uses
