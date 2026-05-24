@@ -2,6 +2,7 @@ package main
 
 import (
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -38,8 +39,12 @@ machine. Closing the window terminates the server.`,
 			// preview) can tell them apart at a glance. Em dash so
 			// it visually separates from the brand without looking
 			// like a hyphenated word.
+			//
+			// Tag pushes (refs/tags/v0.1.0) feed Version through with
+			// a leading 'v', branch pushes feed semver without one.
+			// We always render exactly one 'v' regardless of input.
 			return app.Run(app.RunOptions{
-				Title:     "WhatsKept — v" + Version,
+				Title:     "WhatsKept — v" + strings.TrimPrefix(Version, "v"),
 				Width:     width,
 				Height:    height,
 				Resizable: resizable,
