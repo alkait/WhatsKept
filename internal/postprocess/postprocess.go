@@ -64,6 +64,7 @@ type SyncResult struct {
 	AgentsMDExists bool              `json:"agents_md_exists"`
 	IgnoreFiles    []string          `json:"ignore_files"`
 	ProfileSync    *ProfileSyncStats `json:"profile_sync,omitempty"`
+	ContactSync    *ContactSyncStats `json:"contact_sync,omitempty"`
 }
 
 // ApplyViews opens the SQLite database at dbPath and runs the whole
@@ -299,6 +300,22 @@ func SyncMessages(
 		return nil, err
 	}
 
+	// iOS-Contacts sync. Runs before SyncProfiles because it's the
+	// faster of the two (~2–5 s vs 10–30 s) and gives the user a
+	// visible win sooner — names start resolving in the UI before
+	// the avatar dump finishes. Non-fatal: a failure here is
+	// captured in stats.Errors and the surrounding sync still
+	// succeeds. Fail-soft if the backup has no AddressBook record
+	// (rare — empty device, privacy reset, non-iOS source).
+	log("Syncing iOS Contacts…")
+	contactStats, contactErr := SyncContacts(bundle, workspace, livePath, log)
+	if contactErr != nil {
+		log(fmt.Sprintf("Contacts sync failed: %v", contactErr))
+		contactStats = &ContactSyncStats{
+			Errors: []string{contactErr.Error()},
+		}
+	}
+
 	// Profile-avatar sync. Non-fatal: a failure here doesn't unwind
 	// the message sync — the DB is already on disk and applied. The
 	// stats (and any per-file errors) are surfaced in the SyncResult
@@ -342,6 +359,7 @@ func SyncMessages(
 		AgentsMDExists: agentsErr == nil,
 		IgnoreFiles:    agentIgnoreFiles,
 		ProfileSync:    profileStats,
+		ContactSync:    contactStats,
 	}, nil
 }
 

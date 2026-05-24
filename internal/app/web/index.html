@@ -788,7 +788,8 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword
   const isStale    = !!dbStatus.is_stale;
   const msgCount    = dbStatus.message_count;
   const ftsCount    = dbStatus.fts_count;
-  const avatarCount = dbStatus.avatar_count;
+  const avatarCount  = dbStatus.avatar_count;
+  const contactCount = dbStatus.contact_count;
   const lastSynced  = dbStatus.last_synced_at;
   const latestBkp   = dbStatus.latest_backup_at;
 
@@ -816,6 +817,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword
     const parts = [];
     if (msgCount != null) parts.push(`${msgCount.toLocaleString()} messages`);
     if (ftsCount != null) parts.push(`${ftsCount.toLocaleString()} in FTS`);
+    if (contactCount != null && contactCount > 0) parts.push(`${contactCount.toLocaleString()} contacts`);
     if (avatarCount != null && avatarCount > 0) parts.push(`${avatarCount.toLocaleString()} avatars`);
     parts.push(`synced ${relativeTime(lastSynced)}`);
     subtitle      = parts.join(" · ");
