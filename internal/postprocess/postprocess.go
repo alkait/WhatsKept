@@ -55,16 +55,18 @@ var ignoreEntries = []string{
 // (and ultimately the React UI). All fields are JSON-tagged for
 // direct re-use in the SSE "done" payload.
 type SyncResult struct {
-	BackupPath     string            `json:"backup_path"`
-	BackupTakenAt  time.Time         `json:"backup_taken_at"`
-	DBPath         string            `json:"db_path"`
-	BytesExtracted int64             `json:"bytes_extracted"`
-	MessageCount   int               `json:"message_count"`
-	FTSCount       int               `json:"fts_count"`
-	AgentsMDExists bool              `json:"agents_md_exists"`
-	IgnoreFiles    []string          `json:"ignore_files"`
-	ProfileSync    *ProfileSyncStats `json:"profile_sync,omitempty"`
-	ContactSync    *ContactSyncStats `json:"contact_sync,omitempty"`
+	BackupPath     string             `json:"backup_path"`
+	BackupTakenAt  time.Time          `json:"backup_taken_at"`
+	DBPath         string             `json:"db_path"`
+	BytesExtracted int64              `json:"bytes_extracted"`
+	MessageCount   int                `json:"message_count"`
+	FTSCount       int                `json:"fts_count"`
+	AgentsMDExists bool               `json:"agents_md_exists"`
+	IgnoreFiles    []string           `json:"ignore_files"`
+	ProfileSync    *ProfileSyncStats  `json:"profile_sync,omitempty"`
+	ContactSync    *ContactSyncStats  `json:"contact_sync,omitempty"`
+	SidecarMerge   *SidecarMergeStats `json:"sidecar_merge,omitempty"`
+	OrphanPrune    *OrphanPruneStats  `json:"orphan_prune,omitempty"`
 }
 
 // ApplyViews opens the SQLite database at dbPath and runs the whole
@@ -80,6 +82,15 @@ func ApplyViews(dbPath string) error {
 	defer db.Close()
 	if _, err := db.Exec(viewsSQL); err != nil {
 		return fmt.Errorf("apply views: %w", err)
+	}
+	// The static INSERT INTO messages_fts that used to live at the
+	// bottom of views.sql moved into rebuildFTS() so it can JOIN in
+	// sidecar tables (wa_image_text, wa_voice_text, wa_document)
+	// when they exist. Run it here so ApplyViews's contract is
+	// unchanged for callers: after this returns, messages_fts is
+	// populated.
+	if _, err := rebuildFTS(db); err != nil {
+		return fmt.Errorf("rebuild fts: %w", err)
 	}
 	return nil
 }
@@ -286,6 +297,33 @@ func SyncMessages(
 		log(fmt.Sprintf("Identity verified: %s%s", existing.DeviceName, phoneSuffix(existing)))
 	}
 
+	// Sidecar merge-forward. The freshly-decrypted tempPath has none
+	// of the user's hard-earned wa_image_text / media_index /
+	// wa_voice_text / voice_index rows from previous syncs — the
+	// backup carries device data only, not WhatsKept-derived data.
+	// Copy those rows forward (filtering to messages that still
+	// exist) BEFORE the rename, so the about-to-be-promoted DB has
+	// them. If livePath doesn't exist yet (first sync) this is a
+	// no-op. Failures are non-fatal: a corrupted prior DB shouldn't
+	// block a fresh sync from succeeding — we just lose OCR
+	// continuity and the user can re-run media-index.
+	var mergeStats *SidecarMergeStats
+	if _, err := os.Stat(livePath); err == nil {
+		log("Carrying OCR/transcript state forward…")
+		ms, mErr := mergeSidecarsForward(livePath, tempPath)
+		if mErr != nil {
+			log(fmt.Sprintf("Sidecar merge failed (continuing): %v", mErr))
+		} else {
+			mergeStats = ms
+			if ms.OCRPreserved > 0 || ms.VoicePreserved > 0 {
+				log(fmt.Sprintf(
+					"Preserved %d OCR rows, %d voice rows (dropped: %d OCR, %d voice for deleted messages).",
+					ms.OCRPreserved, ms.VoicePreserved, ms.OCRDropped, ms.VoiceDropped,
+				))
+			}
+		}
+	}
+
 	// Identity OK — atomically promote staging to live. After this
 	// point a partial failure leaves us with a fresh DB that just
 	// hasn't had views re-applied; ApplyViews is idempotent, so the
@@ -298,6 +336,30 @@ func SyncMessages(
 	log("Applying views and FTS5 index…")
 	if err := ApplyViews(livePath); err != nil {
 		return nil, err
+	}
+
+	// Orphan prune. mergeSidecarsForward only carries forward rows
+	// whose rowid is in the new ZWAMESSAGE, so DB-side this is
+	// usually a no-op — but it also walks ./media/ and deletes any
+	// <rowid>.jpg whose message no longer exists on the device. That
+	// gives us the "media folder mirrors device state" invariant the
+	// user asked for. Non-fatal: failures bump stats and the sync
+	// still succeeds.
+	mediaDir := filepath.Join(workspace, "media")
+	pruneStats, pruneErr := pruneOrphans(livePath, mediaDir)
+	if pruneErr != nil {
+		log(fmt.Sprintf("Orphan prune failed (continuing): %v", pruneErr))
+	} else if pruneStats != nil {
+		total := pruneStats.MediaFilesDeleted + pruneStats.OCRRowsDeleted +
+			pruneStats.MediaIndexRowsDeleted + pruneStats.VoiceRowsDeleted +
+			pruneStats.VoiceIndexRowsDeleted
+		if total > 0 {
+			log(fmt.Sprintf(
+				"Pruned %d orphan media files, %d OCR rows, %d media_index rows.",
+				pruneStats.MediaFilesDeleted, pruneStats.OCRRowsDeleted,
+				pruneStats.MediaIndexRowsDeleted,
+			))
+		}
 	}
 
 	// iOS-Contacts sync. Runs before SyncProfiles because it's the
@@ -360,6 +422,8 @@ func SyncMessages(
 		IgnoreFiles:    agentIgnoreFiles,
 		ProfileSync:    profileStats,
 		ContactSync:    contactStats,
+		SidecarMerge:   mergeStats,
+		OrphanPrune:    pruneStats,
 	}, nil
 }
 

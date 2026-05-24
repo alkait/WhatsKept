@@ -424,14 +424,16 @@ LEFT JOIN ZWAMEDIAITEM    mi ON mi.ZMESSAGE = m.Z_PK AND m.ZMESSAGETYPE = 7;
 --   - Use MATCH for queries: SELECT rowid, snippet(messages_fts, 0, '[[', ']]', '...', 12)
 --                            FROM messages_fts WHERE messages_fts MATCH 'foo NEAR bar';
 --   - Tokenizer: unicode61 with diacritic-folding, so "cafe" matches "café".
+--
+-- This script only DEFINES the (empty) virtual table. The population step
+-- is intentionally NOT in SQL: Go's RebuildFTS() builds a SELECT that
+-- LEFT-JOINs wa_image_text / wa_voice_text / wa_document into the indexed
+-- text when those sidecar tables exist, so that media-index / voice-index
+-- runs automatically extend the FTS reach without needing a separate
+-- migration step.
 -- ----------------------------------------------------------------------------
 DROP TABLE IF EXISTS messages_fts;
 CREATE VIRTUAL TABLE messages_fts USING fts5(
     text,
     tokenize = 'unicode61 remove_diacritics 2'
 );
-
-INSERT INTO messages_fts(rowid, text)
-SELECT Z_PK, ZTEXT
-FROM   ZWAMESSAGE
-WHERE  ZTEXT IS NOT NULL AND ZTEXT <> '';
