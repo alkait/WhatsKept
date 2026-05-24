@@ -122,6 +122,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// the same SSE machinery as backups.
 	mux.HandleFunc("GET /api/database/status", s.handleDatabaseStatus)
 	mux.HandleFunc("POST /api/database/sync", s.handleSyncDatabase)
+	mux.HandleFunc("POST /api/database/media-index", s.handleMediaIndex)
 
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
@@ -663,12 +664,18 @@ func (s *server) handleStreamJob(w http.ResponseWriter, r *http.Request) {
 //     server-side so the UI doesn't need to parse two timestamps).
 //   - Tell the user to run a backup first when has_backups is false.
 type databaseStatus struct {
-	DBExists       bool   `json:"db_exists"`
-	DBPath         string `json:"db_path,omitempty"`
-	MessageCount   *int   `json:"message_count,omitempty"`
-	FTSCount       *int   `json:"fts_count,omitempty"`
-	AvatarCount    *int   `json:"avatar_count,omitempty"`     // wa_profile_picture row count
-	ContactCount   *int   `json:"contact_count,omitempty"`    // wa_contact row count (iOS-Contacts)
+	DBExists     bool   `json:"db_exists"`
+	DBPath       string `json:"db_path,omitempty"`
+	MessageCount *int   `json:"message_count,omitempty"`
+	FTSCount     *int   `json:"fts_count,omitempty"`
+	AvatarCount  *int   `json:"avatar_count,omitempty"`  // wa_profile_picture row count
+	ContactCount *int   `json:"contact_count,omitempty"` // wa_contact row count (iOS-Contacts)
+	// ImageDescribed: rows in media_index with status='described'.
+	// ImageTotal:     all JPG image messages in the DB.
+	// Pair lets the UI render "X / Y indexed" on the Sync-images card
+	// without spinning up a job just to compute it.
+	ImageDescribed *int   `json:"image_described,omitempty"`
+	ImageTotal     *int   `json:"image_total,omitempty"`
 	LastSyncedAt   string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
 	LatestBackupAt string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
 	IsStale        bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
@@ -740,53 +747,76 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 
 	// Best-effort counts. A failure here doesn't sink the response —
 	// the UI just hides those fields.
-	msgs, fts, avatars, contacts := readDBCounts(dbPath)
-	if msgs >= 0 {
-		out.MessageCount = &msgs
+	cs := readDBCounts(dbPath)
+	if cs.msgs >= 0 {
+		out.MessageCount = &cs.msgs
 	}
-	if fts >= 0 {
-		out.FTSCount = &fts
+	if cs.fts >= 0 {
+		out.FTSCount = &cs.fts
 	}
-	if avatars >= 0 {
-		out.AvatarCount = &avatars
+	if cs.avatars >= 0 {
+		out.AvatarCount = &cs.avatars
 	}
-	if contacts >= 0 {
-		out.ContactCount = &contacts
+	if cs.contacts >= 0 {
+		out.ContactCount = &cs.contacts
+	}
+	if cs.imageDescribed >= 0 {
+		out.ImageDescribed = &cs.imageDescribed
+	}
+	if cs.imageTotal >= 0 {
+		out.ImageTotal = &cs.imageTotal
 	}
 
 	writeJSON(w, http.StatusOK, out)
 }
 
-// readDBCounts opens dbPath read-only and returns (messages, fts,
-// avatars, contacts). Returns -1 across the board on open failure;
-// individual fields return -1 if their table is missing (FTS may be
-// absent on a DB that has been decrypted but not yet had views
-// applied; wa_profile_picture / wa_contact are absent until the
-// first sync run).
-func readDBCounts(dbPath string) (msgs, fts, avatars, contacts int) {
-	msgs, fts, avatars, contacts = -1, -1, -1, -1
+// dbCounts groups everything we surface in the Database tab so we
+// can pass it around as one value (the previous tuple-return was
+// getting unwieldy as more sidecar surfaces landed).
+//
+// A field of -1 means: "table missing or query failed". The handler
+// treats that as "hide this field in the UI", which is exactly how
+// the JSON omitempty-tagged *int pointers carry the same intent.
+type dbCounts struct {
+	msgs           int // ZWAMESSAGE                              (always present once a DB exists)
+	fts            int // messages_fts                            (after ApplyViews / media-index)
+	avatars        int // wa_profile_picture                      (after SyncProfiles)
+	contacts       int // wa_contact                              (after SyncContacts)
+	imageDescribed int // media_index where status='described'    (after media-index)
+	imageTotal     int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
+}
+
+// readDBCounts opens dbPath read-only and reports the counts that
+// drive the Database tab's "X messages · Y in FTS · Z contacts · …"
+// subtitle and the Sync-images card's "X / Y indexed" gauge. Every
+// field is best-effort: a missing table returns -1 for that field
+// rather than failing the whole call.
+func readDBCounts(dbPath string) dbCounts {
+	cs := dbCounts{msgs: -1, fts: -1, avatars: -1, contacts: -1, imageDescribed: -1, imageTotal: -1}
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
-		return
+		return cs
 	}
 	defer db.Close()
-	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM ZWAMESSAGE`).Scan(&n); err == nil {
-		msgs = n
+
+	type probe struct {
+		dest *int
+		sql  string
 	}
-	var f int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts`).Scan(&f); err == nil {
-		fts = f
+	for _, p := range []probe{
+		{&cs.msgs, `SELECT COUNT(*) FROM ZWAMESSAGE`},
+		{&cs.fts, `SELECT COUNT(*) FROM messages_fts`},
+		{&cs.avatars, `SELECT COUNT(*) FROM wa_profile_picture`},
+		{&cs.contacts, `SELECT COUNT(*) FROM wa_contact`},
+		{&cs.imageDescribed, `SELECT COUNT(*) FROM media_index WHERE status = 'described'`},
+		{&cs.imageTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`},
+	} {
+		var n int
+		if err := db.QueryRow(p.sql).Scan(&n); err == nil {
+			*p.dest = n
+		}
 	}
-	var a int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM wa_profile_picture`).Scan(&a); err == nil {
-		avatars = a
-	}
-	var c int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM wa_contact`).Scan(&c); err == nil {
-		contacts = c
-	}
-	return
+	return cs
 }
 
 type syncDatabaseRequest struct {
@@ -837,6 +867,69 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 		}
 		return err
 	})
+
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// mediaIndexRequest is the JSON body of POST /api/database/media-index.
+// Same shape as the sync request — only the password matters; everything
+// else (workspace, backup picking) is implicit in server state.
+type mediaIndexRequest struct {
+	Password string `json:"password"`
+}
+
+// handleMediaIndex starts a `postprocess.MediaIndex` run as an
+// in-process SSE job. The job emits two event types:
+//   - "line"     human-readable status (e.g. "Unlocking iOS backup…")
+//   - "progress" JSON-encoded MediaIndexProgress every 25 rows; the UI
+//     renders a progress bar with rate / ETA / counts
+//
+// Cancellation: the UI hits DELETE /api/jobs/{id} (existing endpoint)
+// to abort. Our context.Context derived from the http.Request gets
+// torn down, the loop breaks between rows, and the current row's
+// commit either finishes or rolls back. Either way the DB stays
+// consistent.
+func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+
+	var req mediaIndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	attempted := req.Password
+	if attempted == "" {
+		attempted = s.pw.get()
+	}
+	if attempted == "" {
+		httpError(w, http.StatusBadRequest, "backup password is required")
+		return
+	}
+
+	// The job's context outlives the HTTP request that started it;
+	// don't tie cancellation to r.Context() (which the http server
+	// will close as soon as we return from this handler). The job
+	// manager owns its own lifecycle.
+	jobID := s.jobs.startInProcessProgress("media-index",
+		func(log func(string), progress func(any)) error {
+			_, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
+				Workspace:  cur,
+				BackupRoot: backup.DefaultRoot(),
+				Password:   attempted,
+				Log:        log,
+				Progress: func(p postprocess.MediaIndexProgress) {
+					progress(p)
+				},
+			})
+			if err == nil {
+				s.pw.set(attempted)
+			}
+			return err
+		})
 
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }

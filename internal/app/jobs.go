@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,9 +21,19 @@ import (
 // jobEvent is the JSON shape pushed to SSE subscribers. Field naming
 // matches what the React frontend already expects (carried over from
 // the Python implementation).
+//
+// Event types:
+//
+//	"line"     human-readable log line (Data)
+//	"progress" structured progress update (Data = JSON payload, shape
+//	           defined per-task by the emitter; the UI dispatches on
+//	           the job's task field to know how to render it)
+//	"adopted"  backup process adopted from a previous app lifetime
+//	"ping"     idle heartbeat, ~5 s cadence
+//	"done"     terminal — Status + Code + optional Error
 type jobEvent struct {
-	Type   string `json:"type"`             // "line", "adopted", "ping", "done"
-	Data   string `json:"data,omitempty"`   // line text (for "line")
+	Type   string `json:"type"`
+	Data   string `json:"data,omitempty"`   // "line": text; "progress": JSON payload
 	Status string `json:"status,omitempty"` // "ok" | "error" (for "done")
 	Code   int    `json:"code,omitempty"`   // exit code (for "done")
 	PID    int    `json:"pid,omitempty"`    // child pid (for "adopted","ping")
@@ -183,6 +194,24 @@ func (m *jobManager) activeJob() *activeJobInfo {
 // The returned job ID can be subscribed to via /api/stream/{id}
 // immediately; the work goroutine is launched before this returns.
 func (m *jobManager) startInProcess(task string, work func(log func(string)) error) string {
+	return m.startInProcessProgress(task, func(log func(string), _ func(any)) error {
+		return work(log)
+	})
+}
+
+// startInProcessProgress is the variant used by long-running jobs
+// (notably media-index) that have something more than a rolling log
+// to show. The work function gets a second callback `progress(any)`
+// which JSON-encodes its argument and emits it as a "progress"
+// jobEvent. The frontend dispatches on the job's `task` field to
+// know how to deserialise the payload.
+//
+// Existing callers can keep using startInProcess unchanged — it's a
+// thin wrapper around this one that discards the progress channel.
+func (m *jobManager) startInProcessProgress(
+	task string,
+	work func(log func(string), progress func(any)) error,
+) string {
 	j := &job{
 		id:        uuid.NewString(),
 		task:      task,
@@ -194,7 +223,16 @@ func (m *jobManager) startInProcess(task string, work func(log func(string)) err
 		log := func(s string) {
 			j.emit(jobEvent{Type: "line", Data: s})
 		}
-		err := work(log)
+		progress := func(payload any) {
+			b, err := json.Marshal(payload)
+			if err != nil {
+				// Marshal failures are silent — losing one
+				// progress tick is fine, the next will come.
+				return
+			}
+			j.emit(jobEvent{Type: "progress", Data: string(b)})
+		}
+		err := work(log, progress)
 		if err != nil {
 			j.emit(jobEvent{Type: "done", Status: "error", Error: err.Error()})
 			return

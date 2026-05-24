@@ -755,7 +755,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, onSync, onMediaIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -829,6 +829,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword
   const buttonDisabled = isRunning || !hasBackups;
 
   return (
+    <>
     <section>
       <div className="flex items-center justify-between mb-3">
         <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Messages database</h2>
@@ -893,20 +894,212 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, onSync, hasSessionPassword
 
       <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
         Decrypts the latest backup's ChatStorage.sqlite into your workspace, applies the SQL view layer
-        (chats, messages, FTS5 index), and writes <code>AGENTS.md</code> plus per-agent ignore files.
-        Voice transcription and image OCR are separate, opt-in stages that will land in a future update.
+        (chats, messages, FTS5 index), syncs iOS Contacts + WhatsApp avatars, and writes <code>AGENTS.md</code>
+        plus per-agent ignore files. Voice transcription is a separate, opt-in stage that will land in a
+        future update.
+      </p>
+    </section>
+
+    <MediaIndexCard
+      dbStatus={dbStatus}
+      job={mediaJob}
+      onMediaIndex={onMediaIndex}
+      hasSessionPassword={hasSessionPassword}
+      reloadDbStatus={reloadDbStatus}
+    />
+
+    {prompting && (
+      <PasswordPromptModal
+        device={{ name: "the latest iPhone backup" }}
+        onConfirm={pw => { setPrompting(false); onSync(pw); }}
+        onCancel={() => setPrompting(false)}
+        confirmLabel="Sync messages"
+      />
+    )}
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MediaIndexCard — "Sync images" section under the Database tab
+// ═══════════════════════════════════════════════════════════════════════════
+// Lifecycle parallels DatabaseTab's messages card: read counts from
+// dbStatus, decide a state ("idle / partial / done / no-db / running"),
+// render the button accordingly, and (when running) show a structured
+// progress card driven by the "progress" events the media-index job
+// emits over SSE.
+function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloadDbStatus }) {
+  const [prompting, setPrompting] = useState(false);
+  const j = job || {};
+  const isRunning = !!j.running;
+  const hasDone   = j.done !== undefined && j.done !== null;
+  const progress  = j.progress || null;
+
+  // Reload counts on every successful finish so the header gauge
+  // updates from "5,210 / 31,608" → "5,260 / 31,608" without a
+  // manual refresh.
+  useEffect(() => {
+    if (hasDone && j.done === true) reloadDbStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasDone, j.done]);
+
+  if (!dbStatus) return null;
+  const hasDB    = !!dbStatus.db_exists;
+  const total    = dbStatus.image_total ?? null;
+  const indexed  = dbStatus.image_described ?? 0;
+  const remaining = total != null ? Math.max(total - indexed, 0) : null;
+  const allDone   = total != null && total > 0 && indexed >= total;
+
+  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
+  if (!hasDB) {
+    title         = "Run a messages sync first";
+    subtitle      = "Image indexing reads the message database — sync that above before scanning images.";
+    buttonLabel   = "Sync images";
+    buttonPrimary = false;
+    statusDot     = "#9ca3af";
+  } else if (total === 0) {
+    title         = "No image messages on device";
+    subtitle      = "There's nothing to index — your WhatsApp has no JPG images.";
+    buttonLabel   = "Sync images";
+    buttonPrimary = false;
+    statusDot     = "#9ca3af";
+  } else if (allDone) {
+    title         = "All images indexed";
+    subtitle      = `${indexed.toLocaleString()} of ${total.toLocaleString()} images have OCR text + classification labels in wa_image_text.`;
+    buttonLabel   = "Re-scan images";
+    buttonPrimary = false;
+    statusDot     = "#25D366";
+  } else if (indexed === 0) {
+    title         = "Images not yet indexed";
+    subtitle      = total != null
+      ? `${total.toLocaleString()} images on the device. Scanning will OCR + classify each one via Apple Vision (~0.2 s / image).`
+      : "Scan will OCR + classify each image via Apple Vision (~0.2 s / image).";
+    buttonLabel   = "Sync images";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  } else {
+    title         = "Resume image indexing";
+    subtitle      = `${indexed.toLocaleString()} / ${total.toLocaleString()} indexed · ${remaining.toLocaleString()} remaining.`;
+    buttonLabel   = "Resume";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  }
+
+  const pct = (total != null && total > 0)
+    ? Math.min(100, Math.round((indexed / total) * 100))
+    : 0;
+
+  const launch = () => {
+    if (hasSessionPassword) onMediaIndex("");
+    else setPrompting(true);
+  };
+
+  const buttonDisabled = isRunning || !hasDB || total === 0;
+
+  return (
+    <section className="mt-6">
+      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Image OCR</h2>
+
+      <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
+              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+
+            {/* Static (non-running) progress bar, when there's progress to show. */}
+            {!isRunning && hasDB && total != null && total > 0 && (
+              <div className="mt-3">
+                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
+                </div>
+                <p className="text-[10px] text-gray-400 mt-1">{pct}% indexed</p>
+              </div>
+            )}
+          </div>
+
+          <button onClick={launch} disabled={buttonDisabled}
+            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
+            <RefreshIcon />
+            {isRunning ? "Indexing…" : buttonLabel}
+          </button>
+        </div>
+
+        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
+
+        {/* Live progress card while running — driven by the structured
+            "progress" SSE event the media-index job emits every ~25 rows. */}
+        {isRunning && (
+          <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
+            {progress ? (
+              <>
+                <div className="flex items-baseline justify-between text-xs mb-2">
+                  <span className="font-semibold text-gray-900">
+                    {progress.done.toLocaleString()} / {(progress.pending || 0).toLocaleString()} images
+                  </span>
+                  <span className="text-gray-500">
+                    {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)}/s` : ""}
+                    {progress.eta_seconds > 0 ? ` · ETA ${fmtEta(progress.eta_seconds)}` : ""}
+                  </span>
+                </div>
+                <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
+                  <div className="h-full rounded-full transition-all duration-500" style={{
+                    width: `${Math.min(100, Math.round((progress.done / Math.max(progress.pending, 1)) * 100))}%`,
+                    background:'#25D366',
+                  }}></div>
+                </div>
+                <div className="grid grid-cols-4 gap-2 mt-3 text-[11px] text-gray-600">
+                  <div><span className="font-semibold text-gray-900">{progress.with_ocr.toLocaleString()}</span> with OCR</div>
+                  <div><span className="font-semibold text-gray-900">{progress.with_labels.toLocaleString()}</span> labelled</div>
+                  <div><span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing</div>
+                  <div><span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors</div>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-gray-500">Preparing…</p>
+            )}
+            {/* Tail of the log lines for transparency. */}
+            {j.lines && j.lines.length > 0 && (
+              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
+                {j.lines[j.lines.length - 1]}
+              </p>
+            )}
+          </div>
+        )}
+
+        {hasDone && j.done === true && !isRunning && (
+          <p className="text-xs text-gray-500 mt-3">✓ Indexing complete. Agent queries can now MATCH on image content.</p>
+        )}
+      </div>
+
+      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
+        Decrypts each WhatsApp image from the iOS backup to <code>./media/&lt;rowid&gt;.jpg</code>, then runs
+        Apple Vision (OCR + classification) and stores results in <code>wa_image_text</code>. Resumable: cancel
+        anytime and re-run to pick up where you left off. Orphan JPEGs from deleted messages are pruned on the
+        next message sync, so this folder mirrors device state.
       </p>
 
       {prompting && (
         <PasswordPromptModal
           device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onSync(pw); }}
+          onConfirm={pw => { setPrompting(false); onMediaIndex(pw); }}
           onCancel={() => setPrompting(false)}
-          confirmLabel="Sync messages"
+          confirmLabel="Sync images"
         />
       )}
     </section>
   );
+}
+
+// fmtEta formats a duration in seconds for the live progress card.
+function fmtEta(secs) {
+  if (!secs || secs < 0) return "—";
+  if (secs < 60)   return `${Math.round(secs)}s`;
+  if (secs < 3600) return `${(secs/60).toFixed(1)}m`;
+  return `${(secs/3600).toFixed(1)}h`;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1135,6 +1328,19 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         ...prev,
         [key]: { ...(prev[key]||{}), lines: [...((prev[key]||{}).lines||[]), msg.data] }
       }));
+      // "progress" events carry a JSON payload whose shape depends on
+      // the job's task (currently only media-index emits these — see
+      // postprocess.MediaIndexProgress). We just stash the parsed
+      // payload on the job and let the per-task card render it.
+      if (msg.type === "progress") {
+        try {
+          const p = JSON.parse(msg.data);
+          setJobs(prev => ({
+            ...prev,
+            [key]: { ...(prev[key]||{}), progress: p }
+          }));
+        } catch { /* ignore malformed payload */ }
+      }
       if (msg.type === "done") {
         const ok = msg.status === "ok";
         // Every completed messages-sync may have written a fresh
@@ -1210,6 +1416,26 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       // See startBackup: server-side cache commit is deferred to the
       // job's success, so we read it back from /api/session/password
       // on "done" rather than assuming it took.
+      streamJob(job_id, key, true);
+    } catch(ex) {
+      patchJob(key, { running: false, done: false, error: ex.message });
+    }
+  };
+
+  // ── start image-OCR (media-index) ─────────────────────────────────────
+  // Uses key "db:media-index" so it matches what the server reports as
+  // the active job's task on /api/jobs/active — that way a page reload
+  // mid-run reconnects to the same in-memory job state.
+  const startMediaIndex = async (password) => {
+    const key = "db:media-index";
+    patchJob(key, {
+      running: true, done: null,
+      lines: [], progress: null,
+      adopted: false, pid: null,
+      startedAt: new Date().toISOString(), error: "",
+    });
+    try {
+      const { job_id } = await api.post("/api/database/media-index", { password });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -1380,7 +1606,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             dbStatus={dbStatus}
             reloadDbStatus={reloadDbStatus}
             job={jobs["db:sync"]}
+            mediaJob={jobs["db:media-index"]}
             onSync={startSync}
+            onMediaIndex={startMediaIndex}
             hasSessionPassword={hasSessionPassword}
             onForgetPassword={forgetSessionPassword}
             binding={workspace.binding}
