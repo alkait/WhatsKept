@@ -98,6 +98,18 @@ jobs:
           file dist/whatskept
           ls -lh dist/whatskept
 
+      # Wrap the binary in a proper macOS .app so window managers /
+      # Spotlight see CFBundleIdentifier=com.whatskept.app instead of
+      # "NULL-APP-BUNDLE-ID". Same Mach-O — main.go detects bundle
+      # launch via os.Args[0] and defaults to the GUI subcommand.
+      - name: Bundle as .app
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          make bundle
+          /usr/libexec/PlistBuddy -c "Print" dist/WhatsKept.app/Contents/Info.plist
+          codesign -d -vv dist/WhatsKept.app 2>&1 | grep -E 'Identifier|adhoc|Format'
+
       # Re-sign the embedded helpers too. The Makefile only re-signs the
       # outer binary; the libimobiledevice tools inside
       # internal/helpers/bundle are already ad-hoc-signed when checked
@@ -155,19 +167,31 @@ jobs:
       #     # launch; that works as long as they have an internet
       #     # connection that day.
 
-      # Package as zip so the GitHub release asset preserves the
-      # executable bit. A raw upload of the Mach-O loses +x and forces
-      # users to chmod after download.
+      # Package both flavours so users can pick:
+      #   - WhatsKept-<ver>.app.zip   GUI users: drag-to-/Applications.
+      #     Use ditto (preserves resource forks, codesign metadata,
+      #     symlinks); plain `zip -r` corrupts the bundle's signature
+      #     on extract.
+      #   - whatskept-<ver>.zip       CLI users: bare Mach-O for
+      #     scripts (`whatskept extract`, `whatskept list`). plain
+      #     zip is fine here.
       - name: Package
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           mkdir -p out
+          cp README.md "out/README.md"
+
+          # .app bundle for GUI users
+          ditto -c -k --keepParent dist/WhatsKept.app \
+                "WhatsKept-darwin-arm64-${VERSION}.app.zip"
+
+          # Bare CLI binary for scripted use
           cp dist/whatskept "out/whatskept"
-          cp README.md      "out/README.md"
           (cd out && zip -9 "../whatskept-darwin-arm64-${VERSION}.zip" whatskept README.md)
-          ls -lh whatskept-darwin-arm64-*.zip
-          shasum -a 256 whatskept-darwin-arm64-*.zip | tee SHA256SUMS
+
+          ls -lh *.zip
+          shasum -a 256 *.zip | tee SHA256SUMS
 
       # Branch pushes get a pre-release at a stable, rolling tag so the
       # "latest dev build" URL never changes. The previous asset is
@@ -187,10 +211,16 @@ jobs:
             Releases tab's regular (non-pre-release) entries.
 
             macOS arm64 (Apple Silicon) only for now.
-            The binary is ad-hoc signed; on first launch macOS may show
+
+            **Pick one:**
+            - `WhatsKept-darwin-arm64-*.app.zip` — GUI; unzip and drag to `/Applications`.
+            - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
+
+            Both are ad-hoc signed; on first launch macOS may show
             "cannot be opened because the developer cannot be verified".
             Right-click \xe2\x86\x92 Open to bypass.
           files: |
+            WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
             SHA256SUMS
 
@@ -204,5 +234,6 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
+            WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
             SHA256SUMS

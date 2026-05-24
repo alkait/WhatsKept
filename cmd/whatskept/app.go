@@ -19,9 +19,9 @@ func init() {
 
 func newAppCmd() *cobra.Command {
 	var (
-		width      int
-		height     int
-		resizable  bool
+		width     int
+		height    int
+		resizable bool
 	)
 
 	cmd := &cobra.Command{
@@ -33,8 +33,13 @@ The window hosts a small React UI backed by an internal HTTP server on
 localhost. No external services are contacted; nothing leaves the
 machine. Closing the window terminates the server.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Title shows the running version so a user with two
+			// builds open (e.g. a tag release alongside a fresh dev
+			// preview) can tell them apart at a glance. Em dash so
+			// it visually separates from the brand without looking
+			// like a hyphenated word.
 			return app.Run(app.RunOptions{
-				Title:     "WhatsKept",
+				Title:     "WhatsKept — v" + Version,
 				Width:     width,
 				Height:    height,
 				Resizable: resizable,

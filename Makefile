@@ -1,5 +1,6 @@
-BIN := dist/whatskept
-PKG := ./cmd/whatskept
+BIN    := dist/whatskept
+APP    := dist/WhatsKept.app
+PKG    := ./cmd/whatskept
 VERSION ?= 0.0.0-dev
 
 # Build tags enabled in dist/whatskept:
@@ -10,7 +11,7 @@ VERSION ?= 0.0.0-dev
 #                  this tag. Required for the Database tab's sync.
 GO_TAGS := sqlite_fts5
 
-.PHONY: build run list extract app clean tidy fmt vet test
+.PHONY: build bundle run list extract app clean tidy fmt vet test
 
 build: $(BIN)
 
@@ -29,6 +30,19 @@ $(BIN): $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -pat
 sign:
 	@chmod +x build/sign.sh
 	@./build/sign.sh $(BIN)
+
+# `bundle` wraps dist/whatskept in a proper macOS .app so window
+# managers (aerospace, Dock, Mission Control), Spotlight, and the
+# OS "Get Info" dialog see a real CFBundleIdentifier instead of
+# "NULL-APP-BUNDLE-ID". The bundled binary is the SAME executable;
+# main.go detects launch-as-bundle by inspecting os.Args[0] and
+# defaults to the GUI subcommand in that case. Idempotent;
+# re-running over an existing $(APP) wipes and rebuilds.
+bundle: $(APP)
+
+$(APP): $(BIN) build/make-bundle.sh
+	@chmod +x build/make-bundle.sh
+	@VERSION=$(VERSION) ./build/make-bundle.sh $(BIN)
 
 run: build
 	$(BIN)
