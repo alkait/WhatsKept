@@ -40,7 +40,7 @@
 </script>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback, useRef } = React;
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
 // ── Icons ─────────────────────────────────────────────────────────────────
 const Svg = ({ d, size=16, cls="" }) => (
@@ -444,6 +444,174 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MediaIssuesModal — explainer + per-row list for failed/skipped images
+// ═══════════════════════════════════════════════════════════════════════════
+// Fetches GET /api/database/media-index/issues on mount, then groups
+// the error rows by error-message so "11 images failed with 'decrypt:
+// EOF'" doesn't render as 11 individual lines the user has to scan.
+// Missing rows aren't grouped — they all share the same (non-)reason
+// and the row count + sample paths are the useful signal there.
+function MediaIssuesModal({ onClose }) {
+  const [data, setData] = useState(null);   // null = loading, {} = loaded
+  const [error, setError] = useState("");
+  const [tab, setTab] = useState("errors"); // "errors" | "missing"
+
+  useEffect(() => {
+    api.get("/api/database/media-index/issues?limit=500")
+      .then(setData)
+      .catch(e => setError(e.message || "Failed to load issues"));
+  }, []);
+
+  // Group error rows by message so "decrypt: EOF (x11)" collapses
+  // into one folded entry the user can expand to see the rowids.
+  const grouped = useMemo(() => {
+    if (!data || !data.errors) return [];
+    const m = new Map();
+    for (const row of data.errors) {
+      const key = row.error || "(no error message)";
+      if (!m.has(key)) m.set(key, []);
+      m.get(key).push(row);
+    }
+    return Array.from(m.entries())
+      .map(([msg, rows]) => ({ msg, rows }))
+      .sort((a, b) => b.rows.length - a.rows.length);
+  }, [data]);
+
+  const errorsTotal  = data?.errors_total  ?? 0;
+  const missingTotal = data?.missing_total ?? 0;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
+         onClick={onClose}>
+      <div className="w-full max-w-2xl max-h-[80vh] rounded-2xl bg-white border shadow-2xl flex flex-col"
+           style={{borderColor:'#ECE5DD'}}
+           onClick={e => e.stopPropagation()}>
+
+        <header className="px-6 py-4 border-b flex items-center justify-between" style={{borderColor:'#ECE5DD'}}>
+          <div>
+            <h2 className="text-base font-semibold text-gray-900">Image indexing issues</h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              From <code>media_index</code> · most recent first
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none px-2">×</button>
+        </header>
+
+        {/* Tab strip — only show the row if either kind exists. */}
+        {(errorsTotal > 0 || missingTotal > 0) && (
+          <div className="px-6 pt-3 flex gap-2">
+            <button onClick={() => setTab("errors")}
+              className={"text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors " +
+                         (tab === "errors" ? "text-white" : "text-gray-600 hover:bg-gray-100")}
+              style={tab === "errors" ? {background:'#075E54'} : {}}>
+              Errors ({errorsTotal.toLocaleString()})
+            </button>
+            <button onClick={() => setTab("missing")}
+              className={"text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors " +
+                         (tab === "missing" ? "text-white" : "text-gray-600 hover:bg-gray-100")}
+              style={tab === "missing" ? {background:'#075E54'} : {}}>
+              Missing ({missingTotal.toLocaleString()})
+            </button>
+          </div>
+        )}
+
+        <div className="flex-1 overflow-y-auto px-6 py-4">
+          {error && <p className="text-sm text-red-500">{error}</p>}
+          {!error && !data && <p className="text-sm text-gray-500">Loading…</p>}
+
+          {data && tab === "errors" && (
+            errorsTotal === 0 ? (
+              <p className="text-sm text-gray-500">
+                No errors recorded. Every image that the indexer could read was successfully described.
+              </p>
+            ) : (
+              <>
+                <p className="text-[11px] text-gray-500 mb-3">
+                  An <strong>error</strong> means the indexer found the file in the backup manifest but
+                  couldn't OCR it. Reasons: corrupted/truncated JPEG, decrypt failed, Vision crashed on a
+                  specific image, etc. Showing {data.errors.length.toLocaleString()} of {errorsTotal.toLocaleString()}.
+                </p>
+                <div className="space-y-3">
+                  {grouped.map(g => (
+                    <ErrorGroup key={g.msg} msg={g.msg} rows={g.rows} />
+                  ))}
+                </div>
+              </>
+            )
+          )}
+
+          {data && tab === "missing" && (
+            missingTotal === 0 ? (
+              <p className="text-sm text-gray-500">
+                No missing files. Every image referenced by a message exists in the backup.
+              </p>
+            ) : (
+              <>
+                <p className="text-[11px] text-gray-500 mb-3">
+                  <strong>Missing</strong> means the chat references an image but the file is not present
+                  in the iOS backup. This is almost always because the image was never downloaded on the
+                  phone (you saw a thumbnail in chat but never tapped to fetch the full image), or WhatsApp's
+                  local media cache evicted it before the backup ran. Not an error — there's simply no file
+                  to OCR. Showing {data.missing.length.toLocaleString()} of {missingTotal.toLocaleString()}.
+                </p>
+                <ul className="space-y-1">
+                  {data.missing.map(row => (
+                    <li key={row.rowid} className="text-[11px] font-mono text-gray-600 truncate" title={row.manifest_path}>
+                      <span className="text-gray-400">#{row.rowid}</span> · {row.manifest_path}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )
+          )}
+        </div>
+
+        <footer className="px-6 py-3 border-t flex justify-end" style={{borderColor:'#ECE5DD'}}>
+          <button onClick={onClose}
+            className="rounded-lg px-4 py-1.5 text-sm font-semibold text-white"
+            style={{background:'#075E54'}}>
+            Close
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
+
+// ErrorGroup — collapsible folder for N rows that share an error message.
+// Default-collapsed; expand to see rowids + manifest paths. Keeps the
+// modal scannable even when there are hundreds of errors.
+function ErrorGroup({ msg, rows }) {
+  const [open, setOpen] = useState(rows.length <= 3); // small groups: expand by default
+
+  return (
+    <div className="rounded-lg border" style={{borderColor:'#DCF8C6'}}>
+      <button onClick={() => setOpen(o => !o)}
+        className="w-full px-3 py-2 flex items-center justify-between hover:bg-gray-50 text-left rounded-lg">
+        <div className="min-w-0 flex-1">
+          <p className="text-xs font-mono text-gray-900 truncate">{msg}</p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0 ml-3">
+          <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">
+            {rows.length} {rows.length === 1 ? "image" : "images"}
+          </span>
+          <span className="text-gray-400 text-xs">{open ? "▾" : "▸"}</span>
+        </div>
+      </button>
+      {open && (
+        <ul className="border-t px-3 py-2 space-y-1" style={{borderColor:'#DCF8C6'}}>
+          {rows.map(r => (
+            <li key={r.rowid} className="text-[11px] font-mono text-gray-600 truncate" title={r.manifest_path}>
+              <span className="text-gray-400">#{r.rowid}</span> · {r.manifest_path}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -930,6 +1098,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, onSync, onMediaI
 // emits over SSE.
 function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloadDbStatus }) {
   const [prompting, setPrompting] = useState(false);
+  const [showIssues, setShowIssues] = useState(false);
   const j = job || {};
   const isRunning = !!j.running;
   const hasDone   = j.done !== undefined && j.done !== null;
@@ -1015,7 +1184,20 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
                 <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
                   <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
                 </div>
-                <p className="text-[10px] text-gray-400 mt-1">{pct}% indexed</p>
+                <div className="flex items-center justify-between mt-1">
+                  <p className="text-[10px] text-gray-400">{pct}% indexed</p>
+                  {/* Idle-state issues link — driven by dbStatus, not the
+                      current run (which may not exist yet). Hidden when
+                      both counts are zero so the card stays uncluttered
+                      in the happy path. */}
+                  {((dbStatus.image_errors ?? 0) > 0 || (dbStatus.image_missing ?? 0) > 0) && (
+                    <button onClick={() => setShowIssues(true)}
+                      className="text-[10px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
+                      View {((dbStatus.image_errors ?? 0) + (dbStatus.image_missing ?? 0)).toLocaleString()} issue
+                      {((dbStatus.image_errors ?? 0) + (dbStatus.image_missing ?? 0)) === 1 ? "" : "s"}
+                    </button>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -1052,11 +1234,28 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
                   }}></div>
                 </div>
                 <div className="grid grid-cols-4 gap-2 mt-3 text-[11px] text-gray-600">
-                  <div><span className="font-semibold text-gray-900">{progress.with_ocr.toLocaleString()}</span> with OCR</div>
-                  <div><span className="font-semibold text-gray-900">{progress.with_labels.toLocaleString()}</span> labelled</div>
-                  <div><span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing</div>
-                  <div><span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors</div>
+                  <div title="Images where Vision found readable text (OCR returned a non-empty string).">
+                    <span className="font-semibold text-gray-900">{progress.with_ocr.toLocaleString()}</span> with OCR
+                  </div>
+                  <div title="Images where Vision returned at least one classification label above the confidence floor.">
+                    <span className="font-semibold text-gray-900">{progress.with_labels.toLocaleString()}</span> labelled
+                  </div>
+                  <div title="Chat references an image whose file isn't in the backup — typically never downloaded on device. Not an error.">
+                    <span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing
+                  </div>
+                  <div title="Indexer found the file but couldn't OCR it (corrupted/truncated JPEG, decrypt failed, Vision crashed, etc).">
+                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
+                  </div>
                 </div>
+                {(progress.errors > 0 || progress.missing > 0) && (
+                  <div className="mt-2">
+                    <button onClick={() => setShowIssues(true)}
+                      className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
+                      View {(progress.errors + progress.missing).toLocaleString()} issue
+                      {(progress.errors + progress.missing) === 1 ? "" : "s"}
+                    </button>
+                  </div>
+                )}
               </>
             ) : (
               <p className="text-xs text-gray-500">Preparing…</p>
@@ -1090,6 +1289,8 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
           confirmLabel="Sync images"
         />
       )}
+
+      {showIssues && <MediaIssuesModal onClose={() => setShowIssues(false)} />}
     </section>
   );
 }

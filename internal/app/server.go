@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -123,6 +124,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/database/status", s.handleDatabaseStatus)
 	mux.HandleFunc("POST /api/database/sync", s.handleSyncDatabase)
 	mux.HandleFunc("POST /api/database/media-index", s.handleMediaIndex)
+	mux.HandleFunc("GET /api/database/media-index/issues", s.handleMediaIndexIssues)
 
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
@@ -672,10 +674,17 @@ type databaseStatus struct {
 	ContactCount *int   `json:"contact_count,omitempty"` // wa_contact row count (iOS-Contacts)
 	// ImageDescribed: rows in media_index with status='described'.
 	// ImageTotal:     all JPG image messages in the DB.
-	// Pair lets the UI render "X / Y indexed" on the Sync-images card
-	// without spinning up a job just to compute it.
+	// ImageErrors:    rows in media_index with status='error'.
+	// ImageMissing:   rows in media_index with status='missing' (file
+	//                 not present in the backup manifest — usually
+	//                 means the image was never downloaded on device).
+	// The first pair drives "X / Y indexed" copy on the Sync-images
+	// card. The second pair drives the "View N issues" link, which
+	// opens a modal listing the offending rows from media_index.
 	ImageDescribed *int   `json:"image_described,omitempty"`
 	ImageTotal     *int   `json:"image_total,omitempty"`
+	ImageErrors    *int   `json:"image_errors,omitempty"`
+	ImageMissing   *int   `json:"image_missing,omitempty"`
 	LastSyncedAt   string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
 	LatestBackupAt string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
 	IsStale        bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
@@ -766,6 +775,12 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	if cs.imageTotal >= 0 {
 		out.ImageTotal = &cs.imageTotal
 	}
+	if cs.imageErrors >= 0 {
+		out.ImageErrors = &cs.imageErrors
+	}
+	if cs.imageMissing >= 0 {
+		out.ImageMissing = &cs.imageMissing
+	}
 
 	writeJSON(w, http.StatusOK, out)
 }
@@ -784,6 +799,8 @@ type dbCounts struct {
 	contacts       int // wa_contact                              (after SyncContacts)
 	imageDescribed int // media_index where status='described'    (after media-index)
 	imageTotal     int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
+	imageErrors    int // media_index where status='error'        (after media-index)
+	imageMissing   int // media_index where status='missing'      (after media-index)
 }
 
 // readDBCounts opens dbPath read-only and reports the counts that
@@ -792,7 +809,10 @@ type dbCounts struct {
 // field is best-effort: a missing table returns -1 for that field
 // rather than failing the whole call.
 func readDBCounts(dbPath string) dbCounts {
-	cs := dbCounts{msgs: -1, fts: -1, avatars: -1, contacts: -1, imageDescribed: -1, imageTotal: -1}
+	cs := dbCounts{
+		msgs: -1, fts: -1, avatars: -1, contacts: -1,
+		imageDescribed: -1, imageTotal: -1, imageErrors: -1, imageMissing: -1,
+	}
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		return cs
@@ -810,6 +830,8 @@ func readDBCounts(dbPath string) dbCounts {
 		{&cs.contacts, `SELECT COUNT(*) FROM wa_contact`},
 		{&cs.imageDescribed, `SELECT COUNT(*) FROM media_index WHERE status = 'described'`},
 		{&cs.imageTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`},
+		{&cs.imageErrors, `SELECT COUNT(*) FROM media_index WHERE status = 'error'`},
+		{&cs.imageMissing, `SELECT COUNT(*) FROM media_index WHERE status = 'missing'`},
 	} {
 		var n int
 		if err := db.QueryRow(p.sql).Scan(&n); err == nil {
@@ -932,6 +954,130 @@ func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 		})
 
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// mediaIndexIssue is one row of the issues list shown in the
+// "View issues" modal under the Image OCR card. We keep this
+// flat (no nested objects) so the UI can render it with one map().
+type mediaIndexIssue struct {
+	Rowid        int64  `json:"rowid"`
+	ManifestPath string `json:"manifest_path"`
+	Error        string `json:"error,omitempty"` // empty for missing rows — there's no error, just no file
+	AttemptedAt  string `json:"attempted_at,omitempty"`
+	Bytes        int64  `json:"bytes,omitempty"` // 0 for missing — file never decrypted
+}
+
+// mediaIndexIssuesResponse buckets the rows by status so the modal
+// can render two clearly-separated tabs. Counts are reported
+// independently of the returned slice length so the UI can show
+// "displaying 50 of 1,247 missing" honestly even when we cap the
+// payload size.
+type mediaIndexIssuesResponse struct {
+	Errors       []mediaIndexIssue `json:"errors"`
+	Missing      []mediaIndexIssue `json:"missing"`
+	ErrorsTotal  int               `json:"errors_total"`
+	MissingTotal int               `json:"missing_total"`
+	Limit        int               `json:"limit"`
+}
+
+// handleMediaIndexIssues lists the failure rows in media_index so
+// the UI can show *why* indexing didn't fully cover a workspace.
+//
+// Read-only, opens the live ChatStorage.sqlite directly (no need
+// to go through postprocess). Returns up to `limit` rows of each
+// kind, plus the unbounded totals so the UI doesn't have to guess
+// whether the list is full.
+func (s *server) handleMediaIndexIssues(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		httpError(w, http.StatusBadRequest, "no database in workspace")
+		return
+	}
+
+	limit := 200
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+	}
+
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "open db: "+err.Error())
+		return
+	}
+	defer db.Close()
+
+	// The media_index table only exists after the first media-index
+	// run. Probe via the schema rather than catching the error from
+	// the SELECT — clearer separation of "not run yet" from "actually
+	// broken".
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_index'`,
+	).Scan(&n); err != nil || n == 0 {
+		writeJSON(w, http.StatusOK, mediaIndexIssuesResponse{
+			Errors:  []mediaIndexIssue{}, // never null — UI does .map() on these
+			Missing: []mediaIndexIssue{},
+			Limit:   limit,
+		})
+		return
+	}
+
+	out := mediaIndexIssuesResponse{
+		Errors:  []mediaIndexIssue{},
+		Missing: []mediaIndexIssue{},
+		Limit:   limit,
+	}
+
+	// Unbounded totals first — these power the "Showing X of Y" copy.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error'`).Scan(&out.ErrorsTotal)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+
+	// Bounded sample, newest first so the user sees the most recent
+	// run's failures (which is almost always what they're debugging).
+	if out.ErrorsTotal > 0 {
+		out.Errors = queryMediaIssues(db, "error", limit)
+	}
+	if out.MissingTotal > 0 {
+		out.Missing = queryMediaIssues(db, "missing", limit)
+	}
+
+	writeJSON(w, http.StatusOK, out)
+}
+
+// queryMediaIssues pulls up to `limit` rows of one status from
+// media_index, newest first. Best-effort: a query failure returns
+// an empty slice rather than propagating to the HTTP handler — the
+// caller has already reported the total count and an empty list is
+// a survivable (if disappointing) outcome.
+func queryMediaIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM media_index
+		 WHERE status = ?
+		 ORDER BY attempted_at DESC
+		 LIMIT ?`,
+		status, limit,
+	)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------
