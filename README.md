@@ -109,22 +109,36 @@ whatskept/
 
 ## Subcommand status
 
-| Subcommand                | Python (wa-extract)       | Go (here)         |
-| ------------------------- | ------------------------- | ----------------- |
-| `whatskept list`          | parts of `cli.py`         | done              |
-| `whatskept extract`       | `cli.py` + `extract.py`   | done (decrypt)    |
-| `whatskept app`           | `app/main.py`             | done (Backup tab) |
-| `whatskept media-index`   | `media_indexer.py`        | pending           |
-| `whatskept voice-index`   | `voice_indexer.py`        | pending           |
-| `whatskept contacts-sync` | `contacts_sync.py`        | pending           |
-| `whatskept profiles-sync` | `profiles_sync.py`        | pending           |
-| views.sql + FTS rebuild   | `postprocess.py`          | pending           |
-| AGENTS.md scaffold        | `postprocess.py`          | pending           |
+| Subcommand                | Python (wa-extract)               | Go (here)         |
+| ------------------------- | --------------------------------- | ----------------- |
+| `whatskept list`          | parts of `cli.py`                 | done              |
+| `whatskept extract`       | `cli.py` + `extract.py`           | done              |
+| `whatskept app`           | `app/main.py` + `app/server.py`   | done              |
+| `whatskept media-index`   | `media_indexer.py` + `vision.py`  | done              |
+| `whatskept voice-index`   | `voice_indexer.py` + `whisper.py` | pending           |
+| views.sql + FTS rebuild   | `postprocess.py`                  | done              |
+| AGENTS.md scaffold        | `postprocess.py`                  | done              |
+| iOS Contacts sync         | `contacts.py`                     | done (in-process) |
+| WhatsApp profile avatars  | `profiles.py`                     | done (in-process) |
+| Sidecar merge-forward     | `postprocess.merge_state_into`    | done              |
 
-The `app` subcommand currently exposes the **Backup tab only**: list
-existing iOS backups, delete a backup, drive a fresh backup over USB
-with live progress streaming via Server-Sent Events. The Database tab
-is hidden until `postprocess` is ported.
+The `app` subcommand exposes the full GUI: a **Backups** tab to drive
+fresh USB backups, a **Database** tab with two sync surfaces (messages
++ images), and an **Agents** tab to launch supported agents pointed at
+the workspace. iOS Contacts sync and WhatsApp profile-avatar sync are
+not separate subcommands — they run automatically as steps of `Sync
+messages`, matching how the Python source-of-truth orchestrates them.
+
+The image-OCR pipeline (`media-index`) wraps macOS Vision via a small
+bundled Swift helper at `internal/helpers/bundle/whatskept-vision`,
+running OCR + classification per JPEG at ~0.2 s/image on Apple
+Silicon. Results land in `wa_image_text` and join into `messages_fts`
+on rebuild, so agent `MATCH 'receipt'` queries hit message text *and*
+image content.
+
+Voice transcription is the last remaining sidecar — it needs a
+bundled whisper.cpp (or a Swift wrapper over the new system Speech
+APIs). Tracked as the final piece for parity with the Python tool.
 
 ## Validated foundations
 
