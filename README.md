@@ -6,6 +6,17 @@ A single self-contained binary. Drives iOS backups, decrypts WhatsApp's
 ChatStorage.sqlite, and (eventually) feeds it into a searchable
 SQLite + FTS5 workspace that an agent can query directly.
 
+## How this was built
+
+> Built in a weekend with **Claude Opus 4.7**, burning ~**$900** in
+> tokens so you don't have to. Practically every line of code in this
+> repo is AI-generated. I won't pretend I read it line by line — I
+> didn't — but I stood behind **every architecture decision**: how
+> the backup is decrypted, where secrets live, what crosses a
+> network boundary, how the workspace is laid out, why the binary
+> ships self-contained. The agent wrote the code; the design, the
+> trade-offs, and the privacy posture are mine.
+
 ## What this is (and what it isn't)
 
 WhatsKept is a **data pipeline**, not an AI assistant. Its entire job
