@@ -38,10 +38,11 @@ import (
 //   - label_min_conf defaults to 0.50 (Python: 0.30); below that
 //     Apple Vision labels are mostly "indoor"/"outdoor" noise.
 //   - Decrypted JPEGs are kept on disk by default at
-//     <workspace>/media/<rowid>.jpg so the agent can `open` an
-//     image without re-decrypting (see AGENTS.md). Orphan files
-//     get pruned by SyncMessages on the next sync; we do not have
-//     to clean up here.
+//     <workspace>/media/<rowid>.<ext> (jpg / png / heic / gif —
+//     whatever the bytes actually are) so the agent can `open`
+//     an image without re-decrypting (see AGENTS.md). Orphan
+//     files get pruned by SyncMessages on the next sync; we do
+//     not have to clean up here.
 
 const (
 	// Status values stored in media_index.status. The set is
@@ -62,22 +63,58 @@ const (
 	// index without overrides gets identical behaviour.
 	defaultLabelTopN    = 5
 	defaultLabelMinConf = 0.50
-
-	// JPEG magic bytes. A row whose decrypted blob doesn't start
-	// with these is recorded as STATUS_ERROR ("not a JPEG")
-	// rather than handed to Vision, which would otherwise emit a
-	// generic "unsupported format" error.
-	jpegMagicByte0 = 0xFF
-	jpegMagicByte1 = 0xD8
-	jpegMagicByte2 = 0xFF
 )
+
+// mediaImageExts lists every on-disk extension processOne is allowed
+// to write under <Workspace>/media/. Used by the orphan-prune walk
+// to know which suffixes mean "indexer output" vs "user-dropped
+// files we don't touch". Keep in sync with detectImageFormat.
+var mediaImageExts = []string{".jpg", ".png", ".heic", ".gif"}
+
+// detectImageFormat sniffs the first few bytes of `data` and returns
+// a bare extension ("jpg", "png", "heic", "gif") for the four
+// formats Apple Vision accepts in WhatsApp content. ok=false means
+// nothing matched — the blob is corrupt, encrypted, or some format
+// Vision can't handle (TIFF/WebP do exist but we haven't seen them
+// in WhatsApp media so far).
+//
+// Magic-byte references:
+//   - JPEG:  FF D8 FF
+//   - PNG:   89 50 4E 47 0D 0A 1A 0A
+//   - HEIC:  bytes [4:8] == "ftyp" (ISO BMFF box header). Brand at
+//     [8:12] varies (heic / heix / mif1 / msf1 / heim / heis);
+//     we accept any "ftyp" since misclassifying e.g. an MP4
+//     here is harmless — Vision rejects non-images cleanly
+//     and we surface that as a normal vision error.
+//   - GIF:   47 49 46 38 ('GIF8')
+func detectImageFormat(data []byte) (string, bool) {
+	if len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "jpg", true
+	}
+	if len(data) >= 8 &&
+		data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 &&
+		data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A {
+		return "png", true
+	}
+	if len(data) >= 12 &&
+		data[4] == 'f' && data[5] == 't' && data[6] == 'y' && data[7] == 'p' {
+		return "heic", true
+	}
+	if len(data) >= 4 &&
+		data[0] == 'G' && data[1] == 'I' && data[2] == 'F' && data[3] == '8' {
+		return "gif", true
+	}
+	return "", false
+}
 
 // MediaIndexOptions configures one MediaIndex run. The zero value is
 // not useful — at minimum Workspace, BackupRoot and Password (or an
 // explicit BackupPath) must be set.
 type MediaIndexOptions struct {
 	// Workspace is the directory containing ChatStorage.sqlite.
-	// Decrypted JPEGs land in <Workspace>/media/<rowid>.jpg.
+	// Decrypted images land in <Workspace>/media/<rowid>.<ext>
+	// where <ext> reflects the actual format (jpg/png/heic/gif).
+	// WhatsApp's ZMEDIALOCALPATH is .jpg regardless of content.
 	Workspace string
 
 	// BackupPath, when non-empty, pins the backup to a specific
@@ -484,8 +521,18 @@ func processOne(
 	// 2. Decrypt to memory. WhatsApp images are small (~50-500 KB);
 	//    no streaming needed and we want a single bytes blob for
 	//    the magic-byte sanity check and the on-disk write.
+	//
+	//    EOF is its own bucket: the manifest references the blob
+	//    but iOS didn't actually persist its bytes (selective
+	//    backup, or a media item that's still uploading). User-side
+	//    that's identical to "file not in manifest", so reclassify
+	//    as missing instead of error.
 	rd, err := bundle.FileReader(*rec)
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			writeMediaIndex(db, c, MediaStatusMissing, 0, "", now)
+			return MediaStatusMissing
+		}
 		writeMediaIndex(db, c, MediaStatusError, 0,
 			fmt.Sprintf("decrypt: %v", err), now)
 		return MediaStatusError
@@ -493,24 +540,36 @@ func processOne(
 	data, err := io.ReadAll(rd)
 	_ = rd.Close()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			writeMediaIndex(db, c, MediaStatusMissing, 0, "", now)
+			return MediaStatusMissing
+		}
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
 			fmt.Sprintf("read: %v", err), now)
 		return MediaStatusError
 	}
 
-	// 3. JPEG magic check. WhatsApp occasionally stores .jpg-named
-	//    HEIC files; Vision tolerates those but we still skip
-	//    anything that's not JPEG/HEIC-shaped (zero-byte files,
-	//    truncated downloads, etc).
-	if len(data) < 3 || data[0] != jpegMagicByte0 || data[1] != jpegMagicByte1 || data[2] != jpegMagicByte2 {
-		writeMediaIndex(db, c, MediaStatusError, int64(len(data)), "not a JPEG", now)
+	// 3. Format check. WhatsApp's ZMEDIALOCALPATH always ends in
+	//    `.jpg` regardless of the actual blob — in practice we see
+	//    JPEG, PNG (esp. stickers / canvas-rendered group content),
+	//    HEIC (Live Photos and modern iPhone cameras), and GIF.
+	//    Apple Vision handles all four natively. Anything else
+	//    (zero-byte files, truncated downloads, AES-padded garbage)
+	//    is recorded as STATUS_ERROR rather than handed to Vision,
+	//    which would otherwise emit a generic "unsupported format".
+	ext, ok := detectImageFormat(data)
+	if !ok {
+		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
+			"unrecognized image format", now)
 		return MediaStatusError
 	}
 
 	// 4. Write to disk. Atomic via tmp+rename so an interrupted
-	//    write doesn't leave a half-JPEG that Vision would barf on
-	//    a future retry.
-	out := filepath.Join(mediaDir, fmt.Sprintf("%d.jpg", c.rowid))
+	//    write doesn't leave a half-image that Vision would barf
+	//    on a future retry. Use the detected extension so `file`
+	//    and `open` behave honestly — agents glob `<rowid>.*` per
+	//    AGENTS.md.
+	out := filepath.Join(mediaDir, fmt.Sprintf("%d.%s", c.rowid, ext))
 	if err := writeFileAtomic(out, data); err != nil {
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
 			fmt.Sprintf("write: %v", err), now)

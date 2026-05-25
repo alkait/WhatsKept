@@ -39,6 +39,7 @@ in a separate repository.`,
 	root.AddCommand(newExtractCmd())
 	root.AddCommand(newAppCmd())
 	root.AddCommand(newMediaIndexCmd())
+	root.AddCommand(newVoiceIndexCmd())
 
 	return root
 }

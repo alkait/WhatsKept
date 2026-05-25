@@ -10,8 +10,11 @@ user's questions by running SQL against the database.
 ```
 ./ChatStorage.sqlite     # the main DB — your primary tool
 ./views.sql              # views + FTS5 definitions (already applied)
-./media/<rowid>.jpg      # full-res images (if `whatskept-media-index` ran)
-./voice/<rowid>.<ext>    # voice notes, usually .opus (if `whatskept-voice-index` ran)
+./media/<rowid>.<ext>    # full-res images (if `whatskept media-index` ran).
+                         # <ext> is the real format: jpg, png, heic, or gif.
+                         # WhatsApp stores everything with a .jpg path on the
+                         # phone, but the bytes are often something else.
+./voice/<rowid>.opus     # voice notes (Ogg/OPUS, if `whatskept voice-index` ran)
 ./profiles/whatsapp/<jid>.jpg   # WhatsApp avatars (if `whatskept-profiles-sync` ran)
 ./profiles/ios/<jid>.jpg        # iOS Contacts avatar thumbnails — fallback
                                 # when no WhatsApp avatar exists (if
@@ -34,8 +37,8 @@ join key you need across `media/`, `voice/`, `wa_image_text`, `wa_voice_text`.
 | surface              | source                                       | requires                      |
 |----------------------|----------------------------------------------|-------------------------------|
 | typed text           | `ZWAMESSAGE.ZTEXT`                           | always                        |
-| screenshots / photos | `wa_image_text.ocr_text` + `labels`          | `whatskept-media-index` ran   |
-| voice notes          | `wa_voice_text.transcript`                   | `whatskept-voice-index` ran   |
+| screenshots / photos | `wa_image_text.ocr_text` + `labels`          | `whatskept media-index` ran   |
+| voice notes          | `wa_voice_text.transcript`                   | `whatskept voice-index` ran   |
 | attached documents   | `wa_document.filename`                       | always                        |
 | shared links         | `ZWAMEDIAITEM.ZTITLE` (preview headline)     | always                        |
 
@@ -114,13 +117,14 @@ the file to macOS.
    one. **Never** `open` several files in a row — one Preview/QuickTime
    window per file is rude.
 3. **Check the file exists** (not every message has been indexed):
-   - Image: `test -f ./media/<rowid>.jpg` or `media_index.status = 'described'`.
+   - Image: `ls ./media/<rowid>.*` (extension varies — jpg/png/heic/gif) or
+     `media_index.status = 'described'`.
    - Voice: `ls ./voice/<rowid>.*` (codec varies) or `voice_index.status = 'transcribed'`.
    - Avatar: `SELECT path FROM v_avatar WHERE jid = ?` — may be NULL.
 4. **Hand off to macOS:**
 
    ```bash
-   open ./media/<rowid>.jpg
+   open ./media/<rowid>.*
    open ./voice/<rowid>.opus
    open ./profiles/whatsapp/<jid>.jpg
    ```
@@ -283,7 +287,7 @@ the user, `open <path>`; don't read it.
 
 ### `wa_image_text` — image OCR + labels
 
-Optional. Populated by `whatskept-media-index` (Apple Vision, on-device).
+Optional. Populated by `whatskept media-index` (Apple Vision, on-device, via the bundled `whatskept-vision` helper).
 
 | column         | meaning                                                            |
 |----------------|--------------------------------------------------------------------|
@@ -299,8 +303,9 @@ image").
 
 ### `wa_voice_text` — voice-note transcripts
 
-Optional. Populated by `whatskept-voice-index` (mlx-whisper on Apple
-Silicon; default model `whisper-large-v3-turbo`).
+Optional. Populated by `whatskept voice-index` (whisper.cpp with Metal
+acceleration on Apple Silicon; bundled `ggml-large-v3-turbo-q5_0` model,
+~574 MB, downloaded on first use to `~/Library/Application Support/whatskept/models/`).
 
 | column          | meaning                                                          |
 |-----------------|------------------------------------------------------------------|
@@ -313,7 +318,9 @@ Silicon; default model `whisper-large-v3-turbo`).
 
 Companion `voice_index(rowid, status)` tracks resume state; `status` ∈
 `transcribed | missing | error | skipped`. `'skipped'` means the clip
-exceeded the duration cap (default 10 min).
+exceeded the duration cap (default 10 min). `'missing'` means iOS didn't
+back up the blob (very common for voice notes the user hasn't replayed
+on the device since the last backup) — not an error, just unavailable.
 
 ## Pitfalls — read these before writing your first query
 

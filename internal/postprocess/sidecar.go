@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -53,6 +54,8 @@ type OrphanPruneStats struct {
 	VoiceIndexRowsDeleted int `json:"voice_index_rows_deleted"`
 	MediaFilesDeleted     int `json:"media_files_deleted"`
 	MediaFilesFailed      int `json:"media_files_failed"`
+	VoiceFilesDeleted     int `json:"voice_files_deleted"`
+	VoiceFilesFailed      int `json:"voice_files_failed"`
 }
 
 // tableExists returns true if a regular table or virtual table with
@@ -313,7 +316,7 @@ CREATE INDEX IF NOT EXISTS voice_index_status_idx ON voice_index(status);
 //
 // Fail-soft: per-file os.Remove failures bump MediaFilesFailed but
 // never abort.
-func pruneOrphans(dbPath, mediaDir string) (*OrphanPruneStats, error) {
+func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -355,19 +358,12 @@ func pruneOrphans(dbPath, mediaDir string) (*OrphanPruneStats, error) {
 		}
 	}
 
-	// Pass 2 — disk files. Skip if mediaDir doesn't exist yet (first
-	// sync, no media-index ever run).
-	if mediaDir == "" {
+	// Pass 2 — disk files. Build the "alive" rowid set once
+	// (memory cost ~8 bytes/msg → 800 KB for 100K messages; trivial)
+	// and reuse it across all per-surface walks below.
+	if mediaDir == "" && voiceDir == "" {
 		return stats, nil
 	}
-	st, err := os.Stat(mediaDir)
-	if err != nil || !st.IsDir() {
-		return stats, nil //nolint:nilerr // missing dir is fine, not an error
-	}
-
-	// Build the "alive" rowid set once (memory cost ~8 bytes/msg →
-	// 800 KB for 100K messages; trivial). Looking up file rowids is
-	// then O(1) per file.
 	rows, err := db.Query(`SELECT Z_PK FROM ZWAMESSAGE`)
 	if err != nil {
 		return nil, fmt.Errorf("query live message rowids: %w", err)
@@ -383,34 +379,66 @@ func pruneOrphans(dbPath, mediaDir string) (*OrphanPruneStats, error) {
 	}
 	rows.Close()
 
-	entries, err := os.ReadDir(mediaDir)
+	// Media folder holds whatever extensions detectImageFormat
+	// produces — JPEG / PNG / HEIC / GIF — so we walk each suffix.
+	// Any non-matching file (user-dropped, README.txt, etc.) is
+	// left alone by pruneOrphanFiles' stem-must-be-pure-int rule.
+	for _, ext := range mediaImageExts {
+		if err := pruneOrphanFiles(mediaDir, ext, alive,
+			&stats.MediaFilesDeleted, &stats.MediaFilesFailed); err != nil {
+			return nil, err
+		}
+	}
+	if err := pruneOrphanFiles(voiceDir, ".opus", alive,
+		&stats.VoiceFilesDeleted, &stats.VoiceFilesFailed); err != nil {
+		return nil, err
+	}
+
+	return stats, nil
+}
+
+// pruneOrphanFiles walks `dir` and deletes any file whose name is
+// "<rowid><suffix>" where rowid is not in `alive`. dir == "" or a
+// nonexistent dir is a quiet no-op (first sync, sidecar never run,
+// etc). Counts are accumulated into the int pointers.
+func pruneOrphanFiles(dir, suffix string, alive map[int64]struct{}, deleted, failed *int) error {
+	if dir == "" {
+		return nil
+	}
+	st, err := os.Stat(dir)
+	if err != nil || !st.IsDir() {
+		return nil //nolint:nilerr // missing dir is fine, not an error
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read media dir: %w", err)
+		return fmt.Errorf("read %s: %w", dir, err)
 	}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jpg") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), suffix) {
 			continue
 		}
-		// Filename shape: "<rowid>.jpg" produced by media-index.
-		// Anything else (e.g. user-dropped file) is left alone so
-		// we never delete data we didn't put there.
-		stem := strings.TrimSuffix(e.Name(), ".jpg")
-		var r int64
-		if _, err := fmt.Sscanf(stem, "%d", &r); err != nil {
+		// Filename shape: "<rowid><suffix>" produced by the
+		// matching indexer. Anything else (user-dropped files,
+		// transient .wav scratch files, etc) is left alone so we
+		// never delete data we didn't put there. Use ParseInt
+		// rather than Sscanf because the latter is happy to accept
+		// "4_partial" → 4, which would mis-classify e.g. half-
+		// written outputs from another tool as our orphans.
+		stem := strings.TrimSuffix(e.Name(), suffix)
+		r, err := strconv.ParseInt(stem, 10, 64)
+		if err != nil {
 			continue
 		}
 		if _, ok := alive[r]; ok {
 			continue
 		}
-		p := filepath.Join(mediaDir, e.Name())
-		if err := os.Remove(p); err != nil {
-			stats.MediaFilesFailed++
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			*failed++
 		} else {
-			stats.MediaFilesDeleted++
+			*deleted++
 		}
 	}
-
-	return stats, nil
+	return nil
 }
 
 // rebuildFTS drops messages_fts and repopulates it from the current

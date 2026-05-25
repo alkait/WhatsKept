@@ -923,7 +923,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, onSync, onMediaIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, voiceJob, modelJob, onSync, onMediaIndex, onVoiceIndex, onVoiceModelDownload, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -1072,6 +1072,16 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, onSync, onMediaI
       dbStatus={dbStatus}
       job={mediaJob}
       onMediaIndex={onMediaIndex}
+      hasSessionPassword={hasSessionPassword}
+      reloadDbStatus={reloadDbStatus}
+    />
+
+    <VoiceIndexCard
+      dbStatus={dbStatus}
+      job={voiceJob}
+      modelJob={modelJob}
+      onVoiceIndex={onVoiceIndex}
+      onVoiceModelDownload={onVoiceModelDownload}
       hasSessionPassword={hasSessionPassword}
       reloadDbStatus={reloadDbStatus}
     />
@@ -1301,6 +1311,359 @@ function fmtEta(secs) {
   if (secs < 60)   return `${Math.round(secs)}s`;
   if (secs < 3600) return `${(secs/60).toFixed(1)}m`;
   return `${(secs/3600).toFixed(1)}h`;
+}
+
+// fmtMB formats a byte count to a "X MB" string. Used by the
+// voice-model download modal's progress line.
+function fmtMB(bytes) {
+  if (!bytes && bytes !== 0) return "—";
+  return `${(bytes / (1024*1024)).toFixed(0)} MB`;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VoiceIndexCard — "Sync voice notes" section under the Database tab
+// ═══════════════════════════════════════════════════════════════════════════
+// Mirrors MediaIndexCard exactly except:
+//   - Reads dbStatus.voice_total / voice_transcribed counts.
+//   - Pre-flights /api/database/voice-index/model-status on mount;
+//     if the speech model isn't installed yet, the button opens the
+//     download modal instead of jumping into a transcription job.
+//   - Live progress driven by VoiceIndexProgress (transcribed,
+//     missing, errors, current_label).
+function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDownload, hasSessionPassword, reloadDbStatus }) {
+  const [prompting, setPrompting]       = useState(false); // password modal
+  const [showDownload, setShowDownload] = useState(false); // model-download modal
+  const [modelInstalled, setModelInstalled] = useState(null); // null = unknown
+  const [modelInfo, setModelInfo]       = useState(null);
+
+  const j  = job      || {};
+  const mj = modelJob || {};
+  const isRunning   = !!j.running;
+  const isDownloading = !!mj.running;
+  const hasDone     = j.done !== undefined && j.done !== null;
+  const progress    = j.progress || null;
+
+  // Check model presence on mount, and again after every successful
+  // download (so the button label flips from "Set up voice…" → "Sync
+  // voice notes" without a page reload).
+  const reloadModelStatus = async () => {
+    try {
+      const m = await api.get("/api/database/voice-index/model-status");
+      setModelInfo(m);
+      setModelInstalled(!!m.installed);
+    } catch { /* leave modelInstalled as null — button will be a no-op */ }
+  };
+  useEffect(() => { reloadModelStatus(); }, []);
+
+  // After the download job finishes, refresh status + auto-close modal.
+  useEffect(() => {
+    if (mj.done === true) {
+      reloadModelStatus();
+      setShowDownload(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mj.done]);
+
+  // Same DB-counts refresh dance as MediaIndexCard.
+  useEffect(() => {
+    if (hasDone && j.done === true) reloadDbStatus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasDone, j.done]);
+
+  if (!dbStatus) return null;
+  const hasDB       = !!dbStatus.db_exists;
+  const total       = dbStatus.voice_total ?? null;
+  const transcribed = dbStatus.voice_transcribed ?? 0;
+  const remaining   = total != null ? Math.max(total - transcribed, 0) : null;
+  const allDone     = total != null && total > 0 && transcribed >= total;
+
+  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
+  if (!hasDB) {
+    title         = "Run a messages sync first";
+    subtitle      = "Voice transcription reads the message database — sync that above before transcribing voice notes.";
+    buttonLabel   = "Sync voice notes";
+    buttonPrimary = false;
+    statusDot     = "#9ca3af";
+  } else if (total === 0) {
+    title         = "No voice notes on device";
+    subtitle      = "There's nothing to transcribe — your WhatsApp has no .opus voice messages.";
+    buttonLabel   = "Sync voice notes";
+    buttonPrimary = false;
+    statusDot     = "#9ca3af";
+  } else if (modelInstalled === false) {
+    title         = "Set up voice transcription";
+    subtitle      = total != null
+      ? `${total.toLocaleString()} voice notes on the device. One-time 574 MB speech-model download required.`
+      : "One-time 574 MB speech-model download required before transcribing.";
+    buttonLabel   = "Set up";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  } else if (allDone) {
+    title         = "All voice notes transcribed";
+    subtitle      = `${transcribed.toLocaleString()} of ${total.toLocaleString()} voice notes transcribed and indexed in wa_voice_text.`;
+    buttonLabel   = "Re-transcribe";
+    buttonPrimary = false;
+    statusDot     = "#25D366";
+  } else if (transcribed === 0) {
+    title         = "Voice notes not yet transcribed";
+    subtitle      = total != null
+      ? `${total.toLocaleString()} voice notes on the device. whisper.cpp runs at ~14× realtime on Apple Silicon (Metal-accelerated).`
+      : "whisper.cpp transcribes each clip on-device with auto language detection.";
+    buttonLabel   = "Sync voice notes";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  } else {
+    title         = "Resume voice transcription";
+    subtitle      = `${transcribed.toLocaleString()} / ${total.toLocaleString()} transcribed · ${remaining.toLocaleString()} remaining.`;
+    buttonLabel   = "Resume";
+    buttonPrimary = true;
+    statusDot     = "#f59e0b";
+  }
+
+  const pct = (total != null && total > 0)
+    ? Math.min(100, Math.round((transcribed / total) * 100))
+    : 0;
+
+  const launch = () => {
+    if (modelInstalled === false) {
+      setShowDownload(true);
+      return;
+    }
+    if (hasSessionPassword) onVoiceIndex("");
+    else setPrompting(true);
+  };
+
+  const buttonDisabled = isRunning || isDownloading || !hasDB || total === 0 || modelInstalled === null;
+
+  return (
+    <section className="mt-6">
+      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Voice transcription</h2>
+
+      <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
+              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+
+            {/* Static (non-running) progress bar. */}
+            {!isRunning && hasDB && total != null && total > 0 && modelInstalled && (
+              <div className="mt-3">
+                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
+                </div>
+                <p className="text-[10px] text-gray-400 mt-1">{pct}% transcribed</p>
+              </div>
+            )}
+          </div>
+
+          <button onClick={launch} disabled={buttonDisabled}
+            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
+            <RefreshIcon />
+            {isRunning ? "Transcribing…" : isDownloading ? "Downloading…" : buttonLabel}
+          </button>
+        </div>
+
+        {j.error && j.error !== "model_required" && (
+          <p className="text-sm text-red-500 mt-3">{j.error}</p>
+        )}
+
+        {/* Live progress card while transcribing. */}
+        {isRunning && (
+          <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
+            {progress ? (
+              <>
+                <div className="flex items-baseline justify-between text-xs mb-2">
+                  <span className="font-semibold text-gray-900">
+                    {progress.done.toLocaleString()} / {(progress.pending || 0).toLocaleString()} clips
+                  </span>
+                  <span className="text-gray-500">
+                    {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)} clips/s` : ""}
+                    {progress.eta_seconds > 0 ? ` · ETA ${fmtEta(progress.eta_seconds)}` : ""}
+                  </span>
+                </div>
+                <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
+                  <div className="h-full rounded-full transition-all duration-500" style={{
+                    width: `${Math.min(100, Math.round((progress.done / Math.max(progress.pending, 1)) * 100))}%`,
+                    background:'#25D366',
+                  }}></div>
+                </div>
+                <div className="grid grid-cols-3 gap-2 mt-3 text-[11px] text-gray-600">
+                  <div title="Clips successfully transcribed and persisted to wa_voice_text.">
+                    <span className="font-semibold text-gray-900">{progress.transcribed.toLocaleString()}</span> transcribed
+                  </div>
+                  <div title="Chat references a voice note whose .opus file isn't in the backup. Not an error.">
+                    <span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing
+                  </div>
+                  <div title="Indexer found the file but couldn't transcribe (corrupted opus, decrypt failed, whisper crashed, etc).">
+                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
+                  </div>
+                </div>
+                {progress.current_label && (
+                  <p className="text-[10px] text-gray-400 mt-2 font-mono truncate">
+                    Now: {progress.current_label}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-xs text-gray-500">Preparing…</p>
+            )}
+            {j.lines && j.lines.length > 0 && (
+              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
+                {j.lines[j.lines.length - 1]}
+              </p>
+            )}
+          </div>
+        )}
+
+        {hasDone && j.done === true && !isRunning && (
+          <p className="text-xs text-gray-500 mt-3">✓ Transcription complete. Agent queries can now MATCH on voice-note transcripts.</p>
+        )}
+      </div>
+
+      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
+        Decrypts each <code>.opus</code> voice note from the iOS backup to <code>./voice/&lt;rowid&gt;.opus</code>,
+        then transcribes via the bundled <code>whisper-cli</code> (Metal-accelerated, large-v3-turbo) and stores
+        the result in <code>wa_voice_text</code>. Auto-detects language per clip — handles Arabic / English /
+        code-switching out of the box. Resumable: cancel anytime and re-run.
+      </p>
+
+      {prompting && (
+        <PasswordPromptModal
+          device={{ name: "the latest iPhone backup" }}
+          onConfirm={pw => { setPrompting(false); onVoiceIndex(pw); }}
+          onCancel={() => setPrompting(false)}
+          confirmLabel="Sync voice notes"
+        />
+      )}
+
+      {showDownload && (
+        <VoiceModelDownloadModal
+          modelInfo={modelInfo}
+          modelJob={modelJob}
+          onStart={onVoiceModelDownload}
+          onClose={() => setShowDownload(false)}
+        />
+      )}
+    </section>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VoiceModelDownloadModal — first-run speech-model installer
+// ═══════════════════════════════════════════════════════════════════════════
+// Two visual states gated by modelJob.running:
+//   1. Idle (pre-click)        — shows model name, size, source URL,
+//                                cache path, and a [Cancel] / [Download]
+//                                button pair.
+//   2. In-progress (post-click) — shows MB / total · MB/s · ETA, with
+//                                a progress bar and a Close button. The
+//                                actual cancel-the-download mechanism
+//                                is deferred (would require sending
+//                                DELETE /api/jobs/{id}).
+function VoiceModelDownloadModal({ modelInfo, modelJob, onStart, onClose }) {
+  const mj = modelJob || {};
+  const running = !!mj.running;
+  const done    = mj.done === true;
+  const failed  = mj.done === false && !!mj.error;
+  const p       = mj.progress || null;
+  const stage   = p?.stage || (failed ? "error" : "idle");
+
+  const total   = modelInfo?.bytes_total ?? 0;
+  const got     = p?.bytes_read ?? 0;
+  const pct     = total > 0 ? Math.min(100, (got / total) * 100) : 0;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center" style={{background:'rgba(0,0,0,0.45)'}}>
+      <div className="rounded-xl bg-white shadow-xl w-full max-w-md p-6" style={{border:'1px solid #DCF8C6'}}>
+        <h3 className="font-semibold text-gray-900 text-base mb-2">
+          {done ? "Speech model installed" : "Set up voice transcription"}
+        </h3>
+
+        {!running && !done && !failed && (
+          <>
+            <p className="text-sm text-gray-600 leading-relaxed mb-4">
+              WhatsKept needs to download a speech model before it can transcribe voice notes.
+              This is a one-time download — the model persists across all future app updates.
+            </p>
+            <dl className="text-xs text-gray-700 space-y-1.5 mb-5 rounded-lg p-3" style={{background:'#F8FAFC', border:'1px solid #E5E7EB'}}>
+              <div className="flex justify-between"><dt className="text-gray-500">Model</dt><dd className="font-medium">{modelInfo?.display || "Whisper Large-v3-Turbo"}</dd></div>
+              <div className="flex justify-between"><dt className="text-gray-500">Size</dt><dd className="font-medium">{fmtMB(total)}</dd></div>
+              <div className="flex justify-between"><dt className="text-gray-500">Source</dt><dd className="font-medium">HuggingFace</dd></div>
+              <div className="flex justify-between gap-3 min-w-0"><dt className="text-gray-500 shrink-0">Cache</dt><dd className="font-mono text-[10px] truncate text-right" title={modelInfo?.path}>~/Library/Application Support/whatskept/models/</dd></div>
+            </dl>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg">Cancel</button>
+              <button onClick={onStart}
+                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
+                Download &amp; install
+              </button>
+            </div>
+          </>
+        )}
+
+        {running && (
+          <>
+            <p className="text-xs text-gray-500 mb-3">
+              {stage === "verifying"
+                ? "Verifying integrity (sha256)…"
+                : `${fmtMB(got)} of ${fmtMB(total)}`}
+            </p>
+            <div className="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
+              <div className="h-full rounded-full transition-all" style={{width:`${pct}%`, background:'#25D366'}}></div>
+            </div>
+            {stage === "downloading" && p && (
+              <div className="flex justify-between text-[11px] text-gray-500 mt-2">
+                <span>{p.rate_bps ? `${(p.rate_bps / (1024*1024)).toFixed(1)} MB/s` : ""}</span>
+                <span>{p.eta_seconds > 0 ? `ETA ${fmtEta(p.eta_seconds)}` : ""}</span>
+              </div>
+            )}
+            <p className="text-[10px] text-gray-400 mt-4">
+              Downloading from HuggingFace · this window can stay open in the background.
+            </p>
+          </>
+        )}
+
+        {done && (
+          <>
+            <p className="text-sm text-gray-600 leading-relaxed mb-4">
+              ✓ The speech model is installed at <code className="font-mono text-[11px]">~/Library/Application Support/whatskept/models/</code>.
+              You can now transcribe your voice notes.
+            </p>
+            <div className="flex justify-end">
+              <button onClick={onClose}
+                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
+                Continue
+              </button>
+            </div>
+          </>
+        )}
+
+        {failed && (
+          <>
+            <p className="text-sm text-red-600 leading-relaxed mb-3">
+              Download failed: {mj.error}
+            </p>
+            <p className="text-xs text-gray-500 mb-4">
+              The partial file is preserved — clicking <strong>Retry</strong> resumes from where it stopped (HTTP Range).
+            </p>
+            <div className="flex justify-end gap-2">
+              <button onClick={onClose}
+                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg">Close</button>
+              <button onClick={onStart}
+                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
+                Retry
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1643,6 +2006,54 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     }
   };
 
+  // ── start voice transcription (voice-index) ───────────────────────────
+  // Same shape as startMediaIndex. The server returns 412 with
+  // {error: "model_required"} if the speech model isn't installed —
+  // we surface that as an error string so the card can render a
+  // distinguishable "Download model first" affordance.
+  const startVoiceIndex = async (password) => {
+    const key = "db:voice-index";
+    patchJob(key, {
+      running: true, done: null,
+      lines: [], progress: null,
+      adopted: false, pid: null,
+      startedAt: new Date().toISOString(), error: "",
+    });
+    try {
+      const { job_id } = await api.post("/api/database/voice-index", { password });
+      streamJob(job_id, key, true);
+    } catch(ex) {
+      // If the server rejected with 412/model_required, normalise the
+      // error string so the card knows to open the download modal
+      // instead of showing a generic failure.
+      const isModelRequired = (ex.message || "").includes("model_required");
+      patchJob(key, {
+        running: false,
+        done: false,
+        error: isModelRequired ? "model_required" : ex.message,
+      });
+    }
+  };
+
+  // ── start voice-model download (one-time, ~574 MB) ────────────────────
+  // Tracked under its own job key so the UI can show progress simultaneously
+  // with whatever the user was about to do (voice-index, in practice).
+  const startVoiceModelDownload = async () => {
+    const key = "db:voice-model-download";
+    patchJob(key, {
+      running: true, done: null,
+      lines: [], progress: null,
+      adopted: false, pid: null,
+      startedAt: new Date().toISOString(), error: "",
+    });
+    try {
+      const { job_id } = await api.post("/api/database/voice-index/model-download", {});
+      streamJob(job_id, key, true);
+    } catch(ex) {
+      patchJob(key, { running: false, done: false, error: ex.message });
+    }
+  };
+
   const tabs = [
     { id: "backups",  label: "Backups"  },
     { id: "database", label: "Database" },
@@ -1808,8 +2219,12 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             reloadDbStatus={reloadDbStatus}
             job={jobs["db:sync"]}
             mediaJob={jobs["db:media-index"]}
+            voiceJob={jobs["db:voice-index"]}
+            modelJob={jobs["db:voice-model-download"]}
             onSync={startSync}
             onMediaIndex={startMediaIndex}
+            onVoiceIndex={startVoiceIndex}
+            onVoiceModelDownload={startVoiceModelDownload}
             hasSessionPassword={hasSessionPassword}
             onForgetPassword={forgetSessionPassword}
             binding={workspace.binding}

@@ -346,18 +346,20 @@ func SyncMessages(
 	// user asked for. Non-fatal: failures bump stats and the sync
 	// still succeeds.
 	mediaDir := filepath.Join(workspace, "media")
-	pruneStats, pruneErr := pruneOrphans(livePath, mediaDir)
+	voiceDir := filepath.Join(workspace, "voice")
+	pruneStats, pruneErr := pruneOrphans(livePath, mediaDir, voiceDir)
 	if pruneErr != nil {
 		log(fmt.Sprintf("Orphan prune failed (continuing): %v", pruneErr))
 	} else if pruneStats != nil {
 		total := pruneStats.MediaFilesDeleted + pruneStats.OCRRowsDeleted +
 			pruneStats.MediaIndexRowsDeleted + pruneStats.VoiceRowsDeleted +
-			pruneStats.VoiceIndexRowsDeleted
+			pruneStats.VoiceIndexRowsDeleted + pruneStats.VoiceFilesDeleted
 		if total > 0 {
 			log(fmt.Sprintf(
-				"Pruned %d orphan media files, %d OCR rows, %d media_index rows.",
-				pruneStats.MediaFilesDeleted, pruneStats.OCRRowsDeleted,
-				pruneStats.MediaIndexRowsDeleted,
+				"Pruned: %d media files / %d voice files · %d wa_image_text / %d wa_voice_text rows · %d media_index / %d voice_index rows.",
+				pruneStats.MediaFilesDeleted, pruneStats.VoiceFilesDeleted,
+				pruneStats.OCRRowsDeleted, pruneStats.VoiceRowsDeleted,
+				pruneStats.MediaIndexRowsDeleted, pruneStats.VoiceIndexRowsDeleted,
 			))
 		}
 	}

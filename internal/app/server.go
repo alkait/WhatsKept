@@ -126,6 +126,13 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/database/media-index", s.handleMediaIndex)
 	mux.HandleFunc("GET /api/database/media-index/issues", s.handleMediaIndexIssues)
 
+	// Voice transcription. The model-status route lets the GUI decide
+	// whether to open the "first run, please download model" modal
+	// before kicking off a transcription job.
+	mux.HandleFunc("GET /api/database/voice-index/model-status", s.handleVoiceModelStatus)
+	mux.HandleFunc("POST /api/database/voice-index/model-download", s.handleVoiceModelDownload)
+	mux.HandleFunc("POST /api/database/voice-index", s.handleVoiceIndex)
+
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
@@ -681,14 +688,24 @@ type databaseStatus struct {
 	// The first pair drives "X / Y indexed" copy on the Sync-images
 	// card. The second pair drives the "View N issues" link, which
 	// opens a modal listing the offending rows from media_index.
-	ImageDescribed *int   `json:"image_described,omitempty"`
-	ImageTotal     *int   `json:"image_total,omitempty"`
-	ImageErrors    *int   `json:"image_errors,omitempty"`
-	ImageMissing   *int   `json:"image_missing,omitempty"`
-	LastSyncedAt   string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
-	LatestBackupAt string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
-	IsStale        bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
-	HasBackups     bool   `json:"has_backups"`                // any encrypted backup found at all
+	ImageDescribed *int `json:"image_described,omitempty"`
+	ImageTotal     *int `json:"image_total,omitempty"`
+	ImageErrors    *int `json:"image_errors,omitempty"`
+	ImageMissing   *int `json:"image_missing,omitempty"`
+	// Voice-note counterparts (driven by voice_index / wa_voice_text):
+	//   VoiceTranscribed: voice_index where status='transcribed'
+	//   VoiceTotal:       all .opus messages in ZWAMEDIAITEM
+	//   VoiceErrors:      voice_index where status='error'
+	//   VoiceMissing:     voice_index where status='missing'
+	// Drive the Sync-voice-notes card's "X / Y transcribed" gauge.
+	VoiceTranscribed *int   `json:"voice_transcribed,omitempty"`
+	VoiceTotal       *int   `json:"voice_total,omitempty"`
+	VoiceErrors      *int   `json:"voice_errors,omitempty"`
+	VoiceMissing     *int   `json:"voice_missing,omitempty"`
+	LastSyncedAt     string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
+	LatestBackupAt   string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
+	IsStale          bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
+	HasBackups       bool   `json:"has_backups"`                // any encrypted backup found at all
 }
 
 func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
@@ -781,6 +798,18 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	if cs.imageMissing >= 0 {
 		out.ImageMissing = &cs.imageMissing
 	}
+	if cs.voiceTranscribed >= 0 {
+		out.VoiceTranscribed = &cs.voiceTranscribed
+	}
+	if cs.voiceTotal >= 0 {
+		out.VoiceTotal = &cs.voiceTotal
+	}
+	if cs.voiceErrors >= 0 {
+		out.VoiceErrors = &cs.voiceErrors
+	}
+	if cs.voiceMissing >= 0 {
+		out.VoiceMissing = &cs.voiceMissing
+	}
 
 	writeJSON(w, http.StatusOK, out)
 }
@@ -793,14 +822,18 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 // treats that as "hide this field in the UI", which is exactly how
 // the JSON omitempty-tagged *int pointers carry the same intent.
 type dbCounts struct {
-	msgs           int // ZWAMESSAGE                              (always present once a DB exists)
-	fts            int // messages_fts                            (after ApplyViews / media-index)
-	avatars        int // wa_profile_picture                      (after SyncProfiles)
-	contacts       int // wa_contact                              (after SyncContacts)
-	imageDescribed int // media_index where status='described'    (after media-index)
-	imageTotal     int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
-	imageErrors    int // media_index where status='error'        (after media-index)
-	imageMissing   int // media_index where status='missing'      (after media-index)
+	msgs             int // ZWAMESSAGE                              (always present once a DB exists)
+	fts              int // messages_fts                            (after ApplyViews / media-index)
+	avatars          int // wa_profile_picture                      (after SyncProfiles)
+	contacts         int // wa_contact                              (after SyncContacts)
+	imageDescribed   int // media_index where status='described'    (after media-index)
+	imageTotal       int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
+	imageErrors      int // media_index where status='error'        (after media-index)
+	imageMissing     int // media_index where status='missing'      (after media-index)
+	voiceTranscribed int // voice_index where status='transcribed' (after voice-index)
+	voiceTotal       int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.opus'
+	voiceErrors      int // voice_index where status='error'       (after voice-index)
+	voiceMissing     int // voice_index where status='missing'     (after voice-index)
 }
 
 // readDBCounts opens dbPath read-only and reports the counts that
@@ -812,6 +845,7 @@ func readDBCounts(dbPath string) dbCounts {
 	cs := dbCounts{
 		msgs: -1, fts: -1, avatars: -1, contacts: -1,
 		imageDescribed: -1, imageTotal: -1, imageErrors: -1, imageMissing: -1,
+		voiceTranscribed: -1, voiceTotal: -1, voiceErrors: -1, voiceMissing: -1,
 	}
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
@@ -832,6 +866,10 @@ func readDBCounts(dbPath string) dbCounts {
 		{&cs.imageTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`},
 		{&cs.imageErrors, `SELECT COUNT(*) FROM media_index WHERE status = 'error'`},
 		{&cs.imageMissing, `SELECT COUNT(*) FROM media_index WHERE status = 'missing'`},
+		{&cs.voiceTranscribed, `SELECT COUNT(*) FROM voice_index WHERE status = 'transcribed'`},
+		{&cs.voiceTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.opus'`},
+		{&cs.voiceErrors, `SELECT COUNT(*) FROM voice_index WHERE status = 'error'`},
+		{&cs.voiceMissing, `SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`},
 	} {
 		var n int
 		if err := db.QueryRow(p.sql).Scan(&n); err == nil {
@@ -1119,4 +1157,146 @@ func (s *server) handleForgetBinding(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// Voice transcription
+// ---------------------------------------------------------------------------
+
+// voiceModelStatusResponse is the shape returned by GET
+// /api/database/voice-index/model-status. The frontend uses
+// `installed` to decide whether to open the download modal before
+// kicking off a transcription job.
+//
+// We deliberately do NOT sha-verify on this read path — the call
+// happens on every Database-tab mount, and verifying 574 MB takes
+// ~0.5 s which would make the tab feel sluggish. Verification
+// happens when the file is first downloaded (where corruption
+// risk is highest), and a wrong-content file has the wrong size
+// in 99% of cases anyway.
+type voiceModelStatusResponse struct {
+	Installed    bool   `json:"installed"`     // true iff size matches spec.Bytes
+	Name         string `json:"name"`          // basename, e.g. "ggml-large-v3-turbo-q5_0.bin"
+	Display      string `json:"display"`       // human-readable model name
+	BytesTotal   int64  `json:"bytes_total"`   // expected final size
+	BytesPresent int64  `json:"bytes_present"` // current file size (0 if missing)
+	SourceURL    string `json:"source_url"`
+	Path         string `json:"path"` // absolute path the model would live at
+}
+
+func (s *server) handleVoiceModelStatus(w http.ResponseWriter, _ *http.Request) {
+	spec := helpers.WhisperModel
+	st, sz, err := helpers.CheckModel(spec, false)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("check model: %v", err))
+		return
+	}
+	path, _ := helpers.ModelPath(spec)
+	writeJSON(w, http.StatusOK, voiceModelStatusResponse{
+		Installed:    st == helpers.ModelPresent || st == helpers.ModelVerified,
+		Name:         spec.Name,
+		Display:      spec.Display,
+		BytesTotal:   spec.Bytes,
+		BytesPresent: sz,
+		SourceURL:    spec.URL,
+		Path:         path,
+	})
+}
+
+// handleVoiceModelDownload starts an SSE-streamed model download
+// job. The response is `{job_id}` and progress events flow through
+// /api/stream/{id} as `progress` events whose payload is a
+// helpers.DownloadProgress JSON.
+//
+// Idempotent: if the model is already on disk, the job emits a
+// single "done" event without ever hitting the network.
+func (s *server) handleVoiceModelDownload(w http.ResponseWriter, _ *http.Request) {
+	jobID := s.jobs.startInProcessProgress("voice-model-download",
+		func(log func(string), progress func(any)) error {
+			spec := helpers.WhisperModel
+			log(fmt.Sprintf("Speech model: %s", spec.Display))
+			log(fmt.Sprintf("Source: %s", spec.URL))
+			log(fmt.Sprintf("Size: %d MB", spec.Bytes/(1024*1024)))
+			log("Downloading…")
+			err := helpers.DownloadModel(spec, helpers.DownloadOptions{
+				Ctx: context.Background(),
+				Progress: func(p helpers.DownloadProgress) {
+					progress(p)
+				},
+			})
+			if err != nil {
+				return err
+			}
+			log("Model installed.")
+			return nil
+		})
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// voiceIndexRequest mirrors mediaIndexRequest — the JSON body may
+// optionally carry a password override; otherwise the session cache
+// is consulted.
+type voiceIndexRequest struct {
+	Password string `json:"password"`
+	Language string `json:"language"` // optional pin, e.g. "ar" or "en"
+}
+
+// handleVoiceIndex starts a `postprocess.VoiceIndex` SSE job. If
+// the speech model isn't installed, returns HTTP 412 with
+// `{error: "model_required"}` so the frontend can route to the
+// download modal first.
+func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+
+	// Pre-flight: model must be installed.
+	st, _, err := helpers.CheckModel(helpers.WhisperModel, false)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("check model: %v", err))
+		return
+	}
+	if st != helpers.ModelPresent && st != helpers.ModelVerified {
+		writeJSON(w, http.StatusPreconditionFailed, map[string]string{
+			"error": "model_required",
+			"hint":  "POST /api/database/voice-index/model-download first",
+		})
+		return
+	}
+
+	var req voiceIndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	attempted := req.Password
+	if attempted == "" {
+		attempted = s.pw.get()
+	}
+	if attempted == "" {
+		httpError(w, http.StatusBadRequest, "backup password is required")
+		return
+	}
+
+	jobID := s.jobs.startInProcessProgress("voice-index",
+		func(log func(string), progress func(any)) error {
+			_, err := postprocess.VoiceIndex(postprocess.VoiceIndexOptions{
+				Workspace:  cur,
+				BackupRoot: backup.DefaultRoot(),
+				Password:   attempted,
+				Language:   req.Language,
+				Log:        log,
+				Progress: func(p postprocess.VoiceIndexProgress) {
+					progress(p)
+				},
+			})
+			if err == nil {
+				s.pw.set(attempted)
+			}
+			return err
+		})
+
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }

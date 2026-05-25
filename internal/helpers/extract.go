@@ -22,6 +22,7 @@ const (
 	IdeviceID       = "idevice_id"
 	IdeviceBackup   = "idevicebackup2"
 	WhatskeptVision = "whatskept-vision" // Swift wrapper over Vision.framework (OCR + classify)
+	WhisperCli      = "whisper-cli"      // ggerganov/whisper.cpp CLI (Metal-accelerated)
 )
 
 // extractMu serialises Path() callers across goroutines so concurrent
