@@ -137,6 +137,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// one with the current workspace as its working folder.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
 	mux.HandleFunc("POST /api/agents/{id}/open", s.handleOpenAgent)
+	mux.HandleFunc("POST /api/open-terminal", s.handleOpenTerminal)
 
 	// Session password — lets the UI skip the modal when a backup
 	// password is already cached, and lets it explicitly forget one

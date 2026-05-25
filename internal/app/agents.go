@@ -198,3 +198,45 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 		"opened":   target,
 	})
 }
+
+// handleOpenTerminal opens the workspace directory in macOS Terminal
+// so the user can pick whatever CLI agent (claude, codex, etc.) they
+// prefer. Same `open -a` mechanics as handleOpenAgent — detached, goes
+// through LaunchServices, focuses an existing Terminal if running.
+//
+// Terminal.app ships with macOS at /System/Applications/Utilities/, so
+// we don't bother with a detection step: `open -a Terminal <path>`
+// either works or the user has done something exotic to their system,
+// in which case the error from `open` is the right message to surface.
+func (s *server) handleOpenTerminal(w http.ResponseWriter, r *http.Request) {
+	var req openAgentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	target := strings.TrimSpace(req.Path)
+	if target == "" {
+		if cur := s.ws.get(); cur != "" {
+			target = cur
+		} else {
+			httpError(w, http.StatusBadRequest, "path is required and no workspace is currently selected")
+			return
+		}
+	}
+	if _, err := os.Stat(target); err != nil {
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("path does not exist: %s", target))
+		return
+	}
+
+	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", target)
+	if err := cmd.Start(); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch Terminal: %v", err))
+		return
+	}
+	go cmd.Wait()
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"opened": target,
+	})
+}

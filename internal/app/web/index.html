@@ -1683,6 +1683,13 @@ function AgentsPanel({ workspace }) {
     finally { setOpeningId(null); }
   };
 
+  const openTerminal = async () => {
+    setOpeningId("__terminal__"); setError("");
+    try { await api.post(`/api/open-terminal`, { path: workspace.path }); }
+    catch(e) { setError(e.message); }
+    finally { setOpeningId(null); }
+  };
+
   if (agents === null) return <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>;
 
   return (
@@ -1728,6 +1735,30 @@ function AgentsPanel({ workspace }) {
               </button>
             </div>
           ))}
+
+          {/* Escape hatch — opens the workspace in Terminal so the user can
+              run any CLI agent (claude, codex, gemini-cli, …) we don't yet
+              detect natively. */}
+          <div className="rounded-xl border bg-white p-4 flex items-center gap-4" style={{borderColor:'#DCF8C6'}}>
+            <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{background:'#DCF8C6',border:'1px solid #128C7E'}}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#075E54" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+              </svg>
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-semibold" style={{color:'#075E54'}}>Terminal</p>
+                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>Built-in</span>
+              </div>
+              <p className="text-xs text-gray-500 mt-0.5">Open the workspace in macOS Terminal — pick any CLI agent (Claude Code, Codex CLI, …) yourself.</p>
+            </div>
+            <button onClick={openTerminal} disabled={openingId === "__terminal__"}
+              className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
+              style={{background:'#075E54'}}
+              title="Open this workspace in a new Terminal window">
+              {openingId === "__terminal__" ? "Opening…" : "Open in Terminal"}
+            </button>
+          </div>
         </div>
       </div>
 
