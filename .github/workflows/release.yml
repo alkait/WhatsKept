@@ -190,6 +190,13 @@ jobs:
           cp dist/whatskept "out/whatskept"
           (cd out && zip -9 "../whatskept-darwin-arm64-${VERSION}.zip" whatskept README.md)
 
+          # Stable, unversioned aliases so README links of the form
+          #   https://github.com/<owner>/<repo>/releases/latest/download/<file>
+          # always resolve to the newest tagged release. Same bytes as the
+          # versioned files above, just renamed.
+          cp "WhatsKept-darwin-arm64-${VERSION}.app.zip" "WhatsKept-darwin-arm64.app.zip"
+          cp "whatskept-darwin-arm64-${VERSION}.zip"     "whatskept-darwin-arm64.zip"
+
           ls -lh *.zip
           shasum -a 256 *.zip | tee SHA256SUMS
 
@@ -222,6 +229,8 @@ jobs:
           files: |
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
+            WhatsKept-darwin-arm64.app.zip
+            whatskept-darwin-arm64.zip
             SHA256SUMS
 
       # Tag pushes get a real release.
@@ -236,4 +245,6 @@ jobs:
           files: |
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
+            WhatsKept-darwin-arm64.app.zip
+            whatskept-darwin-arm64.zip
             SHA256SUMS

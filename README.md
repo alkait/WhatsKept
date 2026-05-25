@@ -6,6 +6,29 @@ A single self-contained binary. Drives iOS backups, decrypts WhatsApp's
 ChatStorage.sqlite, and (eventually) feeds it into a searchable
 SQLite + FTS5 workspace that an agent can query directly.
 
+## Download
+
+Pre-built **macOS arm64 (Apple Silicon)** binaries, ad-hoc signed.
+First launch: right-click → **Open** to bypass Gatekeeper.
+
+- **GUI app** — [`WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip)
+  Unzip and drag `WhatsKept.app` into `/Applications`.
+- **CLI binary** — [`whatskept-darwin-arm64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip)
+  For `whatskept extract` / `whatskept list` and scripted use.
+- **All releases & changelogs** — [github.com/alkait/WhatsKept/releases](https://github.com/alkait/WhatsKept/releases)
+
+One-liner CLI install into `/usr/local/bin`:
+
+```bash
+curl -L -o /tmp/whatskept.zip \
+  https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip \
+  && unzip -o /tmp/whatskept.zip -d /tmp \
+  && sudo install /tmp/whatskept /usr/local/bin/whatskept \
+  && rm /tmp/whatskept.zip
+```
+
+> Prefer to build from source? See [Build](#build) below.
+
 ## How this was built
 
 > Built in a weekend with **Claude Opus 4.7**, burning ~**$900** in
