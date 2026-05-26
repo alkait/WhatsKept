@@ -168,10 +168,21 @@ jobs:
       #     # connection that day.
 
       # Package both flavours so users can pick:
-      #   - WhatsKept-<ver>.app.zip   GUI users: drag-to-/Applications.
-      #     Use ditto (preserves resource forks, codesign metadata,
-      #     symlinks); plain `zip -r` corrupts the bundle's signature
-      #     on extract.
+      #   - WhatsKept-<ver>.app.zip   GUI users. Stages the .app and
+      #     a one-click `Install WhatsKept.command` helper into a
+      #     versioned folder so unzipping yields
+      #         WhatsKept-darwin-arm64-<ver>/
+      #             WhatsKept.app/
+      #             Install WhatsKept.command
+      #     The helper strips com.apple.quarantine + resets the
+      #     stale TCC entry for our bundle ID, which together cover
+      #     the two big friction points of shipping ad-hoc-signed:
+      #     the "is damaged, move to Trash" Gatekeeper dialog, and
+      #     the silently-broken Full Disk Access grant after every
+      #     update (cdhash drift). Use ditto for the zip step
+      #     (preserves codesign metadata, symlinks, resource forks);
+      #     plain `zip -r` corrupts the bundle's signature on
+      #     extract.
       #   - whatskept-<ver>.zip       CLI users: bare Mach-O for
       #     scripts (`whatskept extract`, `whatskept list`). plain
       #     zip is fine here.
@@ -182,8 +193,14 @@ jobs:
           mkdir -p out
           cp README.md "out/README.md"
 
-          # .app bundle for GUI users
-          ditto -c -k --keepParent dist/WhatsKept.app \
+          # .app bundle + install helper for GUI users.
+          STAGE="WhatsKept-darwin-arm64-${VERSION}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          ditto dist/WhatsKept.app "$STAGE/WhatsKept.app"
+          cp build/install-helper.command "$STAGE/Install WhatsKept.command"
+          chmod +x "$STAGE/Install WhatsKept.command"
+          ditto -c -k --keepParent "$STAGE" \
                 "WhatsKept-darwin-arm64-${VERSION}.app.zip"
 
           # Bare CLI binary for scripted use
@@ -220,12 +237,12 @@ jobs:
             macOS arm64 (Apple Silicon) only for now.
 
             **Pick one:**
-            - `WhatsKept-darwin-arm64-*.app.zip` — GUI; unzip and drag to `/Applications`.
+            - `WhatsKept-darwin-arm64-*.app.zip` — GUI. Unzip and double-click `Install WhatsKept.command` inside the unzipped folder. It strips the `com.apple.quarantine` attribute that triggers the "WhatsKept is damaged" dialog, copies the app to `/Applications`, clears any stale Full Disk Access grant, and launches it.
             - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
 
-            Both are ad-hoc signed; on first launch macOS may show
-            "cannot be opened because the developer cannot be verified".
-            Right-click \xe2\x86\x92 Open to bypass.
+            **Why an installer script?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia, macOS refuses to open ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The installer is a one-double-click workaround. The first time you run the `.command` file itself macOS may ask "are you sure" — right-click the file → Open to confirm.
+
+            Re-run the installer after every update.
           files: |
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
@@ -242,6 +259,16 @@ jobs:
           tag_name:   ${{ github.ref_name }}
           prerelease: false
           generate_release_notes: true
+          body: |
+            macOS arm64 (Apple Silicon).
+
+            **Pick one:**
+            - `WhatsKept-darwin-arm64-*.app.zip` — GUI. Unzip and double-click `Install WhatsKept.command` inside the unzipped folder. It strips the `com.apple.quarantine` attribute that triggers the "WhatsKept is damaged" dialog, copies the app to `/Applications`, clears any stale Full Disk Access grant, and launches it.
+            - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
+
+            **Why an installer script?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia, macOS refuses to open ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The installer is a one-double-click workaround. The first time you run the `.command` file itself macOS may ask "are you sure" — right-click the file → Open to confirm.
+
+            Re-run the installer after every update.
           files: |
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
