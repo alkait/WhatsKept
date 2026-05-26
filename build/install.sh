@@ -21,38 +21,41 @@
 #
 # What it does:
 #   1. Sanity-checks: macOS, arm64, /Applications writable.
-#   2. Downloads WhatsKept-darwin-arm64.app.zip from the latest
-#      GitHub release into a temp dir (or the URL specified by
-#      $WHATSKEPT_ZIP_URL — handy for testing dev pre-releases).
-#   3. Verifies the SHA-256 against the SHA256SUMS file shipped with
+#   2. Resolves the latest release tag once up front so all asset
+#      downloads are pinned to the same release — defends against
+#      the brief CDN window after a publish where
+#      `releases/latest/download/<asset>` can hand out different
+#      assets from two adjacent releases. Override with
+#      $WHATSKEPT_ZIP_URL to pin a specific release or a dev
+#      pre-release.
+#   3. Downloads WhatsKept-darwin-arm64.app.zip into a temp dir.
+#   4. Verifies the SHA-256 against the SHA256SUMS file shipped with
 #      the same release, so a man-in-the-middle (or a corrupted
 #      mirror) can't slip a tampered binary past us. Skipped only if
 #      the user explicitly opts out via $WHATSKEPT_SKIP_VERIFY=1.
-#   4. Extracts the zip into the temp dir.
-#   5. Quits a running WhatsKept (so we don't fight an open file
+#   5. Extracts the zip into the temp dir.
+#   6. Quits a running WhatsKept (so we don't fight an open file
 #      descriptor on the binary).
-#   6. Removes any prior /Applications/WhatsKept.app and ditto's the
+#   7. Removes any prior /Applications/WhatsKept.app and ditto's the
 #      new one in.
-#   7. Strips com.apple.quarantine from the destination — defensive,
+#   8. Strips com.apple.quarantine from the destination — defensive,
 #      curl-downloaded files shouldn't have it but `unzip` may copy
 #      xattrs forward from inside the zip.
-#   8. Resets any stale Full Disk Access TCC entry for our bundle ID
+#   9. Resets any stale Full Disk Access TCC entry for our bundle ID
 #      so the next backup-list call re-prompts cleanly. Without
 #      this, ad-hoc cdhash drift between releases would silently
 #      void the previous FDA grant.
-#   9. Launches the app.
+#  10. Launches the app.
 #
 # Idempotent. Safe to re-run after every update.
 
 set -euo pipefail
 
 REPO="alkait/WhatsKept"
-ZIP_URL_DEFAULT="https://github.com/${REPO}/releases/latest/download/WhatsKept-darwin-arm64.app.zip"
-SUMS_URL_DEFAULT="https://github.com/${REPO}/releases/latest/download/SHA256SUMS"
-ZIP_URL="${WHATSKEPT_ZIP_URL:-$ZIP_URL_DEFAULT}"
-SUMS_URL="${WHATSKEPT_SUMS_URL:-$SUMS_URL_DEFAULT}"
 DEST="/Applications/WhatsKept.app"
 BUNDLE_ID="com.whatskept.app"
+# ZIP_URL / SUMS_URL are populated below after we resolve the latest
+# release tag, unless the user has overridden them via env vars.
 
 # ---- tiny output helpers -------------------------------------------------
 
@@ -90,6 +93,39 @@ trap 'rm -rf "$TMP"' EXIT
 
 ZIP_PATH="$TMP/WhatsKept.app.zip"
 SUMS_PATH="$TMP/SHA256SUMS"
+
+# ---- resolve latest release tag -----------------------------------------
+
+# `releases/latest/download/<asset>` is a separate redirect per asset,
+# and during the ~30–60s after a release publishes, GitHub's CDN can
+# hand out one asset from the new release while still serving another
+# from the previous release — the script then sees a SHA-256 mismatch
+# even though both releases are individually consistent.
+#
+# Resolve the latest tag once via the redirect on /releases/latest
+# (which points at the human-readable tag page), then build every
+# asset URL against /releases/download/<TAG>/... so all downloads
+# come from the same atomic release. -I + -L follows redirects with
+# a HEAD; -w '%{url_effective}' prints the final URL after redirects.
+if [[ -n "${WHATSKEPT_ZIP_URL:-}" ]]; then
+  # Caller pinned a specific URL — honour it and skip tag resolution.
+  ZIP_URL="$WHATSKEPT_ZIP_URL"
+  SUMS_URL="${WHATSKEPT_SUMS_URL:-${ZIP_URL%/*}/SHA256SUMS}"
+  TAG="(pinned)"
+else
+  step "Resolving latest release"
+  RESOLVED="$(curl -fsLI -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${REPO}/releases/latest")" \
+    || die "could not reach github.com to resolve latest release"
+  TAG="${RESOLVED##*/}"
+  if [[ -z "$TAG" || "$TAG" == "latest" ]]; then
+    die "could not resolve latest release tag (got: $RESOLVED)"
+  fi
+  BASE="https://github.com/${REPO}/releases/download/${TAG}"
+  ZIP_URL="$BASE/WhatsKept-darwin-arm64.app.zip"
+  SUMS_URL="$BASE/SHA256SUMS"
+  ok "latest release: $TAG"
+fi
 
 # ---- download ------------------------------------------------------------
 
