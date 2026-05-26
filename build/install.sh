@@ -96,17 +96,25 @@ SUMS_PATH="$TMP/SHA256SUMS"
 
 # ---- resolve latest release tag -----------------------------------------
 
-# `releases/latest/download/<asset>` is a separate redirect per asset,
-# and during the ~30–60s after a release publishes, GitHub's CDN can
-# hand out one asset from the new release while still serving another
-# from the previous release — the script then sees a SHA-256 mismatch
-# even though both releases are individually consistent.
+# Two reasons we resolve a single tag up front instead of using
+# /releases/latest/download/<asset> for each download:
 #
-# Resolve the latest tag once via the redirect on /releases/latest
-# (which points at the human-readable tag page), then build every
-# asset URL against /releases/download/<TAG>/... so all downloads
-# come from the same atomic release. -I + -L follows redirects with
-# a HEAD; -w '%{url_effective}' prints the final URL after redirects.
+#   1. Per-asset CDN race: each `/latest/download/<file>` is a
+#      separate redirect, and during the window after a publish
+#      different assets can briefly resolve to different releases —
+#      producing a SHA-256 mismatch even though each release on its
+#      own is consistent.
+#   2. Web-redirector staleness: github.com/<repo>/releases/latest
+#      and /latest/download/<file> share an internal cache that
+#      lags the actual "latest" by minutes after a publish. The
+#      GitHub *API* (api.github.com/.../releases/latest) updates
+#      instantly, so we go through that instead.
+#
+# Anonymous API calls are rate-limited to 60/hour per IP, which is
+# orders of magnitude more than this script needs. We parse JSON
+# with awk so jq isn't required on the user's machine — there's
+# exactly one "tag_name" field at the top of the response and we
+# stop after the first match.
 if [[ -n "${WHATSKEPT_ZIP_URL:-}" ]]; then
   # Caller pinned a specific URL — honour it and skip tag resolution.
   ZIP_URL="$WHATSKEPT_ZIP_URL"
@@ -114,12 +122,13 @@ if [[ -n "${WHATSKEPT_ZIP_URL:-}" ]]; then
   TAG="(pinned)"
 else
   step "Resolving latest release"
-  RESOLVED="$(curl -fsLI -o /dev/null -w '%{url_effective}' \
-    "https://github.com/${REPO}/releases/latest")" \
-    || die "could not reach github.com to resolve latest release"
-  TAG="${RESOLVED##*/}"
+  TAG="$(curl -fsL --retry 2 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${REPO}/releases/latest" \
+    | awk -F'"' '/"tag_name":/ {print $4; exit}')" \
+    || die "could not reach api.github.com to resolve latest release"
   if [[ -z "$TAG" || "$TAG" == "latest" ]]; then
-    die "could not resolve latest release tag (got: $RESOLVED)"
+    die "could not parse latest release tag from GitHub API response"
   fi
   BASE="https://github.com/${REPO}/releases/download/${TAG}"
   ZIP_URL="$BASE/WhatsKept-darwin-arm64.app.zip"
