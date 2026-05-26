@@ -84,30 +84,47 @@ the thinking.
 
 Pre-built **macOS arm64 (Apple Silicon)** binaries, ad-hoc signed.
 
-- **GUI app** — [`WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip)
-  Unzip, then double-click **`Install WhatsKept.command`** inside the
-  unzipped folder. The installer strips the macOS quarantine
-  attribute (which would otherwise trigger the *"WhatsKept is damaged
-  and can't be opened"* dialog), copies the app to `/Applications`,
-  clears any stale Full Disk Access grant, and launches it.
-  Re-run after every update.
-- **CLI binary** — [`whatskept-darwin-arm64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip)
-  For `whatskept extract` / `whatskept list` and scripted use.
-- **All releases & changelogs** — [github.com/alkait/WhatsKept/releases](https://github.com/alkait/WhatsKept/releases)
+**Recommended — one Terminal command, zero Gatekeeper friction:**
 
-> **Why an installer script?** WhatsKept is open-source and
+```bash
+/bin/bash -c "$(curl -fsSL https://github.com/alkait/WhatsKept/releases/latest/download/install.sh)"
+```
+
+The script downloads the latest `WhatsKept.app` via `curl`, verifies
+its SHA-256 against the release's `SHA256SUMS`, drops it into
+`/Applications`, clears any stale Full Disk Access grant from a
+previous version, and launches it. Re-run after every update.
+
+`curl`-downloaded files don't carry the `com.apple.quarantine`
+extended attribute that browsers (Safari, Chrome, Firefox) attach to
+downloads. On macOS Sequoia, ad-hoc-signed apps that *do* carry that
+xattr trigger the *"WhatsKept is damaged and can't be opened"*
+dialog with no right-click → Open bypass. Going through `curl`
+sidesteps that path entirely, which is how Homebrew, rustup, and
+ohmyzsh all install themselves.
+
+**Other ways to get it:**
+
+- **GUI app via browser** — [`WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip).
+  Unzip, then double-click `Install WhatsKept.command` inside the
+  unzipped folder. macOS will ask to confirm the `.command` the
+  first time — right-click the file → **Open** — but the script
+  itself does the same work as the curl|bash flow above. Use this
+  if you'd rather not touch Terminal at all.
+- **CLI binary** — [`whatskept-darwin-arm64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip).
+  Bare Mach-O for `whatskept extract` / `whatskept list` and
+  scripted use.
+- **All releases & changelogs** — [github.com/alkait/WhatsKept/releases](https://github.com/alkait/WhatsKept/releases).
+
+> **Why none of this is one click?** WhatsKept is open-source and
 > ad-hoc signed (no Apple Developer account, which costs $99/year).
-> On macOS Sequoia the kernel refuses to launch ad-hoc-signed apps
-> that carry a quarantine xattr, with no right-click bypass. The
-> installer is a one-double-click workaround. The first time you
-> open the `.command` file itself macOS may ask *"are you sure?"* —
-> right-click the file → **Open** to confirm. (Right-click → Open
-> still works for shell scripts; only ad-hoc-signed `.app` bundles
-> lost that bypass.)
->
-> If you'd rather not run the script: `xattr -dr com.apple.quarantine
-> WhatsKept.app && mv WhatsKept.app /Applications/` does the same
-> thing manually.
+> Apple's Gatekeeper has steadily tightened restrictions on
+> non-Developer-ID apps; on Sequoia an ad-hoc-signed `.app` with a
+> quarantine xattr is hard-blocked. The curl|bash route works
+> because curl never attaches the xattr in the first place; the
+> `.command` route works because shell scripts still allow the
+> right-click → Open bypass. If you'd rather do it by hand:
+> `xattr -dr com.apple.quarantine WhatsKept.app && mv WhatsKept.app /Applications/`.
 
 One-liner CLI install into `/usr/local/bin`:
 

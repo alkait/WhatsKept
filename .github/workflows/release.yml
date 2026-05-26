@@ -167,22 +167,20 @@ jobs:
       #     # launch; that works as long as they have an internet
       #     # connection that day.
 
-      # Package both flavours so users can pick:
-      #   - WhatsKept-<ver>.app.zip   GUI users. Stages the .app and
-      #     a one-click `Install WhatsKept.command` helper into a
-      #     versioned folder so unzipping yields
-      #         WhatsKept-darwin-arm64-<ver>/
-      #             WhatsKept.app/
-      #             Install WhatsKept.command
-      #     The helper strips com.apple.quarantine + resets the
-      #     stale TCC entry for our bundle ID, which together cover
-      #     the two big friction points of shipping ad-hoc-signed:
-      #     the "is damaged, move to Trash" Gatekeeper dialog, and
-      #     the silently-broken Full Disk Access grant after every
-      #     update (cdhash drift). Use ditto for the zip step
-      #     (preserves codesign metadata, symlinks, resource forks);
-      #     plain `zip -r` corrupts the bundle's signature on
-      #     extract.
+      # Package the assets users actually download:
+      #   - install.sh                One-line curl|bash installer.
+      #     Recommended path — curl-downloaded files don't carry
+      #     com.apple.quarantine, so this sidesteps Gatekeeper
+      #     entirely. The script verifies the .app.zip's SHA-256
+      #     against the SHA256SUMS we publish here.
+      #   - WhatsKept-<ver>.app.zip   GUI users who prefer browser
+      #     download. Stages the .app and a `Install WhatsKept.command`
+      #     helper into a versioned folder. The helper strips
+      #     com.apple.quarantine + resets stale FDA, but its own
+      #     .command file is itself quarantined when downloaded via
+      #     a browser — that's why install.sh is the headline path.
+      #     ditto preserves codesign metadata, symlinks, resource
+      #     forks; plain `zip -r` corrupts the bundle's signature.
       #   - whatskept-<ver>.zip       CLI users: bare Mach-O for
       #     scripts (`whatskept extract`, `whatskept list`). plain
       #     zip is fine here.
@@ -193,7 +191,7 @@ jobs:
           mkdir -p out
           cp README.md "out/README.md"
 
-          # .app bundle + install helper for GUI users.
+          # .app bundle + .command fallback for GUI users.
           STAGE="WhatsKept-darwin-arm64-${VERSION}"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
@@ -214,8 +212,20 @@ jobs:
           cp "WhatsKept-darwin-arm64-${VERSION}.app.zip" "WhatsKept-darwin-arm64.app.zip"
           cp "whatskept-darwin-arm64-${VERSION}.zip"     "whatskept-darwin-arm64.zip"
 
+          # Compute SHA256SUMS over the zips BEFORE we add install.sh,
+          # because install.sh fetches SHA256SUMS at runtime and looks
+          # up its own download in there — we don't want it verifying
+          # itself in a chicken-and-egg loop.
           ls -lh *.zip
           shasum -a 256 *.zip | tee SHA256SUMS
+
+          # Publish install.sh verbatim. The canonical URL
+          # https://github.com/alkait/WhatsKept/releases/latest/download/install.sh
+          # always resolves to the latest tagged release's copy, so
+          # a single hard-coded curl URL in the README never goes
+          # stale.
+          cp build/install.sh install.sh
+          chmod +x install.sh
 
       # Branch pushes get a pre-release at a stable, rolling tag so the
       # "latest dev build" URL never changes. The previous asset is
@@ -236,14 +246,21 @@ jobs:
 
             macOS arm64 (Apple Silicon) only for now.
 
-            **Pick one:**
-            - `WhatsKept-darwin-arm64-*.app.zip` — GUI. Unzip and double-click `Install WhatsKept.command` inside the unzipped folder. It strips the `com.apple.quarantine` attribute that triggers the "WhatsKept is damaged" dialog, copies the app to `/Applications`, clears any stale Full Disk Access grant, and launches it.
+            **Recommended — one Terminal command, zero Gatekeeper friction:**
+
+            ```
+            /bin/bash -c "$(curl -fsSL https://github.com/alkait/WhatsKept/releases/latest/download/install.sh)"
+            ```
+
+            `curl`-downloaded files don't carry the `com.apple.quarantine` xattr that browsers attach, so the installer can drop a quarantine-free `WhatsKept.app` into `/Applications` without ever tripping the "WhatsKept is damaged" dialog. Re-run after every update.
+
+            **Other ways to get it:**
+            - `WhatsKept-darwin-arm64-*.app.zip` — browser download. Unzip, then double-click `Install WhatsKept.command` inside the unzipped folder. macOS will ask to confirm the `.command` (right-click → Open the first time) but the script itself runs the same install steps.
             - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
 
-            **Why an installer script?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia, macOS refuses to open ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The installer is a one-double-click workaround. The first time you run the `.command` file itself macOS may ask "are you sure" — right-click the file → Open to confirm.
-
-            Re-run the installer after every update.
+            **Why this dance?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia the kernel refuses to launch ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The curl|bash route avoids quarantine entirely; the .command route works around it after a one-time confirmation.
           files: |
+            install.sh
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
             WhatsKept-darwin-arm64.app.zip
@@ -262,14 +279,21 @@ jobs:
           body: |
             macOS arm64 (Apple Silicon).
 
-            **Pick one:**
-            - `WhatsKept-darwin-arm64-*.app.zip` — GUI. Unzip and double-click `Install WhatsKept.command` inside the unzipped folder. It strips the `com.apple.quarantine` attribute that triggers the "WhatsKept is damaged" dialog, copies the app to `/Applications`, clears any stale Full Disk Access grant, and launches it.
+            **Recommended — one Terminal command, zero Gatekeeper friction:**
+
+            ```
+            /bin/bash -c "$(curl -fsSL https://github.com/alkait/WhatsKept/releases/latest/download/install.sh)"
+            ```
+
+            `curl`-downloaded files don't carry the `com.apple.quarantine` xattr that browsers attach, so the installer can drop a quarantine-free `WhatsKept.app` into `/Applications` without ever tripping the "WhatsKept is damaged" dialog. Re-run after every update.
+
+            **Other ways to get it:**
+            - `WhatsKept-darwin-arm64-*.app.zip` — browser download. Unzip, then double-click `Install WhatsKept.command` inside the unzipped folder. macOS will ask to confirm the `.command` (right-click → Open the first time) but the script itself runs the same install steps.
             - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
 
-            **Why an installer script?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia, macOS refuses to open ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The installer is a one-double-click workaround. The first time you run the `.command` file itself macOS may ask "are you sure" — right-click the file → Open to confirm.
-
-            Re-run the installer after every update.
+            **Why this dance?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia the kernel refuses to launch ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The curl|bash route avoids quarantine entirely; the .command route works around it after a one-time confirmation.
           files: |
+            install.sh
             WhatsKept-darwin-arm64-*.app.zip
             whatskept-darwin-arm64-*.zip
             WhatsKept-darwin-arm64.app.zip
