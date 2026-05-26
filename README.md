@@ -1,44 +1,37 @@
 # WhatsKept
 
-Searchable, agent-queryable WhatsApp history from an iOS backup, in Go.
+Agent-queryable WhatsApp history from an iOS backup, in Go.
 
 A single self-contained binary. Drives iOS backups, decrypts WhatsApp's
 ChatStorage.sqlite, and (eventually) feeds it into a searchable
 SQLite + FTS5 workspace that an agent can query directly.
 
-## Download
+## Contents
 
-Pre-built **macOS arm64 (Apple Silicon)** binaries, ad-hoc signed.
-First launch: right-click → **Open** to bypass Gatekeeper.
+- [What you can ask](#what-you-can-ask)
+- [What this is (and what it isn't)](#what-this-is-and-what-it-isnt)
+- [Download](#download)
+- [How this was built](#how-this-was-built)
+- [System requirements](#system-requirements)
+- [Privacy](#privacy)
+- [Build](#build)
+- [Run](#run)
 
-- **GUI app** — [`WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip)
-  Unzip and drag `WhatsKept.app` into `/Applications`.
-- **CLI binary** — [`whatskept-darwin-arm64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip)
-  For `whatskept extract` / `whatskept list` and scripted use.
-- **All releases & changelogs** — [github.com/alkait/WhatsKept/releases](https://github.com/alkait/WhatsKept/releases)
+## What you can ask
 
-One-liner CLI install into `/usr/local/bin`:
+Once the workspace is built, point an LLM coding agent at the folder
+(Windsurf, Claude Code, Cursor, VS Code + Copilot, …) and ask. A few
+examples of what becomes possible:
 
-```bash
-curl -L -o /tmp/whatskept.zip \
-  https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip \
-  && unzip -o /tmp/whatskept.zip -d /tmp \
-  && sudo install /tmp/whatskept /usr/local/bin/whatskept \
-  && rm /tmp/whatskept.zip
-```
-
-> Prefer to build from source? See [Build](#build) below.
-
-## How this was built
-
-> Built in a weekend with **Claude Opus 4.7**, burning ~**$900** in
-> tokens so you don't have to. Practically every line of code in this
-> repo is AI-generated. I won't pretend I read it line by line — I
-> didn't — but I stood behind **every architecture decision**: how
-> the backup is decrypted, where secrets live, what crosses a
-> network boundary, how the workspace is laid out, why the binary
-> ships self-contained. The agent wrote the code; the design, the
-> trade-offs, and the privacy posture are mine.
+| Use case | Example prompt |
+| --- | --- |
+| **Find a photo or voice note you only vaguely remember** | *"Find the photo Sara sent of a handwritten recipe — I think it had cardamom in it."* |
+| **Recover decisions from a busy group chat** | *"Pull every message in the House Reno group about the kitchen budget and tell me what we landed on."* |
+| **Recall a specific fact someone sent you** | *"What dosage did Dr. Patel say for the antibiotic, and how many days?"* |
+| **Track receipts, orders, and tracking numbers** | *"List every tracking number anyone sent me in the last 6 months and flag the ones I never confirmed."* |
+| **Summarize a relationship or thread** | *"Summarize what my brother and I have talked about this year — what's been on his mind?"* |
+| **Reconstruct a timeline** | *"Build a timeline of my 2023 — major events, trips, life changes — using only what's in WhatsApp."* |
+| **Index recommendations friends have sent** | *"List every restaurant, book, and movie friends have recommended in the last 2 years, grouped by category."* |
 
 ## What this is (and what it isn't)
 
@@ -86,6 +79,40 @@ it turns a locked, encrypted iOS backup into a plain folder of
 readable text, searchable messages, and transcribed voice notes —
 then steps out of the way and lets the agent you already trust do
 the thinking.
+
+## Download
+
+Pre-built **macOS arm64 (Apple Silicon)** binaries, ad-hoc signed.
+First launch: right-click → **Open** to bypass Gatekeeper.
+
+- **GUI app** — [`WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip)
+  Unzip and drag `WhatsKept.app` into `/Applications`.
+- **CLI binary** — [`whatskept-darwin-arm64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip)
+  For `whatskept extract` / `whatskept list` and scripted use.
+- **All releases & changelogs** — [github.com/alkait/WhatsKept/releases](https://github.com/alkait/WhatsKept/releases)
+
+One-liner CLI install into `/usr/local/bin`:
+
+```bash
+curl -L -o /tmp/whatskept.zip \
+  https://github.com/alkait/WhatsKept/releases/latest/download/whatskept-darwin-arm64.zip \
+  && unzip -o /tmp/whatskept.zip -d /tmp \
+  && sudo install /tmp/whatskept /usr/local/bin/whatskept \
+  && rm /tmp/whatskept.zip
+```
+
+> Prefer to build from source? See [Build](#build) below.
+
+## How this was built
+
+> Built in a weekend with **Claude Opus 4.7**, burning ~**$600** in
+> tokens so you don't have to. Practically every line of code in this
+> repo is AI-generated. I won't pretend I read it line by line — I
+> didn't — but I stood behind **every architecture decision**: how
+> the backup is decrypted, where secrets live, what crosses a
+> network boundary, how the workspace is laid out, why the binary
+> ships self-contained. The agent wrote the code; the design, the
+> trade-offs, and the privacy posture are mine.
 
 ## System requirements
 
@@ -138,12 +165,15 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   Drive) can read every message, contact, photo, and voice note.
   Pick a workspace path accordingly — `~/Documents` is fine,
   `~/Dropbox` is not.
-- **AGENTS.md + agent ignore files are advisory.** WhatsKept writes
-  `.windsurfignore`, `.copilotignore`, etc. so agents skip the heavy
-  `media/`/`voice/`/`profiles/` trees, but the SQLite database
-  itself is fair game — when you open the workspace in an agent
-  (Windsurf, VS Code + Copilot, Claude Code, …) and ask a question,
-  chunks of your chat history may be sent to that agent's LLM
+- **The agent reads the text, but not the raw files.** WhatsKept
+  drops `.windsurfignore`, `.copilotignore`, and similar ignore
+  files so agents stay out of the `media/`, `voice/`, and
+  `profiles/` folders — the actual photos, audio files, and profile
+  pictures are off-limits. What the agent *does* see is everything
+  in the SQLite database: every message, every image's OCR'd text
+  and classification labels, every voice-note transcript, and the
+  contact names and numbers joined in. So when you ask a question,
+  chunks of that chat history can be sent to the agent's LLM
   provider. **Trust the agent's privacy story before pointing it at
   the workspace.**
 - **The `.env` file holds your backup password in plaintext.** It
