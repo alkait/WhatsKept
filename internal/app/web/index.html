@@ -1698,7 +1698,7 @@ function AgentsPanel({ workspace }) {
         <div className="rounded-xl border p-4 text-sm" style={{borderColor:'#f4c542',background:'#FFF8E1',color:'#7a5b00'}}>
           <div className="font-medium mb-1">Workspace is empty</div>
           <div className="text-xs leading-relaxed">
-            <code>ChatStorage.sqlite</code> and <code>AGENTS.md</code> haven't been generated yet.
+            <code>ChatStorage.sqlite</code>, <code>AGENTS.md</code>, and <code>CLAUDE.md</code> haven't been generated yet.
             Run a backup from the <span className="font-medium">Backups</span> tab, then come back —
             the agent will have a documented database to query.
           </div>
@@ -1750,7 +1750,7 @@ function AgentsPanel({ workspace }) {
                 <p className="text-sm font-semibold" style={{color:'#075E54'}}>Terminal</p>
                 <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>Built-in</span>
               </div>
-              <p className="text-xs text-gray-500 mt-0.5">Open the workspace in macOS Terminal — pick any CLI agent (Claude Code, Codex CLI, …) yourself.</p>
+              <p className="text-xs text-gray-500 mt-0.5">Open the workspace in macOS Terminal — handy for any CLI agent we don't yet detect natively (Codex CLI, Gemini CLI, …).</p>
             </div>
             <button onClick={openTerminal} disabled={openingId === "__terminal__"}
               className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
@@ -1765,8 +1765,9 @@ function AgentsPanel({ workspace }) {
       {error && <p className="text-sm text-red-500">{error}</p>}
 
       <p className="text-[11px] text-gray-400 leading-relaxed">
-        Agents are launched detached via <code>open -a</code>; closing WhatsKept doesn't affect them.
-        Support for more agents (Cursor, Claude Code, Codex CLI) lands as we test each integration.
+        Agents are launched detached — GUI apps via <code>open -a</code>, CLI agents in a fresh Terminal
+        window — so closing WhatsKept doesn't affect them. Support for more agents (Codex CLI, Gemini CLI)
+        lands as we test each integration.
       </p>
     </section>
   );

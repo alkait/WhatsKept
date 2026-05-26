@@ -1,8 +1,8 @@
 // Package postprocess turns a freshly-decrypted ChatStorage.sqlite
 // into an agent-ready workspace: it applies the SQL view layer (the
 // 12 objects from views.sql, including the messages_fts virtual
-// table), and drops the supporting files (AGENTS.md, views.sql, and
-// per-agent .ignore files) next to it.
+// table), and drops the supporting files (AGENTS.md, CLAUDE.md,
+// views.sql, and per-agent .ignore files) next to it.
 //
 // This is the Go port of the Python `whatskept.postprocess` module.
 // Only the cheap "messages" stage is implemented for now — sidecar
@@ -98,9 +98,13 @@ func ApplyViews(dbPath string) error {
 // WriteAssets drops the files an agent needs to use the workspace
 // productively into `workspace`:
 //
-//   - views.sql  — overwritten on every call (we own it).
-//   - AGENTS.md  — written ONLY if missing. A user-edited AGENTS.md
-//     is left alone, matching the Python behavior.
+//   - views.sql              — overwritten on every call (we own it).
+//   - AGENTS.md / CLAUDE.md  — written ONLY if missing. Both files
+//     get the same template content; the dual filenames let agents
+//     that look for one or the other (Claude Code reads CLAUDE.md,
+//     most others follow the AGENTS.md convention) work out of the
+//     box. A user-edited copy of either is left alone, matching the
+//     Python behavior.
 //   - one ignore file per name in agentIgnoreFiles — overwritten
 //     wholesale (we own these, like the Python flow).
 //
@@ -118,14 +122,19 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 		return fmt.Errorf("write views.sql: %w", err)
 	}
 
-	// 2. AGENTS.md — only if missing.
-	agentsPath := filepath.Join(workspace, "AGENTS.md")
-	if _, err := os.Stat(agentsPath); errors.Is(err, fs.ErrNotExist) {
-		if err := os.WriteFile(agentsPath, []byte(agentsTmpl), 0o644); err != nil {
-			return fmt.Errorf("write AGENTS.md: %w", err)
+	// 2. AGENTS.md and CLAUDE.md — only if missing. Same content; the
+	// twin files exist purely so Claude Code (which keys off CLAUDE.md)
+	// and the broader AGENTS.md ecosystem both pick up our schema notes
+	// without the user having to symlink anything.
+	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
+		p := filepath.Join(workspace, name)
+		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
+			if err := os.WriteFile(p, []byte(agentsTmpl), 0o644); err != nil {
+				return fmt.Errorf("write %s: %w", name, err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("stat %s: %w", name, err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("stat AGENTS.md: %w", err)
 	}
 
 	// 3. Per-agent ignores.
@@ -156,8 +165,8 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 //     identity — JID mismatch returns *ErrIdentityMismatch and
 //     leaves the live DB untouched.
 //  5. Atomic rename: staging → live ChatStorage.sqlite.
-//  6. Apply views.sql, write AGENTS.md (if missing), views.sql, and
-//     the per-agent ignore files.
+//  6. Apply views.sql, write AGENTS.md + CLAUDE.md (if missing),
+//     views.sql, and the per-agent ignore files.
 //  7. Return a SyncResult with final row counts.
 //
 // `log` is invoked with one human-readable status line per major
@@ -400,7 +409,7 @@ func SyncMessages(
 		}
 	}
 
-	log("Writing AGENTS.md, views.sql, and agent ignore files…")
+	log("Writing AGENTS.md, CLAUDE.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err
 	}
