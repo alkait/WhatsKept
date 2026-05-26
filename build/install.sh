@@ -212,20 +212,54 @@ xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
 step "Clearing any stale Full Disk Access grant"
 tccutil reset SystemPolicyAllFiles "$BUNDLE_ID" 2>/dev/null || true
 
+# ---- open FDA pane + reveal app in Finder -------------------------------
+
+# After tccutil reset the user has to manually re-grant Full Disk
+# Access — Apple deliberately doesn't expose a `tccutil grant` and
+# the TCC database is SIP-protected, so this is unfixable without a
+# real Developer ID + notarization. The least we can do is put both
+# windows the user needs right in front of them:
+#
+#   1. System Settings deep-linked to the Full Disk Access pane via
+#      the documented x-apple.systempreferences URL scheme. Lands
+#      directly on the right list, no menu navigation.
+#   2. Finder revealing /Applications/WhatsKept.app with the bundle
+#      pre-selected. System Settings accepts apps via drag-drop into
+#      the FDA list, so the user drags from Finder onto the pane and
+#      is done — no clicking +, no navigating to /Applications.
+#
+# The two `open` calls are non-blocking; both windows surface and
+# the script keeps moving.
+step "Opening Full Disk Access pane and revealing WhatsKept in Finder"
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true
+open -R "$DEST" 2>/dev/null || true
+
 # ---- launch --------------------------------------------------------------
 
+# Launch the app last so it ends up the foreground window — it's the
+# thing the user actually came to see. Once they grant FDA via the
+# pane we just opened, the app needs to be quit + reopened for the
+# new TCC grant to take effect on the running process; we tell them
+# that in the post-install banner below.
 step "Launching WhatsKept"
 open "$DEST"
 
 echo
 ok "WhatsKept installed at $DEST"
 echo
-printf '%sFirst launch:%s WhatsKept needs Full Disk Access to read iOS\n' "$_BOLD" "$_RESET"
-echo "  backups under ~/Library/Application Support/MobileSync/Backup."
-echo "  When the Backups tab shows the FDA error, click + in System"
-echo "  Settings → Privacy & Security → Full Disk Access, choose"
-echo "  /Applications/WhatsKept.app, toggle it ON, then quit and"
-echo "  reopen WhatsKept."
+printf '%sGrant Full Disk Access:%s\n' "$_BOLD" "$_RESET"
+echo "  Two windows just opened for you:"
+echo "    • System Settings → Privacy & Security → Full Disk Access"
+echo "    • Finder, with WhatsKept.app pre-selected in /Applications"
+echo
+echo "  Drag WhatsKept.app from the Finder window into the Full Disk"
+echo "  Access list, toggle it ON, then quit and reopen WhatsKept."
+echo "  (The grant doesn't take effect on an already-running process.)"
+echo
+echo "  WhatsKept reads iOS backups from"
+echo "    ~/Library/Application Support/MobileSync/Backup"
+echo "  which macOS protects behind FDA — there is no way to skip"
+echo "  this step without an Apple Developer ID."
 echo
 printf '%sUpdates:%s re-run this installer. macOS attaches a fresh\n' "$_DIM" "$_RESET"
 printf '%s         %s cdhash to every release, which voids the previous FDA\n' "$_DIM" "$_RESET"
