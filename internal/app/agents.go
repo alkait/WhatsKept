@@ -71,6 +71,13 @@ var agentRegistry = []agentSpec{
 		Binary:      "claude",
 		// No documented ignore-file convention; Claude Code respects .gitignore by default.
 	},
+	{
+		ID:          "opencode",
+		Name:        "opencode",
+		Description: "Open-source terminal coding agent — reads AGENTS.md natively, BYO model provider.",
+		Binary:      "opencode",
+		// No documented ignore-file convention; opencode honours .gitignore by default.
+	},
 }
 
 // AgentIgnoreFiles returns the deduplicated list of dotfile names the
@@ -159,6 +166,7 @@ func detectCLIAgent(name string) (bool, string) {
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates,
 			filepath.Join(home, ".claude", "local", name), // Anthropic's native installer
+			filepath.Join(home, ".opencode", "bin", name), // opencode's `curl … | bash` installer
 			filepath.Join(home, ".npm-global", "bin", name),
 			filepath.Join(home, ".local", "bin", name),
 			filepath.Join(home, ".volta", "bin", name),
