@@ -284,6 +284,24 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, "Directory not found")
 		return
 	}
+	// Refresh agent-facing assets (views.sql, AGENTS.md, CLAUDE.md,
+	// per-agent ignore files) from the binary's embedded templates.
+	// This is the hook that keeps a workspace in lock-step with the
+	// installed WhatsKept version: upgrade WhatsKept → open the
+	// workspace → assets are current, no Sync click required. The
+	// call is cheap (~70 KB of atomic writes) and idempotent. We
+	// only do it for workspaces that have actually been used —
+	// `HasChat` is the proxy: a workspace with ChatStorage.sqlite
+	// has been synced at least once and the agent docs describing
+	// it should be current; a brand-new empty workspace gets its
+	// templates from the first Sync, same as before. Refresh
+	// failures (read-only mount, full disk) are non-fatal — the
+	// user can still browse the workspace.
+	if info := describeWorkspace(abs); info.HasChat {
+		if err := postprocess.WriteAssets(abs, AgentIgnoreFiles()); err != nil {
+			fmt.Fprintf(os.Stderr, "open workspace: refresh assets failed (continuing): %v\n", err)
+		}
+	}
 	s.ws.set(abs)
 	s.pw.clear()
 	addRecent(abs)

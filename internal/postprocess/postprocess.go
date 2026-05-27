@@ -16,7 +16,6 @@ import (
 	_ "embed" // for //go:embed directives below
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -97,17 +96,28 @@ func ApplyViews(dbPath string) error {
 }
 
 // WriteAssets drops the files an agent needs to use the workspace
-// productively into `workspace`:
+// productively into `workspace`. Every file in this set is owned by
+// WhatsKept — content is fully derived from the binary's embedded
+// templates, so each call unconditionally overwrites the on-disk
+// copy. This is what keeps the agent's instructions in lock-step
+// with the installed binary: when the user upgrades WhatsKept, the
+// next workspace-open silently refreshes the schema docs, FTS
+// definitions, and ignore lists without requiring a full data sync.
 //
-//   - views.sql              — overwritten on every call (we own it).
-//   - AGENTS.md / CLAUDE.md  — written ONLY if missing. Both files
-//     get the same template content; the dual filenames let agents
-//     that look for one or the other (Claude Code reads CLAUDE.md,
-//     most others follow the AGENTS.md convention) work out of the
-//     box. A user-edited copy of either is left alone, matching the
-//     Python behavior.
-//   - one ignore file per name in agentIgnoreFiles — overwritten
-//     wholesale (we own these, like the Python flow).
+//   - views.sql              — view + FTS5 definitions.
+//   - AGENTS.md / CLAUDE.md  — same template; two filenames because
+//     Claude Code keys off CLAUDE.md and the broader ecosystem
+//     follows the AGENTS.md convention. Treated as generated
+//     artifacts (not living user-owned docs): a stale copy left in
+//     place after a feature ships would actively mislead the agent
+//     (e.g. "PDF bytes aren't on disk" after document-index landed),
+//     so we always overwrite. Per-workspace user customization is
+//     intentionally out of scope.
+//   - one ignore file per name in agentIgnoreFiles — same body for
+//     all, derived from ignoreEntries.
+//
+// All writes are atomic (tmp+rename) so a crashed or concurrent
+// invocation can never leave a half-written asset behind.
 //
 // The caller is expected to derive `agentIgnoreFiles` from the
 // agent registry (see app.AgentIgnoreFiles); this package
@@ -118,23 +128,15 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 		return fmt.Errorf("mkdir workspace: %w", err)
 	}
 
-	// 1. views.sql — always rewritten.
-	if err := os.WriteFile(filepath.Join(workspace, "views.sql"), []byte(viewsSQL), 0o644); err != nil {
+	// 1. views.sql.
+	if err := writeFileAtomic(filepath.Join(workspace, "views.sql"), []byte(viewsSQL)); err != nil {
 		return fmt.Errorf("write views.sql: %w", err)
 	}
 
-	// 2. AGENTS.md and CLAUDE.md — only if missing. Same content; the
-	// twin files exist purely so Claude Code (which keys off CLAUDE.md)
-	// and the broader AGENTS.md ecosystem both pick up our schema notes
-	// without the user having to symlink anything.
+	// 2. AGENTS.md and CLAUDE.md — same template, twin filenames.
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
-		p := filepath.Join(workspace, name)
-		if _, err := os.Stat(p); errors.Is(err, fs.ErrNotExist) {
-			if err := os.WriteFile(p, []byte(agentsTmpl), 0o644); err != nil {
-				return fmt.Errorf("write %s: %w", name, err)
-			}
-		} else if err != nil {
-			return fmt.Errorf("stat %s: %w", name, err)
+		if err := writeFileAtomic(filepath.Join(workspace, name), []byte(agentsTmpl)); err != nil {
+			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
 
@@ -145,7 +147,7 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 		if name == "" {
 			continue
 		}
-		if err := os.WriteFile(filepath.Join(workspace, name), blob, 0o644); err != nil {
+		if err := writeFileAtomic(filepath.Join(workspace, name), blob); err != nil {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
@@ -166,8 +168,8 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 //     identity — JID mismatch returns *ErrIdentityMismatch and
 //     leaves the live DB untouched.
 //  5. Atomic rename: staging → live ChatStorage.sqlite.
-//  6. Apply views.sql, write AGENTS.md + CLAUDE.md (if missing),
-//     views.sql, and the per-agent ignore files.
+//  6. Apply views.sql and (re)write AGENTS.md, CLAUDE.md, views.sql,
+//     and the per-agent ignore files from the embedded templates.
 //  7. Return a SyncResult with final row counts.
 //
 // `log` is invoked with one human-readable status line per major
