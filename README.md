@@ -10,6 +10,7 @@ SQLite + FTS5 workspace that an agent can query directly.
 
 - [What you can ask](#what-you-can-ask)
 - [What this is (and what it isn't)](#what-this-is-and-what-it-isnt)
+- [Screenshots](#screenshots)
 - [Pipeline](#pipeline)
 - [Download](#download)
 - [How this was built](#how-this-was-built)
@@ -82,6 +83,15 @@ it turns a locked, encrypted iOS backup into a plain folder of
 readable text, searchable messages, and transcribed voice notes —
 then steps out of the way and lets the agent you already trust do
 the thinking.
+
+## Screenshots
+
+Three tabs, in the order you walk through them:
+
+| 1. Backups | 2. Database | 3. Agents |
+| :---: | :---: | :---: |
+| [![Backups tab](docs/screenshots/backup_tab.png)](docs/screenshots/backup_tab.png) | [![Database tab](docs/screenshots/database_tab.png)](docs/screenshots/database_tab.png) | [![Agents tab](docs/screenshots/agent_tab.png)](docs/screenshots/agent_tab.png) |
+| Drive a fresh iOS backup over USB — no need to leave the app. | Decrypt `ChatStorage.sqlite`, OCR images, transcribe voice notes, extract PDFs. Each stage is opt-in and resumable. | Open the prepared workspace in Windsurf, VS Code, Cursor, Claude Code, or Terminal. |
 
 ## Pipeline
 
