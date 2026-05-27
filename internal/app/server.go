@@ -101,6 +101,8 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/workspace/open", s.handleOpenWorkspace)
 	mux.HandleFunc("GET /api/workspace/current", s.handleCurrentWorkspace)
 	mux.HandleFunc("DELETE /api/workspace/current", s.handleDeleteWorkspace)
+	mux.HandleFunc("GET /api/workspace/sizes", s.handleWorkspaceSizes)
+	mux.HandleFunc("POST /api/workspace/reveal", s.handleWorkspaceReveal)
 
 	// Devices + backups
 	mux.HandleFunc("GET /api/devices", s.handleListDevices)
@@ -223,7 +225,16 @@ func (s *server) handleRecentWorkspaces(w http.ResponseWriter, _ *http.Request) 
 	paths := loadRecent()
 	out := make([]workspaceInfo, 0, len(paths))
 	for _, p := range paths {
-		out = append(out, describeWorkspace(p))
+		info := describeWorkspace(p)
+		// Populate TotalBytes only here — the startup picker is the
+		// one place that wants a size hint up-front, and the walk
+		// across ~10 recent dirs at app open is cheap enough to do
+		// inline. Other workspaceInfo callers (open/create/current)
+		// don't need it and shouldn't pay for it on every request.
+		if info.Exists {
+			info.TotalBytes = computeWorkspaceTotal(p)
+		}
+		out = append(out, info)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

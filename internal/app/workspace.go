@@ -62,6 +62,14 @@ type workspaceInfo struct {
 	Exists  bool             `json:"exists"`
 	HasChat bool             `json:"has_chat"`
 	Binding *binding.Binding `json:"binding,omitempty"`
+
+	// TotalBytes is the recursive on-disk size of every known
+	// workspace section (database + profiles/ + media/ + voice/ +
+	// documents/). Only populated by handleRecentWorkspaces so the
+	// startup-screen tiles can render a size hint without a second
+	// round-trip; left zero everywhere else to avoid the
+	// per-section walk on every /api/workspace/current call.
+	TotalBytes int64 `json:"total_bytes,omitempty"`
 }
 
 func describeWorkspace(path string) workspaceInfo {

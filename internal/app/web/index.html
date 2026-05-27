@@ -40,7 +40,7 @@
 </script>
 
 <script type="text/babel">
-const { useState, useEffect, useCallback, useMemo, useRef } = React;
+const { useState, useEffect, useCallback, useMemo, useRef, createContext, useContext } = React;
 
 // ── Icons ─────────────────────────────────────────────────────────────────
 const Svg = ({ d, size=16, cls="" }) => (
@@ -760,6 +760,9 @@ function WorkspaceScreen({ onOpen }) {
                       </p>
                       <p className="text-xs mt-0.5 truncate" style={{color:'#DCF8C6'}}>
                         {top.path.replace(/^\/Users\/[^/]+/, "~")}
+                        {top.total_bytes > 0 && (
+                          <span className="ml-2 tabular-nums">{formatBytes(top.total_bytes)}</span>
+                        )}
                       </p>
                     </>
                   ) : (
@@ -767,6 +770,9 @@ function WorkspaceScreen({ onOpen }) {
                       <p className="font-semibold text-sm truncate">{top.path.replace(/^\/Users\/[^/]+/, "~")}</p>
                       <p className="text-xs mt-0.5" style={{color:'#DCF8C6'}}>
                         {top.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}
+                        {top.total_bytes > 0 && (
+                          <span className="ml-2 tabular-nums">· {formatBytes(top.total_bytes)}</span>
+                        )}
                       </p>
                     </>
                   )}
@@ -796,12 +802,22 @@ function WorkspaceScreen({ onOpen }) {
                                 <span className="text-gray-500 font-normal ml-2">{phoneFromJID(bound.owner_jid)}</span>
                               )}
                             </p>
-                            <p className="text-xs text-gray-400 mt-0.5 truncate">{r.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+                            <p className="text-xs text-gray-400 mt-0.5 truncate">
+                              {r.path.replace(/^\/Users\/[^/]+/, "~")}
+                              {r.total_bytes > 0 && (
+                                <span className="ml-2 tabular-nums">{formatBytes(r.total_bytes)}</span>
+                              )}
+                            </p>
                           </>
                         ) : (
                           <>
                             <p className="text-sm font-medium text-gray-800 truncate">{r.path.replace(/^\/Users\/[^/]+/, "~")}</p>
-                            <p className="text-xs text-gray-400 mt-0.5">{r.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}</p>
+                            <p className="text-xs text-gray-400 mt-0.5">
+                              {r.has_chat ? "Has ChatStorage.sqlite" : "Empty workspace"}
+                              {r.total_bytes > 0 && (
+                                <span className="ml-2 tabular-nums">· {formatBytes(r.total_bytes)}</span>
+                              )}
+                            </p>
                           </>
                         )}
                       </div>
@@ -1885,6 +1901,166 @@ function VoiceModelDownloadModal({ modelInfo, modelJob, onStart, onClose }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// WorkspaceSizes — per-section disk-size breakdown shown above the
+// "Open in agent" list. Helps the user reason about what's actually
+// in the workspace they're about to hand to a model — and which subdirs
+// are large enough to be worth ignoring (media/, voice/) vs. small
+// enough to leave in (the SQLite db, the profile thumbnails).
+//
+// Sections always render even when missing/empty: an absent section is
+// still useful information ("voice notes haven't been transcribed yet"),
+// and a stable row count avoids layout jitter on first sync.
+//
+// State is shared via WorkspaceSizesContext so the Agents-tab card, the
+// header total, and any future consumer all see the same numbers and
+// don't each hit /api/workspace/sizes on a different schedule. The
+// provider polls every WORKSPACE_SIZES_REFRESH_MS to catch changes
+// produced by sync jobs (media-index, voice-index, etc.) without us
+// having to wire change events from every job.
+// ═══════════════════════════════════════════════════════════════════════════
+const WORKSPACE_SIZE_ROWS = [
+  { key: "database",  label: "Database",  hint: "ChatStorage.sqlite",                missing: "Not generated yet — run a backup." },
+  { key: "profiles",  label: "Profiles",  hint: "profiles/whatsapp + profiles/ios",  missing: "No profile pictures yet." },
+  { key: "media",     label: "Media",     hint: "photos & videos",                   missing: "No media indexed yet." },
+  { key: "voice",     label: "Voice",     hint: "voice-note audio & transcripts",    missing: "No voice notes indexed yet." },
+  { key: "documents", label: "Documents", hint: "PDFs & other documents",            missing: "No documents indexed yet." },
+];
+
+const WORKSPACE_SIZES_REFRESH_MS = 10 * 60 * 1000; // 10 minutes
+
+const WorkspaceSizesContext = createContext({
+  sizes: null,
+  error: "",
+  refresh: () => {},
+});
+
+// WorkspaceSizesProvider fetches /api/workspace/sizes once on mount
+// and then on a 10-minute interval, exposing the latest snapshot to
+// any descendant that calls useWorkspaceSizes. Visibility-aware: we
+// also re-fetch when the window regains focus so the user always sees
+// fresh numbers right after they tab back from another app (e.g.
+// after running a manual sync in Finder/Terminal).
+function WorkspaceSizesProvider({ children }) {
+  const [sizes, setSizes] = useState(null); // null = loading
+  const [error, setError] = useState("");
+  const mountedRef = useRef(true);
+
+  const refresh = useCallback(() => {
+    return api.get("/api/workspace/sizes")
+      .then(data => { if (mountedRef.current) { setSizes(data || {}); setError(""); } })
+      .catch(e => { if (mountedRef.current) setError(e.message); });
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    refresh();
+    const id = setInterval(refresh, WORKSPACE_SIZES_REFRESH_MS);
+    const onFocus = () => refresh();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      mountedRef.current = false;
+      clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [refresh]);
+
+  const value = useMemo(() => ({ sizes, error, refresh }), [sizes, error, refresh]);
+  return <WorkspaceSizesContext.Provider value={value}>{children}</WorkspaceSizesContext.Provider>;
+}
+
+const useWorkspaceSizes = () => useContext(WorkspaceSizesContext);
+
+// revealInFinder opens a workspace section in macOS Finder. Failures
+// are swallowed — the click is a "show me" affordance, not a critical
+// action; surfacing an alert for a transient `open` glitch would be
+// more annoying than useful.
+const revealInFinder = (key) =>
+  api.post("/api/workspace/reveal", { key }).catch(() => {});
+
+// WorkspaceTotalBadge — compact "12.4 MB" inline tag for the header's
+// secondary line. Consumes the same WorkspaceSizesContext as the
+// Agents-tab breakdown so both numbers always agree. Renders nothing
+// while the first fetch is in flight to avoid layout jitter, and
+// nothing on error — the Agents tab is the right place to surface
+// detailed size failures.
+function WorkspaceTotalBadge() {
+  const { sizes } = useWorkspaceSizes();
+  if (!sizes || typeof sizes.total !== "number" || sizes.total <= 0) return null;
+  return (
+    <button onClick={() => revealInFinder("root")}
+      title="Show workspace in Finder"
+      className="ml-2 inline-flex items-center text-[11px] tabular-nums hover:underline"
+      style={{color:'#075E54'}}>
+      {formatBytes(sizes.total)}
+    </button>
+  );
+}
+
+function WorkspaceSizes() {
+  const { sizes, error } = useWorkspaceSizes();
+
+  if (error && sizes === null) {
+    return <p className="text-xs text-red-500">Could not read workspace sizes: {error}</p>;
+  }
+  if (sizes === null) {
+    return <div className="text-xs text-gray-400 py-2">Measuring workspace…</div>;
+  }
+
+  const total = sizes.total || WORKSPACE_SIZE_ROWS.reduce((sum, r) => {
+    const e = sizes[r.key];
+    return sum + (e && e.exists ? (e.bytes || 0) : 0);
+  }, 0);
+
+  return (
+    <div>
+      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Workspace size</h2>
+      <div className="rounded-xl border bg-white p-4" style={{borderColor:'#DCF8C6'}}>
+        <div className="divide-y" style={{borderColor:'#F0F0F0'}}>
+          {WORKSPACE_SIZE_ROWS.map(row => {
+            const entry = sizes[row.key] || { exists: false, bytes: 0 };
+            let right;
+            if (!entry.exists) {
+              right = <span className="text-xs text-gray-400 italic">{row.missing}</span>;
+            } else if (!entry.bytes) {
+              right = <span className="text-xs text-gray-400 italic">Empty (0 B)</span>;
+            } else {
+              right = <span className="text-sm tabular-nums" style={{color:'#075E54'}}>{formatBytes(entry.bytes)}</span>;
+            }
+            // Only existing entries are clickable — there's nothing for
+            // Finder to show when the path doesn't exist on disk yet.
+            const canReveal = entry.exists;
+            const rowClass = "flex items-center justify-between py-2 first:pt-0 last:pb-0 gap-3 rounded-md px-2 -mx-2 " +
+              (canReveal ? "cursor-pointer hover:bg-gray-50" : "");
+            return (
+              <div key={row.key}
+                className={rowClass}
+                onClick={canReveal ? () => revealInFinder(row.key) : undefined}
+                title={canReveal ? "Show in Finder" : undefined}>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium" style={{color:'#075E54'}}>{row.label}</p>
+                  <p className="text-[11px] text-gray-500 truncate">{row.hint}</p>
+                </div>
+                <div className="shrink-0 text-right">{right}</div>
+              </div>
+            );
+          })}
+        </div>
+        <div
+          className="flex items-center justify-between pt-3 mt-3 border-t cursor-pointer rounded-md px-2 -mx-2 hover:bg-gray-50"
+          style={{borderColor:'#DCF8C6'}}
+          onClick={() => revealInFinder("root")}
+          title="Show workspace in Finder">
+          <span className="text-[11px] uppercase tracking-wider text-gray-500">Total on disk</span>
+          <span className="text-sm font-semibold tabular-nums" style={{color:'#075E54'}}>
+            {total > 0 ? formatBytes(total) : "0 B"}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // AgentsPanel — Agents tab content
 // ═══════════════════════════════════════════════════════════════════════════
 function AgentsPanel({ workspace }) {
@@ -1922,6 +2098,8 @@ function AgentsPanel({ workspace }) {
           </div>
         </div>
       )}
+
+      <WorkspaceSizes />
 
       <div>
         <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Open in agent</h2>
@@ -2352,12 +2530,16 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
               <p className="text-[11px] text-gray-400 truncate mt-0.5">
                 {workspace.path.replace(/^\/Users\/[^/]+/, "~")}
                 <span className="font-mono ml-2">{shortUDID(workspace.binding.udid)}</span>
+                <WorkspaceTotalBadge />
               </p>
             </>
           ) : (
             <>
               <p className="text-xs font-semibold leading-none" style={{color:'#075E54'}}>WhatsKept</p>
-              <p className="text-xs text-gray-400 truncate mt-0.5">{workspace.path.replace(/^\/Users\/[^/]+/, "~")}</p>
+              <p className="text-xs text-gray-400 truncate mt-0.5">
+                {workspace.path.replace(/^\/Users\/[^/]+/, "~")}
+                <WorkspaceTotalBadge />
+              </p>
             </>
           )}
         </div>
@@ -2555,9 +2737,18 @@ function App() {
     <div className="min-h-screen flex items-center justify-center text-sm" style={{background:'#ECE5DD',color:'#128C7E'}}>Loading…</div>
   );
   if (!workspace) return <WorkspaceScreen onOpen={setWorkspace} />;
-  return <BackupManagerScreen workspace={workspace}
-           onSwitchWorkspace={() => setWorkspace(null)}
-           reloadWorkspace={reloadWorkspace} />;
+  // WorkspaceSizesProvider wraps the BackupManager so the Agents-tab
+  // breakdown and the header total-size hint share one polling source.
+  // It lives below this gate so we don't poll /api/workspace/sizes
+  // until a workspace is actually open (the endpoint returns null
+  // before that, but the request is still pointless overhead).
+  return (
+    <WorkspaceSizesProvider>
+      <BackupManagerScreen workspace={workspace}
+        onSwitchWorkspace={() => setWorkspace(null)}
+        reloadWorkspace={reloadWorkspace} />
+    </WorkspaceSizesProvider>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
