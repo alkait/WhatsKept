@@ -1989,21 +1989,28 @@ function WorkspaceTotalBadge() {
   return (
     <button onClick={() => revealInFinder("root")}
       title="Show workspace in Finder"
-      className="ml-2 inline-flex items-center text-[11px] tabular-nums hover:underline"
-      style={{color:'#075E54'}}>
+      className="ml-2 inline-flex items-center text-[11px] tabular-nums text-gray-400 hover:text-gray-600 hover:underline">
       {formatBytes(sizes.total)}
     </button>
   );
 }
 
+// WorkspaceSizes renders the size breakdown as a single grey one-liner:
+//
+//   12.4 MB  ·  Database 2.1 MB  ·  Profiles 800 KB  ·  Media 8.2 MB
+//
+// Each segment is independently clickable and reveals its section in
+// Finder. Segments for sections that don't exist yet are skipped
+// entirely (rather than rendered greyed-out) so the line stays short
+// and the visible segments are always actionable.
 function WorkspaceSizes() {
   const { sizes, error } = useWorkspaceSizes();
 
   if (error && sizes === null) {
-    return <p className="text-xs text-red-500">Could not read workspace sizes: {error}</p>;
+    return <p className="text-xs text-gray-500">Could not read workspace sizes: {error}</p>;
   }
   if (sizes === null) {
-    return <div className="text-xs text-gray-400 py-2">Measuring workspace…</div>;
+    return <p className="text-xs text-gray-400">Measuring workspace…</p>;
   }
 
   const total = sizes.total || WORKSPACE_SIZE_ROWS.reduce((sum, r) => {
@@ -2011,52 +2018,28 @@ function WorkspaceSizes() {
     return sum + (e && e.exists ? (e.bytes || 0) : 0);
   }, 0);
 
+  const segments = WORKSPACE_SIZE_ROWS
+    .filter(row => sizes[row.key] && sizes[row.key].exists)
+    .map(row => ({ key: row.key, label: row.label, bytes: sizes[row.key].bytes || 0 }));
+
   return (
-    <div>
-      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Workspace size</h2>
-      <div className="rounded-xl border bg-white p-4" style={{borderColor:'#DCF8C6'}}>
-        <div className="divide-y" style={{borderColor:'#F0F0F0'}}>
-          {WORKSPACE_SIZE_ROWS.map(row => {
-            const entry = sizes[row.key] || { exists: false, bytes: 0 };
-            let right;
-            if (!entry.exists) {
-              right = <span className="text-xs text-gray-400 italic">{row.missing}</span>;
-            } else if (!entry.bytes) {
-              right = <span className="text-xs text-gray-400 italic">Empty (0 B)</span>;
-            } else {
-              right = <span className="text-sm tabular-nums" style={{color:'#075E54'}}>{formatBytes(entry.bytes)}</span>;
-            }
-            // Only existing entries are clickable — there's nothing for
-            // Finder to show when the path doesn't exist on disk yet.
-            const canReveal = entry.exists;
-            const rowClass = "flex items-center justify-between py-2 first:pt-0 last:pb-0 gap-3 rounded-md px-2 -mx-2 " +
-              (canReveal ? "cursor-pointer hover:bg-gray-50" : "");
-            return (
-              <div key={row.key}
-                className={rowClass}
-                onClick={canReveal ? () => revealInFinder(row.key) : undefined}
-                title={canReveal ? "Show in Finder" : undefined}>
-                <div className="min-w-0">
-                  <p className="text-sm font-medium" style={{color:'#075E54'}}>{row.label}</p>
-                  <p className="text-[11px] text-gray-500 truncate">{row.hint}</p>
-                </div>
-                <div className="shrink-0 text-right">{right}</div>
-              </div>
-            );
-          })}
-        </div>
-        <div
-          className="flex items-center justify-between pt-3 mt-3 border-t cursor-pointer rounded-md px-2 -mx-2 hover:bg-gray-50"
-          style={{borderColor:'#DCF8C6'}}
-          onClick={() => revealInFinder("root")}
-          title="Show workspace in Finder">
-          <span className="text-[11px] uppercase tracking-wider text-gray-500">Total on disk</span>
-          <span className="text-sm font-semibold tabular-nums" style={{color:'#075E54'}}>
-            {total > 0 ? formatBytes(total) : "0 B"}
-          </span>
-        </div>
-      </div>
-    </div>
+    <p className="text-[11px] text-gray-400 leading-relaxed">
+      <button onClick={() => revealInFinder("root")}
+        title="Show workspace in Finder"
+        className="font-medium hover:underline hover:text-gray-600">
+        Total <span className="tabular-nums">{total > 0 ? formatBytes(total) : "0 B"}</span>
+      </button>
+      {segments.map(seg => (
+        <span key={seg.key}>
+          <span className="mx-2 text-gray-300">•</span>
+          <button onClick={() => revealInFinder(seg.key)}
+            title={`Show ${seg.label} in Finder`}
+            className="hover:underline hover:text-gray-600">
+            {seg.label} <span className="tabular-nums">{formatBytes(seg.bytes)}</span>
+          </button>
+        </span>
+      ))}
+    </p>
   );
 }
 
