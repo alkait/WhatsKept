@@ -15,6 +15,11 @@ user's questions by running SQL against the database.
                          # WhatsApp stores everything with a .jpg path on the
                          # phone, but the bytes are often something else.
 ./voice/<rowid>.opus     # voice notes (Ogg/OPUS, if `whatskept voice-index` ran)
+./documents/<rowid>.pdf  # PDF attachments (if `whatskept document-index` ran).
+                         # Text already extracted into wa_document_text;
+                         # the on-disk PDF is for `open ./documents/<rowid>.pdf`
+                         # handoff to Preview when the user asks to see it.
+                         # Non-PDF formats (xlsx, docx, ...) aren't extracted yet.
 ./profiles/whatsapp/<jid>.jpg   # WhatsApp avatars (if `whatskept-profiles-sync` ran)
 ./profiles/ios/<jid>.jpg        # iOS Contacts avatar thumbnails — fallback
                                 # when no WhatsApp avatar exists (if
@@ -24,7 +29,8 @@ user's questions by running SQL against the database.
 ```
 
 `<rowid>` everywhere = `v_messages.rowid` = `ZWAMESSAGE.Z_PK`. That's the only
-join key you need across `media/`, `voice/`, `wa_image_text`, `wa_voice_text`.
+join key you need across `media/`, `voice/`, `documents/`, `wa_image_text`,
+`wa_voice_text`, `wa_document_text`, and `wa_document`.
 
 - **DB tool**: shell out to `sqlite3 ./ChatStorage.sqlite "..."`. Don't load it
   into Python unless the user asks.
@@ -39,7 +45,8 @@ join key you need across `media/`, `voice/`, `wa_image_text`, `wa_voice_text`.
 | typed text           | `ZWAMESSAGE.ZTEXT`                           | always                        |
 | screenshots / photos | `wa_image_text.ocr_text` + `labels`          | `whatskept media-index` ran   |
 | voice notes          | `wa_voice_text.transcript`                   | `whatskept voice-index` ran   |
-| attached documents   | `wa_document.filename`                       | always                        |
+| document filenames   | `wa_document.filename`                       | always                        |
+| document body text   | `wa_document_text.text` (PDFs only)          | `whatskept document-index` ran|
 | shared links         | `ZWAMEDIAITEM.ZTITLE` (preview headline)     | always                        |
 
 So *any* topical lookup is a single `messages_fts MATCH` joined back to
@@ -56,39 +63,43 @@ SELECT m.rowid, m.ts, m.chat_title, m.sender_name, m.message_type_name,
            NULLIF(m.text, ''),
            NULLIF(t.ocr_text, ''),
            NULLIF(v.transcript, ''),
+           NULLIF(dt.text, ''),
            d.filename,
            m.link_title
        )                                                AS hit_text,
        snippet(messages_fts, 0, '[[', ']]', '…', 12)    AS hit_snippet,
        t.labels                                         AS image_labels,
+       d.filename                                       AS document_filename,
        m.link_url, m.link_title
 FROM   messages_fts f
-JOIN   v_messages    m ON m.rowid = f.rowid
-LEFT JOIN wa_image_text t ON t.rowid = m.rowid
-LEFT JOIN wa_voice_text v ON v.rowid = m.rowid
-LEFT JOIN wa_document  d ON d.rowid = m.rowid
+JOIN   v_messages    m  ON m.rowid = f.rowid
+LEFT JOIN wa_image_text    t  ON t.rowid  = m.rowid
+LEFT JOIN wa_voice_text    v  ON v.rowid  = m.rowid
+LEFT JOIN wa_document      d  ON d.rowid  = m.rowid
+LEFT JOIN wa_document_text dt ON dt.rowid = m.rowid
 WHERE  messages_fts MATCH :query
 ORDER  BY m.ts DESC
 LIMIT  50;
 ```
 
-If `wa_image_text` or `wa_voice_text` doesn't exist yet (optional indexers
-never ran), drop that `LEFT JOIN` — SQLite will error on a missing table,
-not silently null it.
+If `wa_image_text`, `wa_voice_text`, or `wa_document_text` doesn't exist
+yet (optional indexers never ran), drop that `LEFT JOIN` — SQLite will
+error on a missing table, not silently null it.
 
-## ⛔ Hard rule: do NOT ingest `./media/*`, `./voice/*`, `./profiles/*`, or `.env`
+## ⛔ Hard rule: do NOT ingest `./media/*`, `./voice/*`, `./documents/*`, `./profiles/*`, or `.env`
 
-Those folders hold tens of thousands of JPEGs, opus clips, and avatar
-images. The OCR and transcription steps exist *specifically* so you never
-need the raw bytes — every text-shaped thing about them is already in
-`wa_image_text`, `wa_voice_text`, and `messages_fts`. If you want to read
-a `.jpg` or `.opus`, write a better SQL query first.
+Those folders hold tens of thousands of JPEGs, opus clips, PDF documents,
+and avatar images. The OCR, transcription, and PDF-extraction steps exist
+*specifically* so you never need the raw bytes — every text-shaped thing
+about them is already in `wa_image_text`, `wa_voice_text`, `wa_document_text`,
+and `messages_fts`. If you want to read a `.jpg`, `.opus`, or `.pdf`,
+write a better SQL query first.
 
 **Rules:**
 
 1. **Never** read `.env`. It holds the user's iOS backup password.
 2. **Never** read, `cat`, `base64`, attach, or otherwise pipe a
-   `./media/*`, `./voice/*`, or `./profiles/**/*` file into your context.
+   `./media/*`, `./voice/*`, `./documents/*`, or `./profiles/**/*` file into your context.
    Not one. Not "just to check". (`open <path>` to show the user is a
    different operation — see next section.)
 3. The workspace ships a `.windsurfignore` covering those folders. If
@@ -117,15 +128,18 @@ the file to macOS.
    one. **Never** `open` several files in a row — one Preview/QuickTime
    window per file is rude.
 3. **Check the file exists** (not every message has been indexed):
-   - Image: `ls ./media/<rowid>.*` (extension varies — jpg/png/heic/gif) or
+   - Image:    `ls ./media/<rowid>.*` (extension varies — jpg/png/heic/gif) or
      `media_index.status = 'described'`.
-   - Voice: `ls ./voice/<rowid>.*` (codec varies) or `voice_index.status = 'transcribed'`.
-   - Avatar: `SELECT path FROM v_avatar WHERE jid = ?` — may be NULL.
+   - Voice:    `ls ./voice/<rowid>.*` (codec varies) or `voice_index.status = 'transcribed'`.
+   - Document: `ls ./documents/<rowid>.pdf` or `document_index.status = 'extracted'`.
+     PDFs only — non-PDFs are marked `status = 'unsupported'` and are not on disk.
+   - Avatar:   `SELECT path FROM v_avatar WHERE jid = ?` — may be NULL.
 4. **Hand off to macOS:**
 
    ```bash
    open ./media/<rowid>.*
    open ./voice/<rowid>.opus
+   open ./documents/<rowid>.pdf
    open ./profiles/whatsapp/<jid>.jpg
    ```
 
@@ -212,8 +226,9 @@ LIMIT  50;
 ### `wa_document` — attached-file metadata
 
 Always present (derived by `views.sql`). One row per document message
-(`message_type_name = 'document'`, `ZMESSAGETYPE = 8`). Metadata only — we
-don't extract document content.
+(`message_type_name = 'document'`, `ZMESSAGETYPE = 8`). Metadata only;
+extracted PDF body text lives in the optional `wa_document_text` table
+below.
 
 | column      | meaning                                                                  |
 |-------------|--------------------------------------------------------------------------|
@@ -223,7 +238,10 @@ don't extract document content.
 | `file_size` | Bytes (`ZWAMEDIAITEM.ZFILESIZE`).                                        |
 
 Filenames are folded into `messages_fts`, so `MATCH 'passport'` hits a
-message whose attached document is called `SCANNED PASSPORT.pdf`.
+message whose attached document is called `SCANNED PASSPORT.pdf`. **Body
+text** from PDFs is folded in too once `whatskept document-index` has run
+(see `wa_document_text` below), so `MATCH 'tenancy'` will also find a PDF
+lease agreement whose filename doesn't mention the word.
 
 ```sql
 -- All PDFs anyone sent whose filename mentions "contract".
@@ -236,9 +254,11 @@ WHERE  d.ext = 'pdf'
 ORDER  BY m.ts DESC;
 ```
 
-Document bytes are **not** on disk (they stay in the encrypted iOS backup).
-If the user asks to view a document, surface its `(rowid, filename, ts,
-sender_name)` and tell them extraction-to-disk isn't currently supported.
+PDF documents are decrypted to `./documents/<rowid>.pdf` by `whatskept
+document-index`. To show the user, use `open ./documents/<rowid>.pdf` —
+same handoff pattern as images. Non-PDF documents (xlsx, docx, …) stay in
+the encrypted backup; surface `(rowid, filename, ts, sender_name)` and
+tell the user only PDFs are currently extracted.
 
 ### `v_avatar` — contact avatars
 
@@ -300,6 +320,43 @@ Optional. Populated by `whatskept media-index` (Apple Vision, on-device, via the
 Companion `media_index(rowid, status)` tracks resume state; `status` ∈
 `described | missing | error`. Used for existence checks (see "Showing an
 image").
+
+### `wa_document_text` — extracted document text
+
+Optional. Populated by `whatskept document-index` (Apple PDFKit for native
+PDF text + Apple Vision OCR fallback per page; on-device, via the bundled
+`whatskept-vision` helper). **PDFs only.**
+
+| column            | meaning                                                                  |
+|-------------------|--------------------------------------------------------------------------|
+| `rowid`           | Joins to `v_messages.rowid` (= `wa_document.rowid`).                     |
+| `text`            | Extracted body text (PDFKit + OCR, page-joined with `\n`).               |
+| `page_count`      | Total pages in the PDF.                                                  |
+| `pages_with_text` | Pages where PDFKit returned native text without OCR.                     |
+| `pages_ocr`       | Pages that required Vision OCR (rasterized at 144 dpi).                  |
+| `method`          | `'pdfkit'`, `'ocr'`, or `'pdfkit+ocr'` — the dominant strategy used.     |
+| `generated_at`    | UTC ISO timestamp.                                                       |
+
+Companion `document_index(rowid, status)` tracks resume state; `status` ∈
+`extracted | extracted_empty | missing | unsupported | error`.
+`'extracted_empty'` means the PDF opened cleanly but no text was
+recoverable (image-only PDFs whose OCR also returned blank);
+`'unsupported'` means the attachment isn't a PDF (xlsx, docx, …) — these
+stay in the encrypted backup, not on disk.
+
+```sql
+-- Every PDF whose body text mentions "tenancy", with sender + snippet.
+SELECT m.ts, m.chat_title, m.sender_name, d.filename,
+       SUBSTR(dt.text, 1, 200) AS preview,
+       './documents/' || m.rowid || '.pdf' AS path
+FROM   messages_fts f
+JOIN   v_messages    m  ON m.rowid  = f.rowid
+JOIN   wa_document_text dt ON dt.rowid = m.rowid
+JOIN   wa_document      d  ON d.rowid  = m.rowid
+WHERE  messages_fts MATCH 'tenancy'
+ORDER  BY m.ts DESC
+LIMIT  20;
+```
 
 ### `wa_voice_text` — voice-note transcripts
 

@@ -133,6 +133,11 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/database/voice-index/model-download", s.handleVoiceModelDownload)
 	mux.HandleFunc("POST /api/database/voice-index", s.handleVoiceIndex)
 
+	// Document indexing — PDF text extraction (PDFKit + Vision OCR
+	// fallback) into wa_document_text + document_index. No external
+	// model required, so no model-status pre-flight unlike voice.
+	mux.HandleFunc("POST /api/database/document-index", s.handleDocumentIndex)
+
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
@@ -699,14 +704,33 @@ type databaseStatus struct {
 	//   VoiceErrors:      voice_index where status='error'
 	//   VoiceMissing:     voice_index where status='missing'
 	// Drive the Sync-voice-notes card's "X / Y transcribed" gauge.
-	VoiceTranscribed *int   `json:"voice_transcribed,omitempty"`
-	VoiceTotal       *int   `json:"voice_total,omitempty"`
-	VoiceErrors      *int   `json:"voice_errors,omitempty"`
-	VoiceMissing     *int   `json:"voice_missing,omitempty"`
-	LastSyncedAt     string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
-	LatestBackupAt   string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
-	IsStale          bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
-	HasBackups       bool   `json:"has_backups"`                // any encrypted backup found at all
+	VoiceTranscribed *int `json:"voice_transcribed,omitempty"`
+	VoiceTotal       *int `json:"voice_total,omitempty"`
+	VoiceErrors      *int `json:"voice_errors,omitempty"`
+	VoiceMissing     *int `json:"voice_missing,omitempty"`
+	// Document counterparts (driven by document_index / wa_document_text):
+	//   DocumentExtracted: document_index where status='extracted'
+	//   DocumentEmpty:     document_index where status='extracted_empty'
+	//                     (file processed but no text recovered — image-only PDFs)
+	//   DocumentTotal:     all document messages (ZMESSAGETYPE=8) — denominator
+	//                     for the GUI gauge. Includes non-PDFs the indexer
+	//                     can't yet handle (xlsx/docx/etc.) so the user sees
+	//                     "1,558 / 1,930" honestly.
+	//   DocumentPDFTotal:  PDFs only — the indexer's actual addressable surface.
+	//   DocumentErrors:    document_index where status='error'
+	//   DocumentMissing:   document_index where status='missing'
+	//   DocumentUnsupported: document_index where status='unsupported'
+	DocumentExtracted   *int   `json:"document_extracted,omitempty"`
+	DocumentEmpty       *int   `json:"document_empty,omitempty"`
+	DocumentTotal       *int   `json:"document_total,omitempty"`
+	DocumentPDFTotal    *int   `json:"document_pdf_total,omitempty"`
+	DocumentErrors      *int   `json:"document_errors,omitempty"`
+	DocumentMissing     *int   `json:"document_missing,omitempty"`
+	DocumentUnsupported *int   `json:"document_unsupported,omitempty"`
+	LastSyncedAt        string `json:"last_synced_at,omitempty"`   // RFC3339, ChatStorage.sqlite mtime
+	LatestBackupAt      string `json:"latest_backup_at,omitempty"` // RFC3339, max(b.LastBackup) over encrypted backups
+	IsStale             bool   `json:"is_stale"`                   // last_synced_at < latest_backup_at
+	HasBackups          bool   `json:"has_backups"`                // any encrypted backup found at all
 }
 
 func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
@@ -811,6 +835,27 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	if cs.voiceMissing >= 0 {
 		out.VoiceMissing = &cs.voiceMissing
 	}
+	if cs.documentExtracted >= 0 {
+		out.DocumentExtracted = &cs.documentExtracted
+	}
+	if cs.documentEmpty >= 0 {
+		out.DocumentEmpty = &cs.documentEmpty
+	}
+	if cs.documentTotal >= 0 {
+		out.DocumentTotal = &cs.documentTotal
+	}
+	if cs.documentPDFTotal >= 0 {
+		out.DocumentPDFTotal = &cs.documentPDFTotal
+	}
+	if cs.documentErrors >= 0 {
+		out.DocumentErrors = &cs.documentErrors
+	}
+	if cs.documentMissing >= 0 {
+		out.DocumentMissing = &cs.documentMissing
+	}
+	if cs.documentUnsupported >= 0 {
+		out.DocumentUnsupported = &cs.documentUnsupported
+	}
 
 	writeJSON(w, http.StatusOK, out)
 }
@@ -823,18 +868,25 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 // treats that as "hide this field in the UI", which is exactly how
 // the JSON omitempty-tagged *int pointers carry the same intent.
 type dbCounts struct {
-	msgs             int // ZWAMESSAGE                              (always present once a DB exists)
-	fts              int // messages_fts                            (after ApplyViews / media-index)
-	avatars          int // wa_profile_picture                      (after SyncProfiles)
-	contacts         int // wa_contact                              (after SyncContacts)
-	imageDescribed   int // media_index where status='described'    (after media-index)
-	imageTotal       int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
-	imageErrors      int // media_index where status='error'        (after media-index)
-	imageMissing     int // media_index where status='missing'      (after media-index)
-	voiceTranscribed int // voice_index where status='transcribed' (after voice-index)
-	voiceTotal       int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.opus'
-	voiceErrors      int // voice_index where status='error'       (after voice-index)
-	voiceMissing     int // voice_index where status='missing'     (after voice-index)
+	msgs                int // ZWAMESSAGE                              (always present once a DB exists)
+	fts                 int // messages_fts                            (after ApplyViews / media-index)
+	avatars             int // wa_profile_picture                      (after SyncProfiles)
+	contacts            int // wa_contact                              (after SyncContacts)
+	imageDescribed      int // media_index where status='described'    (after media-index)
+	imageTotal          int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
+	imageErrors         int // media_index where status='error'        (after media-index)
+	imageMissing        int // media_index where status='missing'      (after media-index)
+	voiceTranscribed    int // voice_index where status='transcribed' (after voice-index)
+	voiceTotal          int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.opus'
+	voiceErrors         int // voice_index where status='error'       (after voice-index)
+	voiceMissing        int // voice_index where status='missing'     (after voice-index)
+	documentExtracted   int // document_index where status='extracted'      (after document-index)
+	documentEmpty       int // document_index where status='extracted_empty' (after document-index)
+	documentTotal       int // ZWAMESSAGE where ZMESSAGETYPE=8         (all document messages)
+	documentPDFTotal    int // wa_document where ext='pdf'             (indexer's addressable set)
+	documentErrors      int // document_index where status='error'    (after document-index)
+	documentMissing     int // document_index where status='missing'  (after document-index)
+	documentUnsupported int // document_index where status='unsupported' (non-PDF formats)
 }
 
 // readDBCounts opens dbPath read-only and reports the counts that
@@ -847,6 +899,8 @@ func readDBCounts(dbPath string) dbCounts {
 		msgs: -1, fts: -1, avatars: -1, contacts: -1,
 		imageDescribed: -1, imageTotal: -1, imageErrors: -1, imageMissing: -1,
 		voiceTranscribed: -1, voiceTotal: -1, voiceErrors: -1, voiceMissing: -1,
+		documentExtracted: -1, documentEmpty: -1, documentTotal: -1, documentPDFTotal: -1,
+		documentErrors: -1, documentMissing: -1, documentUnsupported: -1,
 	}
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
@@ -871,6 +925,17 @@ func readDBCounts(dbPath string) dbCounts {
 		{&cs.voiceTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.opus'`},
 		{&cs.voiceErrors, `SELECT COUNT(*) FROM voice_index WHERE status = 'error'`},
 		{&cs.voiceMissing, `SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`},
+		{&cs.documentExtracted, `SELECT COUNT(*) FROM document_index WHERE status = 'extracted'`},
+		{&cs.documentEmpty, `SELECT COUNT(*) FROM document_index WHERE status = 'extracted_empty'`},
+		{&cs.documentTotal, `SELECT COUNT(*)
+		                       FROM ZWAMESSAGE m
+		                       JOIN ZWAMEDIAITEM mi ON mi.ZMESSAGE = m.Z_PK
+		                       WHERE m.ZMESSAGETYPE = 8
+		                         AND mi.ZMEDIALOCALPATH IS NOT NULL`},
+		{&cs.documentPDFTotal, `SELECT COUNT(*) FROM wa_document WHERE ext = 'pdf'`},
+		{&cs.documentErrors, `SELECT COUNT(*) FROM document_index WHERE status = 'error'`},
+		{&cs.documentMissing, `SELECT COUNT(*) FROM document_index WHERE status = 'missing'`},
+		{&cs.documentUnsupported, `SELECT COUNT(*) FROM document_index WHERE status = 'unsupported'`},
 	} {
 		var n int
 		if err := db.QueryRow(p.sql).Scan(&n); err == nil {
@@ -1290,6 +1355,67 @@ func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
 				Language:   req.Language,
 				Log:        log,
 				Progress: func(p postprocess.VoiceIndexProgress) {
+					progress(p)
+				},
+			})
+			if err == nil {
+				s.pw.set(attempted)
+			}
+			return err
+		})
+
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// ---------------------------------------------------------------------------
+// Document indexing
+// ---------------------------------------------------------------------------
+
+// documentIndexRequest is the JSON body of POST /api/database/document-index.
+// Only the password matters; workspace + backup are implicit in
+// server state.
+type documentIndexRequest struct {
+	Password string `json:"password"`
+}
+
+// handleDocumentIndex starts a `postprocess.DocumentIndex` run as
+// an in-process SSE job. Same shape as handleMediaIndex / handleVoiceIndex:
+// emits "line" + "progress" events through the existing SSE
+// machinery, and DELETE /api/jobs/{id} would cancel via context
+// teardown between rows.
+//
+// No model-status pre-flight here — PDFKit + Vision are first-party
+// macOS frameworks always present on supported OS versions, unlike
+// the whisper model which is downloaded on first use.
+func (s *server) handleDocumentIndex(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+
+	var req documentIndexRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	attempted := req.Password
+	if attempted == "" {
+		attempted = s.pw.get()
+	}
+	if attempted == "" {
+		httpError(w, http.StatusBadRequest, "backup password is required")
+		return
+	}
+
+	jobID := s.jobs.startInProcessProgress("document-index",
+		func(log func(string), progress func(any)) error {
+			_, err := postprocess.DocumentIndex(postprocess.DocumentIndexOptions{
+				Workspace:  cur,
+				BackupRoot: backup.DefaultRoot(),
+				Password:   attempted,
+				Log:        log,
+				Progress: func(p postprocess.DocumentIndexProgress) {
 					progress(p)
 				},
 			})

@@ -45,6 +45,7 @@ const ignoreHeader = "# Added by WhatsKept. DO NOT feed these to any model — s
 var ignoreEntries = []string{
 	"media/",
 	"voice/",
+	"documents/",
 	"profiles/",
 	".env",
 	"ChatStorage.sqlite.new", // transient temp file from a re-sync
@@ -324,10 +325,11 @@ func SyncMessages(
 			log(fmt.Sprintf("Sidecar merge failed (continuing): %v", mErr))
 		} else {
 			mergeStats = ms
-			if ms.OCRPreserved > 0 || ms.VoicePreserved > 0 {
+			if ms.OCRPreserved > 0 || ms.VoicePreserved > 0 || ms.DocumentPreserved > 0 {
 				log(fmt.Sprintf(
-					"Preserved %d OCR rows, %d voice rows (dropped: %d OCR, %d voice for deleted messages).",
-					ms.OCRPreserved, ms.VoicePreserved, ms.OCRDropped, ms.VoiceDropped,
+					"Preserved %d OCR rows, %d voice rows, %d document rows (dropped: %d OCR, %d voice, %d doc for deleted messages).",
+					ms.OCRPreserved, ms.VoicePreserved, ms.DocumentPreserved,
+					ms.OCRDropped, ms.VoiceDropped, ms.DocumentDropped,
 				))
 			}
 		}
@@ -356,19 +358,22 @@ func SyncMessages(
 	// still succeeds.
 	mediaDir := filepath.Join(workspace, "media")
 	voiceDir := filepath.Join(workspace, "voice")
-	pruneStats, pruneErr := pruneOrphans(livePath, mediaDir, voiceDir)
+	documentsDir := filepath.Join(workspace, "documents")
+	pruneStats, pruneErr := pruneOrphans(livePath, mediaDir, voiceDir, documentsDir)
 	if pruneErr != nil {
 		log(fmt.Sprintf("Orphan prune failed (continuing): %v", pruneErr))
 	} else if pruneStats != nil {
 		total := pruneStats.MediaFilesDeleted + pruneStats.OCRRowsDeleted +
 			pruneStats.MediaIndexRowsDeleted + pruneStats.VoiceRowsDeleted +
-			pruneStats.VoiceIndexRowsDeleted + pruneStats.VoiceFilesDeleted
+			pruneStats.VoiceIndexRowsDeleted + pruneStats.VoiceFilesDeleted +
+			pruneStats.DocumentFilesDeleted + pruneStats.DocumentTextRowsDeleted +
+			pruneStats.DocumentIndexRowsDeleted
 		if total > 0 {
 			log(fmt.Sprintf(
-				"Pruned: %d media files / %d voice files · %d wa_image_text / %d wa_voice_text rows · %d media_index / %d voice_index rows.",
-				pruneStats.MediaFilesDeleted, pruneStats.VoiceFilesDeleted,
-				pruneStats.OCRRowsDeleted, pruneStats.VoiceRowsDeleted,
-				pruneStats.MediaIndexRowsDeleted, pruneStats.VoiceIndexRowsDeleted,
+				"Pruned: %d media / %d voice / %d document files · %d wa_image_text / %d wa_voice_text / %d wa_document_text rows · %d media_index / %d voice_index / %d document_index rows.",
+				pruneStats.MediaFilesDeleted, pruneStats.VoiceFilesDeleted, pruneStats.DocumentFilesDeleted,
+				pruneStats.OCRRowsDeleted, pruneStats.VoiceRowsDeleted, pruneStats.DocumentTextRowsDeleted,
+				pruneStats.MediaIndexRowsDeleted, pruneStats.VoiceIndexRowsDeleted, pruneStats.DocumentIndexRowsDeleted,
 			))
 		}
 	}

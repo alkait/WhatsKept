@@ -10,6 +10,7 @@ SQLite + FTS5 workspace that an agent can query directly.
 
 - [What you can ask](#what-you-can-ask)
 - [What this is (and what it isn't)](#what-this-is-and-what-it-isnt)
+- [Pipeline](#pipeline)
 - [Download](#download)
 - [How this was built](#how-this-was-built)
 - [System requirements](#system-requirements)
@@ -20,7 +21,7 @@ SQLite + FTS5 workspace that an agent can query directly.
 ## What you can ask
 
 Once the workspace is built, point an LLM coding agent at the folder
-(Windsurf, Claude Code, Cursor, VS Code + Copilot, …) and ask. A few
+(Windsurf, Claude Code, Cursor, VS Code + Copilot,etc …) and ask. A few
 examples of what becomes possible:
 
 | Use case | Example prompt |
@@ -47,10 +48,12 @@ agent-friendly workspace on disk.
   blobs from the encrypted iOS backup, using your backup password.
 - **Processes media locally**: OCR + image classification through
   Apple's Vision framework, voice-note transcription through
-  `whisper.cpp` with Metal.
+  `whisper.cpp` with Metal, and PDF document text extraction through
+  Apple PDFKit (with Vision OCR fallback for scanned pages).
 - **Normalizes** everything into a single SQLite database (with FTS5)
-  alongside extracted `media/`, `voice/`, and `profiles/` folders,
-  joined against your macOS Contacts so chats are readable.
+  alongside extracted `media/`, `voice/`, `documents/`, and
+  `profiles/` folders, joined against your macOS Contacts so chats
+  are readable.
 - **Writes an `AGENTS.md`** and agent-ignore files so an LLM coding
   agent dropped into the workspace knows the schema and skips the
   heavy binary trees.
@@ -79,6 +82,69 @@ it turns a locked, encrypted iOS backup into a plain folder of
 readable text, searchable messages, and transcribed voice notes —
 then steps out of the way and lets the agent you already trust do
 the thinking.
+
+## Pipeline
+
+End-to-end data flow, from the encrypted backup on disk to a
+workspace your agent can `MATCH` against. The four side-car
+indexers (avatars/contacts, images, voice, documents) are all
+**opt-in** — each one lives behind its own button in the Database
+tab and can be skipped, re-run, or resumed independently. Everything
+runs **on-device**; the only outbound network call is the one-time
+whisper-model download from HuggingFace if you enable voice
+transcription.
+
+```mermaid
+%%{init: {'flowchart': {'subGraphTitleMargin': {'top': 32, 'bottom': 32}}}}%%
+flowchart TD
+    classDef src    fill:#fff7ed,stroke:#fb923c,color:#7c2d12
+    classDef proc   fill:#fef3c7,stroke:#f59e0b,color:#78350f
+    classDef data   fill:#ecfdf5,stroke:#10b981,color:#064e3b
+    classDef agent  fill:#f5f3ff,stroke:#8b5cf6,color:#4c1d95
+
+    IP["iPhone / iPad"]:::src
+    BK["Encrypted iOS backup"]:::src
+    IP -->|USB| BK
+
+    SYNC{{"Decrypt &amp; extract chat history"}}:::proc
+    BK -->|backup password| SYNC
+
+    DB[("Chat database")]:::data
+    SYNC --> DB
+
+    subgraph SIDE["Optional on-device processors"]
+        direction LR
+        PS{{"Sync contacts &amp; avatars"}}:::proc
+        MI{{"Image OCR &amp; classification"}}:::proc
+        VI{{"Voice-note transcription"}}:::proc
+        XI{{"PDF text extraction"}}:::proc
+    end
+
+    DB -.-> PS
+    DB -.-> MI
+    DB -.-> VI
+    DB -.-> XI
+
+    PS --> AV[("Contacts &amp; avatars")]:::data
+    MI --> IM[("Image text &amp; labels")]:::data
+    VI --> VC[("Voice transcripts")]:::data
+    XI --> DC[("Document text")]:::data
+
+    FTS[("Unified search index")]:::data
+    DB --> FTS
+    IM --> FTS
+    VC --> FTS
+    DC --> FTS
+
+    AGENT(["LLM coding agent<br/>(Windsurf · Cursor · Claude Code · Copilot)"]):::agent
+    FTS --> AGENT
+    AV  --> AGENT
+```
+
+Each on-device processor is **opt-in** — skip it, run it later, or
+re-run to resume where it left off. Re-running the top-level sync
+carries the already-processed work forward and prunes anything tied
+to messages you've since deleted on the phone.
 
 ## Download
 
@@ -161,8 +227,8 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 **What to be cautious about**
 
 - **The workspace contains *decrypted* WhatsApp data.** `ChatStorage.sqlite`,
-  `media/`, `voice/`, and `profiles/` are plaintext on disk, and the
-  Messages sync also joins your macOS Contacts (names + phone
+  `media/`, `voice/`, `documents/`, and `profiles/` are plaintext on
+  disk, and the Messages sync also joins your macOS Contacts (names + phone
   numbers) into the database so chats are readable. Anyone with
   read access to that folder (other macOS users, Time Machine
   backups, cloud-sync folders like iCloud Drive / Dropbox / Google
@@ -171,9 +237,9 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   `~/Dropbox` is not.
 - **The agent reads the text, but not the raw files.** WhatsKept
   drops `.windsurfignore`, `.copilotignore`, and similar ignore
-  files so agents stay out of the `media/`, `voice/`, and
-  `profiles/` folders — the actual photos, audio files, and profile
-  pictures are off-limits. What the agent *does* see is everything
+  files so agents stay out of the `media/`, `voice/`, `documents/`,
+  and `profiles/` folders — the actual photos, audio files, PDFs, and
+  profile pictures are off-limits. What the agent *does* see is everything
   in the SQLite database: every message, every image's OCR'd text
   and classification labels, every voice-note transcript, and the
   contact names and numbers joined in. So when you ask a question,

@@ -1,23 +1,31 @@
 // whatskept-vision — a tiny persistent worker that wraps Apple's
-// Vision.framework so the Go side of whatskept can run OCR +
-// classification on WhatsApp image messages without taking a cgo
-// dependency on macOS frameworks.
+// Vision.framework + PDFKit so the Go side of whatskept can run OCR
+// on WhatsApp image messages and text-extract WhatsApp document
+// messages without taking a cgo dependency on macOS frameworks.
 //
 // Protocol (line-delimited JSON over stdin / stdout):
 //
-//   request:  {"id": <any json scalar>, "path": "<absolute jpeg path>"}
-//   response: {"id": ..., "ok": true,  "ocr_text": "...", "language": "en",
-//              "labels": [["dog", 0.94], ["pet", 0.88], ...]}
-//          OR {"id": ..., "ok": false, "error": "<message>"}
+//   image request:  {"id": <any>, "path": "<jpeg>"}   (kind omitted = "image")
+//                or {"id": <any>, "kind": "image", "path": "<jpeg>"}
+//   image response: {"id": ..., "ok": true,  "ocr_text": "...", "language": "en",
+//                    "labels": [["dog", 0.94], ["pet", 0.88], ...]}
+//
+//   pdf request:    {"id": <any>, "kind": "pdf", "path": "<pdf>"}
+//   pdf response:   {"id": ..., "ok": true, "text": "...",
+//                    "page_count": 33,
+//                    "pages_with_text": 30, "pages_ocr": 3,
+//                    "method": "pdfkit" | "ocr" | "mixed"}
+//
+//   error response: {"id": ..., "ok": false, "error": "<message>"}
 //
 // One request, one response. Order preserved. EOF on stdin →
 // process exits 0.
 //
-// Why a subprocess instead of cgo? Vision.framework has no stable C
-// ABI we can wire to from Go directly; PyObjC-style bindings in cgo
-// against Objective-C selectors are very fragile under SDK updates.
-// A ~100-line Swift binary that does the JSON dance is the smallest
-// stable seam.
+// Why a subprocess instead of cgo? Vision.framework / PDFKit have no
+// stable C ABI we can wire to from Go directly; PyObjC-style
+// bindings in cgo against Objective-C selectors are very fragile
+// under SDK updates. A small Swift binary that does the JSON dance
+// is the smallest stable seam.
 //
 // Build:
 //   swiftc -O -o internal/helpers/bundle/whatskept-vision \
@@ -28,6 +36,8 @@
 
 import Foundation
 import Vision
+import PDFKit
+import AppKit
 
 // MARK: - Wire types ---------------------------------------------------------
 
@@ -69,6 +79,7 @@ struct AnyCodable: Codable {
 struct Request: Codable {
     let id: AnyCodable
     let path: String
+    let kind: String? // "image" (default) or "pdf"
 }
 
 // Label is encoded as a 2-element JSON array [name, score] for
@@ -79,12 +90,30 @@ struct Label {
     let confidence: Float
 }
 
+// Response is the union of all reply shapes the helper emits. Each
+// request kind populates a different subset of fields — see the
+// header comment for the per-kind contract.
+//
+// We hand-roll encode() so we can omit nil fields cleanly. Symmetric
+// decode() is minimal because the Swift side never reads its own
+// output; the Go side does that.
 struct Response: Codable {
     let id: AnyCodable
     let ok: Bool
+
+    // Image-kind fields.
     let ocrText: String?
     let language: String?
     let labels: [Label]?
+
+    // PDF-kind fields.
+    let text: String?
+    let pageCount: Int?
+    let pagesWithText: Int?
+    let pagesOCR: Int?
+    let method: String?
+
+    // Error.
     let error: String?
 
     enum CodingKeys: String, CodingKey {
@@ -92,6 +121,11 @@ struct Response: Codable {
         case ocrText = "ocr_text"
         case language
         case labels
+        case text
+        case pageCount       = "page_count"
+        case pagesWithText   = "pages_with_text"
+        case pagesOCR        = "pages_ocr"
+        case method
         case error
     }
 
@@ -99,7 +133,7 @@ struct Response: Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encode(ok, forKey: .ok)
-        if let s = ocrText { try c.encode(s, forKey: .ocrText) }
+        if let s = ocrText  { try c.encode(s, forKey: .ocrText) }
         if let s = language { try c.encode(s, forKey: .language) }
         if let ls = labels {
             // Encode each label as a [String, Float] pair.
@@ -110,16 +144,28 @@ struct Response: Codable {
                 try pair.encode(l.confidence)
             }
         }
-        if let e = error { try c.encode(e, forKey: .error) }
+        if let s = text          { try c.encode(s, forKey: .text) }
+        if let n = pageCount     { try c.encode(n, forKey: .pageCount) }
+        if let n = pagesWithText { try c.encode(n, forKey: .pagesWithText) }
+        if let n = pagesOCR      { try c.encode(n, forKey: .pagesOCR) }
+        if let s = method        { try c.encode(s, forKey: .method) }
+        if let e = error         { try c.encode(e, forKey: .error) }
     }
 
     init(ok: Bool, id: AnyCodable, ocrText: String? = nil, language: String? = nil,
-         labels: [Label]? = nil, error: String? = nil) {
+         labels: [Label]? = nil, text: String? = nil,
+         pageCount: Int? = nil, pagesWithText: Int? = nil,
+         pagesOCR: Int? = nil, method: String? = nil, error: String? = nil) {
         self.id = id
         self.ok = ok
         self.ocrText = ocrText
         self.language = language
         self.labels = labels
+        self.text = text
+        self.pageCount = pageCount
+        self.pagesWithText = pagesWithText
+        self.pagesOCR = pagesOCR
+        self.method = method
         self.error = error
     }
 
@@ -132,6 +178,11 @@ struct Response: Codable {
         ocrText = try? c.decode(String.self, forKey: .ocrText)
         language = try? c.decode(String.self, forKey: .language)
         labels = nil
+        text = try? c.decode(String.self, forKey: .text)
+        pageCount = try? c.decode(Int.self, forKey: .pageCount)
+        pagesWithText = try? c.decode(Int.self, forKey: .pagesWithText)
+        pagesOCR = try? c.decode(Int.self, forKey: .pagesOCR)
+        method = try? c.decode(String.self, forKey: .method)
         error = try? c.decode(String.self, forKey: .error)
     }
 }
@@ -219,6 +270,133 @@ func describe(path: String, id: AnyCodable,
                     labels: labels)
 }
 
+// MARK: - PDF driver ---------------------------------------------------------
+
+// Per-page text extraction with OCR fallback. For each page, we
+// first try PDFKit's native `page.string` (free, accurate, handles
+// Arabic / RTL correctly). If that returns empty — which happens
+// for ~30% of WhatsApp PDFs which are camera-scanned receipts /
+// contracts — we rasterize the page and run Apple Vision OCR
+// against the resulting bitmap.
+//
+// Tunables (env):
+//   WHATSKEPT_PDF_MAX_OCR_PAGES   (default 100)
+//        Cap on pages we'll rasterize-and-OCR per document. A few
+//        large scanned PDFs (e.g. a 200-page CV dump) would otherwise
+//        burn minutes; the cap means we degrade gracefully — first
+//        N pages get OCR, the rest get whatever PDFKit found
+//        natively (usually nothing for those PDFs, which is fine —
+//        the filename is still in messages_fts via wa_document).
+//   WHATSKEPT_PDF_RENDER_SCALE    (default 2.0)
+//        Multiplier on the PDF's natural page size when rasterizing
+//        for OCR. 2.0 = 144 dpi (PDFs are 72 dpi natively) which is
+//        a good balance of OCR accuracy vs CPU. Bumping to 3.0 helps
+//        small print but doubles rasterize time.
+func describePDF(path: String, id: AnyCodable,
+                 maxOCRPages: Int, renderScale: CGFloat) -> Response {
+    let url = URL(fileURLWithPath: path)
+    if !FileManager.default.fileExists(atPath: path) {
+        return Response(ok: false, id: id, error: "file not found: \(path)")
+    }
+    guard let doc = PDFDocument(url: url) else {
+        return Response(ok: false, id: id, error: "PDFKit could not open document (encrypted or corrupt?)")
+    }
+    let pageCount = doc.pageCount
+    if pageCount == 0 {
+        return Response(ok: true, id: id,
+                        text: "", pageCount: 0,
+                        pagesWithText: 0, pagesOCR: 0,
+                        method: "pdfkit")
+    }
+
+    var parts: [String] = []
+    parts.reserveCapacity(pageCount)
+    var pagesWithText = 0
+    var pagesOCR = 0
+    var ocrUsedThisRun = 0
+
+    for i in 0..<pageCount {
+        guard let page = doc.page(at: i) else { continue }
+        let native = (page.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !native.isEmpty {
+            parts.append(native)
+            pagesWithText += 1
+            continue
+        }
+        // Empty native text — try OCR if we still have budget.
+        if ocrUsedThisRun >= maxOCRPages { continue }
+        if let ocr = ocrOnePDFPage(page: page, scale: renderScale),
+           !ocr.isEmpty {
+            parts.append(ocr)
+            pagesOCR += 1
+        }
+        ocrUsedThisRun += 1
+    }
+
+    let joined = parts.joined(separator: "\n\n")
+    let method: String
+    if pagesOCR == 0 && pagesWithText > 0 { method = "pdfkit" }
+    else if pagesWithText == 0 && pagesOCR > 0 { method = "ocr" }
+    else if pagesWithText > 0 && pagesOCR > 0 { method = "mixed" }
+    else { method = "empty" }
+
+    return Response(ok: true, id: id,
+                    text: joined,
+                    pageCount: pageCount,
+                    pagesWithText: pagesWithText,
+                    pagesOCR: pagesOCR,
+                    method: method)
+}
+
+// ocrOnePDFPage rasterizes a single PDFPage to a CGImage and runs
+// VNRecognizeTextRequest against it. Returns the concatenated lines
+// or nil on any failure (which we treat as "no text found" — same
+// observable behaviour, and OCR errors on scanned-PDF pages are
+// almost always transient / non-fatal).
+func ocrOnePDFPage(page: PDFPage, scale: CGFloat) -> String? {
+    let bounds = page.bounds(for: .mediaBox)
+    let pxW = Int(bounds.width  * scale)
+    let pxH = Int(bounds.height * scale)
+    if pxW <= 0 || pxH <= 0 { return nil }
+
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(data: nil,
+                              width: pxW, height: pxH,
+                              bitsPerComponent: 8,
+                              bytesPerRow: 0,
+                              space: colorSpace,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+    else { return nil }
+
+    // White background — many WhatsApp scans use transparent PDFs
+    // whose Vision OCR drops 30%+ recall against a black background.
+    ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+    ctx.fill(CGRect(x: 0, y: 0, width: pxW, height: pxH))
+    ctx.scaleBy(x: scale, y: scale)
+    page.draw(with: .mediaBox, to: ctx)
+
+    guard let cg = ctx.makeImage() else { return nil }
+
+    let handler = VNImageRequestHandler(cgImage: cg, options: [:])
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = .accurate
+    req.usesLanguageCorrection = true
+    do {
+        try handler.perform([req])
+    } catch {
+        return nil
+    }
+    guard let results = req.results else { return nil }
+    var lines: [String] = []
+    for o in results {
+        if let top = o.topCandidates(1).first {
+            let s = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !s.isEmpty { lines.append(s) }
+        }
+    }
+    return lines.joined(separator: "\n")
+}
+
 // MARK: - I/O loop -----------------------------------------------------------
 
 let labelTopN: Int = {
@@ -230,6 +408,16 @@ let labelMinConf: Float = {
     if let s = ProcessInfo.processInfo.environment["WHATSKEPT_VISION_LABEL_MIN_CONF"],
        let f = Float(s), f >= 0 { return f }
     return 0.50
+}()
+let pdfMaxOCRPages: Int = {
+    if let s = ProcessInfo.processInfo.environment["WHATSKEPT_PDF_MAX_OCR_PAGES"],
+       let n = Int(s), n > 0 { return n }
+    return 100
+}()
+let pdfRenderScale: CGFloat = {
+    if let s = ProcessInfo.processInfo.environment["WHATSKEPT_PDF_RENDER_SCALE"],
+       let f = Double(s), f > 0 { return CGFloat(f) }
+    return 2.0
 }()
 
 let stdin = FileHandle.standardInput
@@ -270,8 +458,19 @@ while let line = readLine(strippingNewline: true) {
         continue
     }
 
-    let resp = describe(path: req.path, id: req.id,
+    let resp: Response
+    switch (req.kind ?? "image") {
+    case "pdf":
+        resp = describePDF(path: req.path, id: req.id,
+                           maxOCRPages: pdfMaxOCRPages,
+                           renderScale: pdfRenderScale)
+    case "image", "":
+        resp = describe(path: req.path, id: req.id,
                         labelTopN: labelTopN, labelMinConf: labelMinConf)
+    default:
+        resp = Response(ok: false, id: req.id,
+                        error: "unknown kind: \(req.kind ?? "?")")
+    }
     do {
         let out = try encoder.encode(resp)
         stdout.write(out)

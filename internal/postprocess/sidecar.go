@@ -34,28 +34,35 @@ import (
 // SidecarMergeStats summarises mergeSidecarsForward's work. Surfaced
 // in SyncResult so the GUI/CLI can show "preserved 4,210 OCR rows".
 type SidecarMergeStats struct {
-	MessagesBefore    int `json:"messages_before"`
-	MessagesAfter     int `json:"messages_after"`
-	MessagesNew       int `json:"messages_new"`
-	MessagesDropped   int `json:"messages_dropped"`
-	OCRPreserved      int `json:"ocr_preserved"`
-	OCRDropped        int `json:"ocr_dropped"`
-	MediaIndexCarried int `json:"media_index_carried"`
-	VoicePreserved    int `json:"voice_preserved"`
-	VoiceDropped      int `json:"voice_dropped"`
-	VoiceIndexCarried int `json:"voice_index_carried"`
+	MessagesBefore       int `json:"messages_before"`
+	MessagesAfter        int `json:"messages_after"`
+	MessagesNew          int `json:"messages_new"`
+	MessagesDropped      int `json:"messages_dropped"`
+	OCRPreserved         int `json:"ocr_preserved"`
+	OCRDropped           int `json:"ocr_dropped"`
+	MediaIndexCarried    int `json:"media_index_carried"`
+	VoicePreserved       int `json:"voice_preserved"`
+	VoiceDropped         int `json:"voice_dropped"`
+	VoiceIndexCarried    int `json:"voice_index_carried"`
+	DocumentPreserved    int `json:"document_preserved"`
+	DocumentDropped      int `json:"document_dropped"`
+	DocumentIndexCarried int `json:"document_index_carried"`
 }
 
 // OrphanPruneStats summarises pruneOrphans's work.
 type OrphanPruneStats struct {
-	OCRRowsDeleted        int `json:"ocr_rows_deleted"`
-	MediaIndexRowsDeleted int `json:"media_index_rows_deleted"`
-	VoiceRowsDeleted      int `json:"voice_rows_deleted"`
-	VoiceIndexRowsDeleted int `json:"voice_index_rows_deleted"`
-	MediaFilesDeleted     int `json:"media_files_deleted"`
-	MediaFilesFailed      int `json:"media_files_failed"`
-	VoiceFilesDeleted     int `json:"voice_files_deleted"`
-	VoiceFilesFailed      int `json:"voice_files_failed"`
+	OCRRowsDeleted           int `json:"ocr_rows_deleted"`
+	MediaIndexRowsDeleted    int `json:"media_index_rows_deleted"`
+	VoiceRowsDeleted         int `json:"voice_rows_deleted"`
+	VoiceIndexRowsDeleted    int `json:"voice_index_rows_deleted"`
+	DocumentTextRowsDeleted  int `json:"document_text_rows_deleted"`
+	DocumentIndexRowsDeleted int `json:"document_index_rows_deleted"`
+	MediaFilesDeleted        int `json:"media_files_deleted"`
+	MediaFilesFailed         int `json:"media_files_failed"`
+	VoiceFilesDeleted        int `json:"voice_files_deleted"`
+	VoiceFilesFailed         int `json:"voice_files_failed"`
+	DocumentFilesDeleted     int `json:"document_files_deleted"`
+	DocumentFilesFailed      int `json:"document_files_failed"`
 }
 
 // tableExists returns true if a regular table or virtual table with
@@ -237,6 +244,53 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 		}
 	}
 
+	// wa_document_text + document_index — populated by `whatskept
+	// document-index`. Schema is co-created here if the old DB had
+	// these tables, then we carry forward rows whose rowid still
+	// exists in the new ZWAMESSAGE. Note: the `wa_document` table
+	// (filename metadata) is NOT touched here — it's rebuilt
+	// deterministically by views.sql on every sync, so it doesn't
+	// need carry-forward.
+	hadDoc, err := attachedTableExists(db, "old", "wa_document_text")
+	if err != nil {
+		return nil, fmt.Errorf("probe old.wa_document_text: %w", err)
+	}
+	if hadDoc {
+		if _, err := db.Exec(createDocumentSidecarsSQL); err != nil {
+			return nil, fmt.Errorf("create document sidecar tables: %w", err)
+		}
+		res, err := db.Exec(
+			`INSERT OR REPLACE INTO main.wa_document_text
+			 SELECT * FROM old.wa_document_text
+			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("preserve wa_document_text: %w", err)
+		}
+		if n, e := res.RowsAffected(); e == nil {
+			stats.DocumentPreserved = int(n)
+		}
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM old.wa_document_text
+			 WHERE rowid NOT IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
+		).Scan(&stats.DocumentDropped); err != nil {
+			return nil, fmt.Errorf("count dropped document rows: %w", err)
+		}
+		if had, _ := attachedTableExists(db, "old", "document_index"); had {
+			res, err := db.Exec(
+				`INSERT OR REPLACE INTO main.document_index
+				 SELECT * FROM old.document_index
+				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("preserve document_index: %w", err)
+			}
+			if n, e := res.RowsAffected(); e == nil {
+				stats.DocumentIndexCarried = int(n)
+			}
+		}
+	}
+
 	return stats, nil
 }
 
@@ -298,6 +352,61 @@ CREATE TABLE IF NOT EXISTS voice_index (
 CREATE INDEX IF NOT EXISTS voice_index_status_idx ON voice_index(status);
 `
 
+// createDocumentSidecarsSQL is the schema for the document-index
+// output tables. Shared by document.go's setup and the merge-
+// forward step here (drift between the two would be a silent
+// corruption hazard, same rationale as the image / voice sidecars).
+//
+// Two tables, mirroring the image/voice pattern:
+//
+//	wa_document_text — extracted body text per PDF. Joined into
+//	  messages_fts by rebuildFTS so MATCH 'cardamom' hits a recipe
+//	  PDF that the sender attached.
+//
+//	document_index   — terminal-state ledger driving the per-row
+//	  resume logic. status values:
+//	     'extracted'   PDFKit and/or Vision OCR returned text;
+//	                   wa_document_text row exists.
+//	     'extracted_empty'  pipeline ran cleanly but the PDF has
+//	                   no recoverable text (image-only PDF whose
+//	                   OCR also came back blank). No wa_document_text
+//	                   row but the file is on disk.
+//	     'missing'     file referenced in DB but not in the iOS
+//	                   backup manifest, or stored as a zero-byte
+//	                   record (selective backup / not downloaded
+//	                   on the phone).
+//	     'unsupported' document is not a PDF (xlsx, docx, ...).
+//	                   We don't have an extractor for these yet;
+//	                   the row is parked here so future runs can
+//	                   skip it cheaply.
+//	     'error'       decrypt / write / PDFKit / Vision failure.
+//
+// pages_with_text + pages_ocr add up to <= page_count (some pages
+// may have been blank entirely, or skipped due to the OCR cap).
+const createDocumentSidecarsSQL = `
+CREATE TABLE IF NOT EXISTS wa_document_text (
+    rowid           INTEGER PRIMARY KEY,
+    text            TEXT NOT NULL DEFAULT '',
+    page_count      INTEGER NOT NULL DEFAULT 0,
+    pages_with_text INTEGER NOT NULL DEFAULT 0,
+    pages_ocr       INTEGER NOT NULL DEFAULT 0,
+    method          TEXT NOT NULL DEFAULT '',
+    generated_at    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS document_index (
+    rowid         INTEGER PRIMARY KEY,
+    manifest_path TEXT    NOT NULL,
+    ext           TEXT,
+    status        TEXT    NOT NULL,
+    bytes         INTEGER,
+    page_count    INTEGER,
+    error         TEXT,
+    attempted_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS document_index_status_idx ON document_index(status);
+CREATE INDEX IF NOT EXISTS document_index_ext_idx    ON document_index(ext);
+`
+
 // pruneOrphans enforces the "./media folder mirrors device state"
 // invariant after a SyncMessages run. Two passes:
 //
@@ -316,7 +425,7 @@ CREATE INDEX IF NOT EXISTS voice_index_status_idx ON voice_index(status);
 //
 // Fail-soft: per-file os.Remove failures bump MediaFilesFailed but
 // never abort.
-func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) {
+func pruneOrphans(dbPath, mediaDir, voiceDir, documentsDir string) (*OrphanPruneStats, error) {
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -325,7 +434,7 @@ func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) 
 
 	stats := &OrphanPruneStats{}
 
-	// Pass 1 — DB rows. Loop the four sidecar tables; skip any that
+	// Pass 1 — DB rows. Loop every sidecar table; skip any that
 	// don't exist yet (fresh workspace).
 	type tbl struct {
 		name string
@@ -336,6 +445,8 @@ func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) 
 		{"media_index", &stats.MediaIndexRowsDeleted},
 		{"wa_voice_text", &stats.VoiceRowsDeleted},
 		{"voice_index", &stats.VoiceIndexRowsDeleted},
+		{"wa_document_text", &stats.DocumentTextRowsDeleted},
+		{"document_index", &stats.DocumentIndexRowsDeleted},
 	}
 	for _, t := range tables {
 		has, err := tableExists(db, t.name)
@@ -361,7 +472,7 @@ func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) 
 	// Pass 2 — disk files. Build the "alive" rowid set once
 	// (memory cost ~8 bytes/msg → 800 KB for 100K messages; trivial)
 	// and reuse it across all per-surface walks below.
-	if mediaDir == "" && voiceDir == "" {
+	if mediaDir == "" && voiceDir == "" && documentsDir == "" {
 		return stats, nil
 	}
 	rows, err := db.Query(`SELECT Z_PK FROM ZWAMESSAGE`)
@@ -391,6 +502,13 @@ func pruneOrphans(dbPath, mediaDir, voiceDir string) (*OrphanPruneStats, error) 
 	}
 	if err := pruneOrphanFiles(voiceDir, ".opus", alive,
 		&stats.VoiceFilesDeleted, &stats.VoiceFilesFailed); err != nil {
+		return nil, err
+	}
+	// Documents folder currently only holds PDFs (document-index
+	// scope). Same stem-must-be-pure-int rule means a user-dropped
+	// README.pdf is left alone.
+	if err := pruneOrphanFiles(documentsDir, ".pdf", alive,
+		&stats.DocumentFilesDeleted, &stats.DocumentFilesFailed); err != nil {
 		return nil, err
 	}
 
@@ -472,6 +590,10 @@ func rebuildFTS(db *sql.DB) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("probe wa_document: %w", err)
 	}
+	hasDocText, err := tableExists(db, "wa_document_text")
+	if err != nil {
+		return 0, fmt.Errorf("probe wa_document_text: %w", err)
+	}
 
 	// Build the SELECT list incrementally. Every COALESCE returns
 	// '' when its source is NULL (LEFT JOIN miss), so the final
@@ -497,13 +619,20 @@ func rebuildFTS(db *sql.DB) (int, error) {
 		whereParts = append(whereParts, "v.rowid IS NOT NULL")
 	}
 	if hasDoc {
-		// Documents have no body text — only the filename is
-		// indexable. That's still a huge agent-side win:
-		// "passport.pdf", "Estimate_2021.pdf", etc. all become
-		// matchable via MATCH.
+		// Document filenames are always indexable (no separate
+		// indexer required — views.sql rebuilds wa_document on every
+		// sync). "passport.pdf", "Estimate_2021.pdf", etc. all
+		// become matchable via MATCH.
 		selectParts = append(selectParts, "COALESCE(d.filename, '')")
 		joinParts = append(joinParts, "LEFT JOIN wa_document d ON d.rowid = m.Z_PK")
 		whereParts = append(whereParts, "d.filename IS NOT NULL AND d.filename <> ''")
+	}
+	if hasDocText {
+		// Extracted PDF body text from `whatskept document-index`.
+		// Optional — only present once the user has run the indexer.
+		selectParts = append(selectParts, "COALESCE(dt.text, '')")
+		joinParts = append(joinParts, "LEFT JOIN wa_document_text dt ON dt.rowid = m.Z_PK")
+		whereParts = append(whereParts, "dt.rowid IS NOT NULL AND dt.text <> ''")
 	}
 	// Link preview titles — ZWAMEDIAITEM is always present, so this
 	// branch needs no existence probe.
