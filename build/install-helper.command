@@ -27,7 +27,9 @@
 #      previously granted FDA, the toggle would silently stop working
 #      after an update. Resetting clears the stale entry so the next
 #      backup-list call re-prompts cleanly.
-#   6. Launches the app.
+#   6. Opens the Full Disk Access pane and reveals the app in Finder
+#      so you can drag it into the list. It deliberately does NOT
+#      launch the app — see the note at that step below.
 #
 # Re-run this script after every WhatsKept update. macOS attaches
 # fresh quarantine xattrs to every download, and the cdhash drift
@@ -106,20 +108,36 @@ xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
 echo "Clearing any stale Full Disk Access grant…"
 tccutil reset SystemPolicyAllFiles "$BUNDLE_ID" 2>/dev/null || true
 
-# 6. Launch.
-echo "Launching WhatsKept…"
-open "$DEST"
+# 6. Open the Full Disk Access pane and reveal the app in Finder.
+#
+#    We deliberately do NOT launch the app. The tccutil reset above
+#    voided any prior FDA grant, so a launched process would have no
+#    disk access and would need a quit + reopen the instant the user
+#    granted it — and worse, it would pop to the foreground and cover
+#    the two windows the user actually needs. Instead the user grants
+#    FDA via drag-drop, then double-clicks WhatsKept in the Finder
+#    window we reveal here; that first launch already has access.
+#
+#    Order matters: open the settings pane first, then the Finder
+#    reveal, so Finder ends up foreground — it's the window the user
+#    drags from. Both `open` calls are non-blocking.
+echo "Opening Full Disk Access pane and revealing WhatsKept in Finder…"
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true
+open -R "$DEST" 2>/dev/null || true
 
 echo
 ok "Done. WhatsKept is installed at $DEST"
 echo
-b "First launch:"
-echo "  WhatsKept needs Full Disk Access to read iOS backups under"
-echo "  ~/Library/Application Support/MobileSync/Backup. When the"
-echo "  Backups tab shows the FDA error, click + in System Settings →"
-echo "  Privacy & Security → Full Disk Access, choose"
-echo "  /Applications/WhatsKept.app, toggle it ON, then quit and"
-echo "  reopen WhatsKept."
+b "Grant Full Disk Access, then open WhatsKept:"
+echo "  Two windows just opened for you:"
+echo "    • System Settings → Privacy & Security → Full Disk Access"
+echo "    • Finder, with WhatsKept.app pre-selected in /Applications"
+echo
+echo "  1. Drag WhatsKept.app from the Finder window into the Full Disk"
+echo "     Access list and toggle it ON."
+echo "  2. Double-click WhatsKept in that same Finder window to open it."
+echo "     (We don't launch it for you: the grant only takes effect on a"
+echo "     freshly-started process, so this first launch already has access.)"
 echo
 warn "After every update, re-run this installer. macOS re-quarantines"
 warn "the new download, and the per-build cdhash means the previous"

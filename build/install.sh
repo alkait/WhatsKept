@@ -237,33 +237,34 @@ tccutil reset SystemPolicyAllFiles "$BUNDLE_ID" 2>/dev/null || true
 #      the FDA list, so the user drags from Finder onto the pane and
 #      is done — no clicking +, no navigating to /Applications.
 #
-# The two `open` calls are non-blocking; both windows surface and
-# the script keeps moving.
+# We deliberately do NOT launch the app here. tccutil reset above
+# voided any prior FDA grant, so a launched process would have no
+# disk access and would need a quit + reopen the instant the user
+# granted it — and worse, it would pop to the foreground and cover
+# the two windows the user actually needs. Instead the user grants
+# FDA via drag-drop, then double-clicks WhatsKept in the Finder
+# window we reveal below; that first launch already has access.
+#
+# Order matters: open the settings pane first, then the Finder
+# reveal, so Finder ends up foreground — it's the window the user
+# drags from. Both `open` calls are non-blocking.
 step "Opening Full Disk Access pane and revealing WhatsKept in Finder"
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || true
 open -R "$DEST" 2>/dev/null || true
 
-# ---- launch --------------------------------------------------------------
-
-# Launch the app last so it ends up the foreground window — it's the
-# thing the user actually came to see. Once they grant FDA via the
-# pane we just opened, the app needs to be quit + reopened for the
-# new TCC grant to take effect on the running process; we tell them
-# that in the post-install banner below.
-step "Launching WhatsKept"
-open "$DEST"
-
 echo
 ok "WhatsKept installed at $DEST"
 echo
-printf '%sGrant Full Disk Access:%s\n' "$_BOLD" "$_RESET"
+printf '%sGrant Full Disk Access, then open WhatsKept:%s\n' "$_BOLD" "$_RESET"
 echo "  Two windows just opened for you:"
 echo "    • System Settings → Privacy & Security → Full Disk Access"
 echo "    • Finder, with WhatsKept.app pre-selected in /Applications"
 echo
-echo "  Drag WhatsKept.app from the Finder window into the Full Disk"
-echo "  Access list, toggle it ON, then quit and reopen WhatsKept."
-echo "  (The grant doesn't take effect on an already-running process.)"
+echo "  1. Drag WhatsKept.app from the Finder window into the Full Disk"
+echo "     Access list and toggle it ON."
+echo "  2. Double-click WhatsKept in that same Finder window to open it."
+echo "     (We don't launch it for you: the grant only takes effect on a"
+echo "     freshly-started process, so this first launch already has access.)"
 echo
 echo "  WhatsKept reads iOS backups from"
 echo "    ~/Library/Application Support/MobileSync/Backup"
