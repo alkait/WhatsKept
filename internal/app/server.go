@@ -35,6 +35,8 @@ type server struct {
 	httpServer *http.Server
 	url        string
 
+	version string // build-time version string; "" for unknown
+
 	ws   *workspaceState
 	jobs *jobManager
 	pw   *passwordStore // session-only iOS-backup password cache
@@ -42,7 +44,7 @@ type server struct {
 
 // newServer binds a free localhost TCP port, builds the route table,
 // and returns a server ready to start. Call Start() to begin serving.
-func newServer() (*server, error) {
+func newServer(version string) (*server, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("bind localhost: %w", err)
@@ -52,6 +54,7 @@ func newServer() (*server, error) {
 	s := &server{
 		listener: ln,
 		url:      fmt.Sprintf("http://127.0.0.1:%d/", port),
+		version:  version,
 		ws:       newWorkspaceState(),
 		jobs:     newJobManager(),
 		pw:       newPasswordStore(),
@@ -156,6 +159,16 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// Only DELETE is exposed; reads come back as part of /api/workspace/current
 	// so the UI gets binding and workspace state in one round-trip.
 	mux.HandleFunc("DELETE /api/binding", s.handleForgetBinding)
+
+	// App metadata + self-update. /api/meta is instant (no network) and
+	// gives the UI the running version; /api/update/check contacts the
+	// GitHub Releases API — the only outbound call the app ever makes —
+	// to see if a newer stable tag exists; /api/update/run opens Terminal
+	// running the official installer and lets the UI quit the app.
+	mux.HandleFunc("GET /api/meta", s.handleMeta)
+	mux.HandleFunc("GET /api/update/check", s.handleUpdateCheck)
+	mux.HandleFunc("POST /api/update/run", s.handleUpdateRun)
+	mux.HandleFunc("POST /api/open-url", s.handleOpenURL)
 
 	// Static files (the embedded React UI). Must be registered last so
 	// /api/* takes precedence on the same mux.

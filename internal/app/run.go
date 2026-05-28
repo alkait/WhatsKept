@@ -17,7 +17,11 @@ import (
 // RunOptions are passed by `cmd/whatskept/app.go` to configure the
 // window. Defaults are applied for any zero-value fields.
 type RunOptions struct {
-	Title     string
+	Title string
+	// Version is the build-time version string (e.g. "v0.1.0" or
+	// "0.0.0-dev.12+abc1234"). Surfaced to the UI via /api/meta so the
+	// header can show it and compare against the latest GitHub release.
+	Version   string
 	Width     int
 	Height    int
 	Resizable bool
@@ -38,7 +42,7 @@ func Run(opts RunOptions) error {
 		opts.Height = 700
 	}
 
-	srv, err := newServer()
+	srv, err := newServer(opts.Version)
 	if err != nil {
 		return fmt.Errorf("start server: %w", err)
 	}

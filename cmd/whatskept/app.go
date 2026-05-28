@@ -45,6 +45,7 @@ machine. Closing the window terminates the server.`,
 			// We always render exactly one 'v' regardless of input.
 			return app.Run(app.RunOptions{
 				Title:     "WhatsKept — v" + strings.TrimPrefix(Version, "v"),
+				Version:   Version,
 				Width:     width,
 				Height:    height,
 				Resizable: resizable,

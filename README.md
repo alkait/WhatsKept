@@ -65,10 +65,12 @@ agent-friendly workspace on disk.
   never sends your messages to OpenAI, Anthropic, Google, or anyone
   else. It does not embed a model, does not call an inference API,
   does not "summarize your chats" on its own.
-- **No cloud sync, no account, no telemetry.** The only outbound
-  network request the binary ever makes is a one-time HTTPS download
-  of the whisper model from HuggingFace, and only if you opt into
-  voice transcription.
+- **No cloud sync, no account, no telemetry.** WhatsKept makes only
+  two kinds of outbound request, both to well-known hosts and neither
+  carrying any of your data: a version check against the GitHub
+  Releases API when the app window opens (so it can offer an Update
+  button), and — only if you opt into voice transcription — a one-time
+  HTTPS download of the whisper model from HuggingFace.
 - **No querying for you.** Asking questions like *"what did Alice say
   about the trip?"* is the **agent's** job — you open the workspace
   in Windsurf / VS Code + Copilot / Claude Code / Cursor / etc. and
@@ -216,10 +218,12 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 
 **The good**
 
-- **No telemetry, no analytics, no accounts.** The binary makes no
-  network calls of its own. The GUI's HTTP server binds to
-  `127.0.0.1` only — it is not reachable from other devices on your
-  network.
+- **No telemetry, no analytics, no accounts.** WhatsKept never sends
+  your data anywhere. Its only outbound calls are a version check to
+  GitHub when the window opens and the opt-in whisper-model download
+  (both below); each contacts a well-known host and carries none of
+  your WhatsApp data. The GUI's HTTP server binds to `127.0.0.1`
+  only — it is not reachable from other devices on your network.
 - **All processing is on-device.** Image OCR + classification runs
   through Apple's Vision framework (`whatskept-vision`); voice
   transcription runs through `whisper.cpp` with Metal acceleration.
@@ -229,10 +233,17 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   process memory for the lifetime of the app session, and cleared
   when you switch workspaces or quit. Not written anywhere by
   WhatsKept on its own.
-- **One opt-in network call, ever.** The first time you run voice
+- **Whisper model: one opt-in download.** The first time you run voice
   transcription, the ~574 MB whisper model is downloaded from
-  HuggingFace over HTTPS and SHA-256 verified. After that, the app
-  is fully offline.
+  HuggingFace over HTTPS and SHA-256 verified. After that, that
+  feature is fully offline.
+- **Update check on launch.** When the app window opens it asks the
+  GitHub Releases API whether a newer version exists, so it can show
+  the **Update** button in the header. It's a single unauthenticated
+  `GET` to `api.github.com` — no account, no identifiers, none of your
+  data. If GitHub is unreachable the app stays quiet and works normally
+  offline. Clicking Update re-runs the official `install.sh` in
+  Terminal (the same command in the install instructions above).
 
 **What to be cautious about**
 
