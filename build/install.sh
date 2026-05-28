@@ -112,9 +112,12 @@ SUMS_PATH="$TMP/SHA256SUMS"
 #
 # Anonymous API calls are rate-limited to 60/hour per IP, which is
 # orders of magnitude more than this script needs. We parse JSON
-# with awk so jq isn't required on the user's machine — there's
-# exactly one "tag_name" field at the top of the response and we
-# stop after the first match.
+# without jq (not guaranteed on the user's machine): grep -o pulls out
+# just the `"tag_name": "vX.Y.Z"` pair, then sed peels off the value.
+# This is layout-independent — the GitHub API returns the whole release
+# object as a single minified line, so anything that keys off newlines
+# (e.g. awk one-field-per-line) would mis-parse it and grab a different
+# quoted token entirely.
 if [[ -n "${WHATSKEPT_ZIP_URL:-}" ]]; then
   # Caller pinned a specific URL — honour it and skip tag resolution.
   ZIP_URL="$WHATSKEPT_ZIP_URL"
@@ -125,7 +128,9 @@ else
   TAG="$(curl -fsL --retry 2 \
     -H 'Accept: application/vnd.github+json' \
     "https://api.github.com/repos/${REPO}/releases/latest" \
-    | awk -F'"' '/"tag_name":/ {print $4; exit}')" \
+    | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | head -1 \
+    | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')" \
     || die "could not reach api.github.com to resolve latest release"
   if [[ -z "$TAG" || "$TAG" == "latest" ]]; then
     die "could not parse latest release tag from GitHub API response"
