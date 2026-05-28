@@ -170,6 +170,9 @@ func detectCLIAgent(name string) (bool, string) {
 			filepath.Join(home, ".npm-global", "bin", name),
 			filepath.Join(home, ".local", "bin", name),
 			filepath.Join(home, ".volta", "bin", name),
+			filepath.Join(home, ".bun", "bin", name),   // `bun install -g …` (e.g. opencode-ai)
+			filepath.Join(home, ".deno", "bin", name),  // `deno install …`
+			filepath.Join(home, ".cargo", "bin", name), // `cargo install …`
 		)
 	}
 	candidates = append(candidates,
@@ -290,10 +293,34 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 		// run the binary. We use AppleScript instead of `open -a Terminal`
 		// because we need to chain `cd <workspace> && exec <binary>` —
 		// `open -a` only opens the directory, it doesn't run a command.
+		//
+		// Cold-launch quirk: if Terminal isn't already running, the `tell`
+		// block launches it, and Terminal honours its "On startup, open:
+		// New window with default profile" preference (the macOS default)
+		// by opening an empty window. A subsequent bare `do script` then
+		// opens a *second* window for the agent, leaving the first one
+		// empty and confusing. We work around this by reusing window 1
+		// when we detect a cold launch — that's the default-profile
+		// window Terminal just opened for us. If the user has set
+		// startup-open to "No window", we fall back to a plain `do script`.
 		shellCmd := fmt.Sprintf("cd %s && clear && exec %s", shellQuote(target), shellQuote(resolved))
+		quoted := appleScriptQuote(shellCmd)
 		ascript := "tell application \"Terminal\"\n" +
+			"set wasRunning to running\n" +
 			"activate\n" +
-			"do script " + appleScriptQuote(shellCmd) + "\n" +
+			"if wasRunning then\n" +
+			"do script " + quoted + "\n" +
+			"else\n" +
+			"repeat 20 times\n" +
+			"if (count of windows) > 0 then exit repeat\n" +
+			"delay 0.05\n" +
+			"end repeat\n" +
+			"if (count of windows) > 0 then\n" +
+			"do script " + quoted + " in window 1\n" +
+			"else\n" +
+			"do script " + quoted + "\n" +
+			"end if\n" +
+			"end if\n" +
 			"end tell"
 		cmd = exec.Command("/usr/bin/osascript", "-e", ascript)
 	}
