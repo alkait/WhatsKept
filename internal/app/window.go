@@ -60,6 +60,20 @@ func runWindow(opts windowOptions, pickFolder pickFolderFunc) error {
 		}
 	}
 
+	// Cmd+Q shim: webview_go does not install an NSApplication main
+	// menu, so macOS has no menu item to dispatch ⌘Q to and the
+	// keystroke is silently swallowed. We work around that by listening
+	// for ⌘Q in the React app (see web/index.html) and calling this
+	// bound function to request a clean shutdown. w.Terminate() makes
+	// w.Run() return below, after which Run() in run.go does the
+	// graceful HTTP-server shutdown — same path as closing the window
+	// with the red dot, so no on-close cleanup is skipped.
+	if err := w.Bind("_wkpQuit", func() {
+		w.Terminate()
+	}); err != nil {
+		return fmt.Errorf("bind quit: %w", err)
+	}
+
 	w.Navigate(opts.URL)
 	w.Run() // blocks
 	return nil

@@ -37,6 +37,28 @@
       },
     },
   };
+
+  // Cmd+Q shim. webview_go doesn't install an NSApplication main menu,
+  // so macOS has no menu item to dispatch ⌘Q to and the keystroke is
+  // silently swallowed. We listen for it here and call the bound
+  // _wkpQuit, which signals webview_go to stop the run loop and lets
+  // the Go side run its graceful HTTP-server shutdown — same path as
+  // closing the window with the red dot.
+  //
+  // Captures on keydown (not keyup) so the user gets the same instant
+  // feedback they expect from a native ⌘Q. preventDefault stops WebKit
+  // from beeping at us. Only fires for the actual modifier (metaKey on
+  // macOS, ctrlKey elsewhere) — KeyQ matches the physical key so it
+  // works regardless of keyboard layout.
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "KeyQ") return;
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if (e.shiftKey || e.altKey) return;
+    e.preventDefault();
+    if (typeof window._wkpQuit === "function") {
+      try { window._wkpQuit(); } catch (_) {}
+    }
+  }, true);
 </script>
 
 <script type="text/babel">
