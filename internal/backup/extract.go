@@ -65,8 +65,33 @@ func (b *Bundle) Records() []Record { return b.mb.Records }
 
 // FileReader returns a streaming reader for the decrypted contents of a
 // single file record. Caller must Close.
+//
+// Absorbs a quirk of the upstream `dunhamsteve/ios` library: when a
+// file's decrypted payload fits in a single ~4 KB cipher block (small
+// avatar thumbnails, short voice notes, tiny PDFs), `mb.FileReader`
+// returns `(reader, io.EOF)` — the reader is non-nil and `io.ReadAll`
+// yields the full, valid content; the EOF just signals "stream is
+// already exhausted". We flatten that to `(reader, nil)` here so
+// every caller can use the standard idiom
+//
+//	rd, err := b.FileReader(rec)
+//	if err != nil { ... }
+//	defer rd.Close()
+//	data, err := io.ReadAll(rd)
+//
+// without losing valid data. Genuine errors (blob missing on disk,
+// bad keybag, short read of IV, AES padding failure) surface as
+// `*os.PathError` or named library errors and are unaffected.
+//
+// Without this absorption ~96% of `.thumb` profile pictures and any
+// chat media / voice / docs that decrypt to <~4 KB are silently
+// dropped — see `tmp/inspect-profile-paths/main.go`.
 func (b *Bundle) FileReader(rec Record) (io.ReadCloser, error) {
-	return b.mb.FileReader(rec)
+	rd, err := b.mb.FileReader(rec)
+	if rd != nil && errors.Is(err, io.EOF) {
+		return rd, nil
+	}
+	return rd, err
 }
 
 // ExtractChatStorage decrypts WhatsApp's ChatStorage.sqlite from the iOS
@@ -104,7 +129,7 @@ func ExtractChatStorageFrom(b *Bundle, outPath string) (int64, error) {
 		return 0, fmt.Errorf("mkdir: %w", err)
 	}
 
-	rd, err := b.mb.FileReader(*rec)
+	rd, err := b.FileReader(*rec)
 	if err != nil {
 		return 0, fmt.Errorf("file reader: %w", err)
 	}
