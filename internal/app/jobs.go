@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/creack/pty"
 	"github.com/google/uuid"
 )
 
@@ -274,17 +275,24 @@ func (m *jobManager) startBackup(udid string, network bool, password, backupRoot
 		cmd.Env = append(cmd.Env, "BACKUP_PASSWORD="+password)
 	}
 
-	stdout, err := cmd.StdoutPipe()
+	// Run idevicebackup2 under a PTY rather than wiring its stdout to
+	// a raw pipe. The reason is a libc stdio buffering trap: when a
+	// child's stdout is a non-TTY (a pipe is non-TTY), libc switches
+	// stdout to *block*-buffered (4 KiB). For an incremental backup
+	// where only a few hundred bytes of newline-terminated status
+	// flow in the initial phase before the receive phase falls into
+	// pure '\r' progress redraws, those initial lines stay stuck in
+	// the child's stdio buffer for the entire run — the UI then sees
+	// zero line events and the "show log" toggle never appears until
+	// the process exits and fflushes everything in one burst.
+	//
+	// Giving the child a controlling terminal keeps stdout *line*-
+	// buffered, so each '\n' flushes immediately and pumpLines emits
+	// one event per line in real time. stderr is automatically merged
+	// onto the same PTY by pty.Start, replacing the old manual
+	// `cmd.Stderr = cmd.Stdout` plumbing.
+	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		cancel()
-		return "", fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = cmd.Stdout // merge into one stream
-	// Reassign because StderrPipe() and assigning Stderr at the same
-	// time conflicts; we want the merged stream so set both to the
-	// same os.File-equivalent. Redo carefully.
-
-	if err := cmd.Start(); err != nil {
 		cancel()
 		return "", fmt.Errorf("start idevicebackup2: %w", err)
 	}
@@ -297,7 +305,7 @@ func (m *jobManager) startBackup(udid string, network bool, password, backupRoot
 	}
 	m.put(j)
 
-	go m.pumpProcess(j, cmd, stdout, cancel, onDone)
+	go m.pumpProcess(j, cmd, ptmx, cancel, onDone)
 	return j.id, nil
 }
 
@@ -305,6 +313,74 @@ func (m *jobManager) startBackup(udid string, network bool, password, backupRoot
 // be tested without dragging in the helpers package's filesystem
 // side-effects.
 type helperCommandFunc func(ctx context.Context, tool string, args ...string) (*exec.Cmd, error)
+
+// pumpLines reads `output` and emits one "line" jobEvent per newline-
+// terminated line (and one final event at EOF for any trailing data).
+//
+// idevicebackup2 redraws its per-file progress bar in place using
+// carriage returns ('\r') rather than newlines. We *must* keep
+// reading those bytes (otherwise the child's stdout pipe fills up
+// and the backup deadlocks), but we *must not* surface each redraw
+// as its own log line — at thousands per second they would flood
+// the SSE history and freeze the React UI (the "show log" toggle
+// stops responding to clicks). So we consume '\r'-terminated
+// segments without emitting, keeping the same observable line
+// stream the original ScanLines-based implementation produced
+// while also fixing the original "bufio.Scanner: token too long"
+// stall caused by an unbounded buffered token.
+//
+// `maxLine` caps the accumulator so a pathological upstream emitting
+// neither '\n' nor '\r' can't OOM us; once full, excess bytes are
+// dropped until the next terminator.
+func pumpLines(output io.Reader, maxLine int, emit func(string)) error {
+	br := bufio.NewReaderSize(output, 64*1024)
+	buf := make([]byte, 0, 4096)
+	flushLine := func() {
+		// Strip a trailing '\r' so a CRLF stream doesn't leave one
+		// dangling on each emitted line.
+		s := buf
+		if len(s) > 0 && s[len(s)-1] == '\r' {
+			s = s[:len(s)-1]
+		}
+		emit(string(s))
+		buf = buf[:0]
+	}
+	for {
+		b, err := br.ReadByte()
+		if err != nil {
+			if len(buf) > 0 {
+				flushLine()
+			}
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		switch b {
+		case '\n':
+			flushLine()
+		case '\r':
+			// Distinguish CRLF (a line terminator) from a bare
+			// '\r' (a progress redraw). Peek one byte ahead: if
+			// the next byte is '\n', the pair is one terminator
+			// and we emit the accumulated buffer once; otherwise
+			// '\r' is a redraw separator and we drop the buffer.
+			next, perr := br.Peek(1)
+			if perr == nil && len(next) > 0 && next[0] == '\n' {
+				_, _ = br.ReadByte() // consume the '\n'
+				flushLine()
+			} else {
+				buf = buf[:0]
+			}
+		default:
+			if len(buf) < maxLine {
+				buf = append(buf, b)
+			}
+			// else: silently truncate. We still consume the byte
+			// so the pipe drains.
+		}
+	}
+}
 
 // pumpProcess scans the merged stdout/stderr pipe line by line,
 // emitting "line" events, then waits for the process and emits "done".
@@ -315,13 +391,17 @@ func (m *jobManager) pumpProcess(j *job, cmd *exec.Cmd, output io.ReadCloser, ca
 	defer cancel()
 	defer output.Close()
 
-	sc := bufio.NewScanner(output)
-	sc.Buffer(make([]byte, 0, 1024), 1024*1024) // tolerate long lines
-	for sc.Scan() {
-		j.emit(jobEvent{Type: "line", Data: sc.Text()})
-	}
-	if err := sc.Err(); err != nil && !errors.Is(err, io.EOF) {
-		j.emit(jobEvent{Type: "line", Data: "[scan error] " + err.Error()})
+	if err := pumpLines(output, 1024*1024, func(line string) {
+		j.emit(jobEvent{Type: "line", Data: line})
+	}); err != nil && !errors.Is(err, syscall.EIO) {
+		// syscall.EIO from a PTY master read is the normal "slave end
+		// closed because child exited" signal on macOS — it is not a
+		// real error, so we filter it out to avoid emitting a noisy
+		// "[read error]" line on every successful backup.
+		j.emit(jobEvent{Type: "line", Data: "[read error] " + err.Error()})
+		// Defensive: ensure the stream is fully drained so the child
+		// can't block on a full stdout buffer while we Wait() below.
+		_, _ = io.Copy(io.Discard, output)
 	}
 
 	werr := cmd.Wait()

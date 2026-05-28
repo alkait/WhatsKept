@@ -1,4 +1,6 @@
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
+github.com/creack/pty v1.1.24 h1:bJrF4RRfyJnbTJqzRLHzcGaZK1NeM5kTC9jGgovnR1s=
+github.com/creack/pty v1.1.24/go.mod h1:08sCNb52WyoAwi2QDyzUCTgcvVFhUzewun7wtTfvcwE=
 github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9 h1:y/vHUusS1xEnKGrmLRlxapfUG5jNS/OBIwY4d9tQ7a8=
 github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9/go.mod h1:B4yeke0t54lzvHGLMoQaHjweT8Yt0DgES3WrZGuRTzk=
 github.com/dunhamsteve/plist v0.0.0-20211213035615-a528b51ff82f h1:isN+gnW3pKSwhwGiENPfVy960FJ3uOI2K+x4X3r57AE=

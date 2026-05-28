@@ -3,6 +3,7 @@ module whatskept
 go 1.22.1
 
 require (
+	github.com/creack/pty v1.1.24
 	github.com/dunhamsteve/ios v0.0.0-20221226180243-59e6dc4fa1a9
 	github.com/google/uuid v1.6.0
 	github.com/mattn/go-sqlite3 v1.14.15
