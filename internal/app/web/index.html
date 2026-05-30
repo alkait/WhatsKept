@@ -962,7 +962,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, voiceJob, modelJob, documentJob, onSync, onMediaIndex, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJob, modelJob, documentJob, onSync, onMediaIndex, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -1107,13 +1107,25 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, voiceJob, modelJ
       </p>
     </section>
 
-    <MediaIndexCard
-      dbStatus={dbStatus}
-      job={mediaJob}
-      onMediaIndex={onMediaIndex}
-      hasSessionPassword={hasSessionPassword}
-      reloadDbStatus={reloadDbStatus}
-    />
+    <section className="mt-6">
+      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Image enrichment</h2>
+      <div className="rounded-xl bg-white border overflow-hidden" style={{borderColor:'#DCF8C6'}}>
+        <MediaIndexCard
+          dbStatus={dbStatus}
+          job={mediaJob}
+          onMediaIndex={onMediaIndex}
+          hasSessionPassword={hasSessionPassword}
+          reloadDbStatus={reloadDbStatus}
+        />
+        <CloudDescribeCard
+          dbStatus={dbStatus}
+          job={cloudJob}
+          onMediaDescribe={onMediaDescribe}
+          hasSessionPassword={hasSessionPassword}
+          reloadDbStatus={reloadDbStatus}
+        />
+      </div>
+    </section>
 
     <VoiceIndexCard
       dbStatus={dbStatus}
@@ -1156,6 +1168,9 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, voiceJob, modelJ
 function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloadDbStatus }) {
   const [prompting, setPrompting] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [pendingForce, setPendingForce] = useState(false);
   const j = job || {};
   const isRunning = !!j.running;
   const hasDone   = j.done !== undefined && j.done !== null;
@@ -1173,8 +1188,13 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
   const hasDB    = !!dbStatus.db_exists;
   const total    = dbStatus.image_total ?? null;
   const indexed  = dbStatus.image_described ?? 0;
-  const remaining = total != null ? Math.max(total - indexed, 0) : null;
-  const allDone   = total != null && total > 0 && indexed >= total;
+  const missing  = dbStatus.image_missing ?? 0;
+  // Missing files (referenced but not in the backup) can't be indexed,
+  // so measure completion against the *describable* set — otherwise the
+  // card is stuck on "N remaining / Resume" forever.
+  const describable = total != null ? Math.max(total - missing, 0) : null;
+  const remaining = describable != null ? Math.max(describable - indexed, 0) : null;
+  const allDone   = describable != null && describable > 0 && indexed >= describable;
 
   let title, subtitle, buttonLabel, buttonPrimary, statusDot;
   if (!hasDB) {
@@ -1191,7 +1211,12 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
     statusDot     = "#9ca3af";
   } else if (allDone) {
     title         = "All images indexed";
-    subtitle      = `${indexed.toLocaleString()} of ${total.toLocaleString()} images have OCR text + classification labels in wa_image_text.`;
+    subtitle      = (
+      <span>
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} indexed</button>
+        {missing > 0 && <> · <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{missing.toLocaleString()} not in backup</button></>}
+      </span>
+    );
     buttonLabel   = "Re-scan images";
     buttonPrimary = false;
     statusDot     = "#25D366";
@@ -1205,28 +1230,45 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
     statusDot     = "#f59e0b";
   } else {
     title         = "Resume image indexing";
-    subtitle      = `${indexed.toLocaleString()} / ${total.toLocaleString()} indexed · ${remaining.toLocaleString()} remaining.`;
+    subtitle      = (
+      <span>
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} indexed</button>
+        {" · "}
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{remaining.toLocaleString()} remaining</button>
+        {missing > 0 && <> · <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{missing.toLocaleString()} not in backup</button></>}.
+      </span>
+    );
     buttonLabel   = "Resume";
     buttonPrimary = true;
     statusDot     = "#f59e0b";
   }
+  buttonLabel = "Re-describe images"; // unified across both engines
 
-  const pct = (total != null && total > 0)
-    ? Math.min(100, Math.round((indexed / total) * 100))
+  const pct = (describable != null && describable > 0)
+    ? Math.min(100, Math.round((indexed / describable) * 100))
     : 0;
 
+  // run flow: password gate (if not cached) → start. `force` re-scans
+  // everything with Apple Vision, overwriting existing rows.
+  const run = (force) => {
+    if (hasSessionPassword) onMediaIndex("", { force });
+    else { setPendingForce(force); setPrompting(true); }
+  };
+  // The button: when everything's already enriched, the only action is
+  // a full Apple re-scan — which overwrites other enrichment (incl.
+  // paid cloud descriptions), so confirm first. Otherwise just run.
   const launch = () => {
-    if (hasSessionPassword) onMediaIndex("");
-    else setPrompting(true);
+    if (allDone) { setShowConfirm(true); return; }
+    run(false);
   };
 
   const buttonDisabled = isRunning || !hasDB || total === 0;
 
   return (
-    <section className="mt-6">
-      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Image OCR</h2>
+    <div className="p-5">
+      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">Apple Vision · local</h3>
+      <p className="text-[11px] text-gray-400 mb-3">Reads any text and tags what's in each photo, right on your Mac — free and private.</p>
 
-      <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -1327,28 +1369,450 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
         )}
 
         {hasDone && j.done === true && !isRunning && (
-          <p className="text-xs text-gray-500 mt-3">✓ Indexing complete. Agent queries can now MATCH on image content.</p>
+          <p className="text-xs text-gray-500 mt-3">✓ Done. Your images are now searchable by their text and contents.</p>
         )}
-      </div>
-
-      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
-        Decrypts each WhatsApp image from the iOS backup to <code>./media/&lt;rowid&gt;.jpg</code>, then runs
-        Apple Vision (OCR + classification) and stores results in <code>wa_image_text</code>. Resumable: cancel
-        anytime and re-run to pick up where you left off. Orphan JPEGs from deleted messages are pruned on the
-        next message sync, so this folder mirrors device state.
-      </p>
 
       {prompting && (
         <PasswordPromptModal
           device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onMediaIndex(pw); }}
+          onConfirm={pw => { setPrompting(false); onMediaIndex(pw, { force: pendingForce }); }}
           onCancel={() => setPrompting(false)}
           confirmLabel="Sync images"
         />
       )}
 
+      {showConfirm && (
+        <ConfirmModal
+          title="Re-scan with Apple Vision?"
+          body={`This re-runs on-device Apple Vision over all ${describable.toLocaleString()} describable images and OVERWRITES their current enrichment — including any AI (cloud) descriptions you've already paid for. Apple Vision is free and private but more basic. Only do this if you want to revert to on-device results.`}
+          confirmLabel="Re-scan & overwrite"
+          onConfirm={() => { setShowConfirm(false); run(true); }}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+
       {showIssues && <MediaIssuesModal onClose={() => setShowIssues(false)} />}
-    </section>
+      {showInfo && <ImageOcrTermsModal onClose={() => setShowInfo(false)} />}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CloudDescribeCard — "Cloud descriptions" section under Image OCR
+// ═══════════════════════════════════════════════════════════════════════════
+// Opt-in cloud describer (OpenRouter). Needs (1) a session API key —
+// prompted via OpenRouterKeyModal, held in RAM by the server, never on
+// disk — and (2) the backup password (reused from the session like the
+// other indexers). Shows coverage (cloud vs on-device), a cost estimate,
+// and a live cost meter while running.
+const CLOUD_COST_PER_IMAGE = 0.0002; // measured ~$ / image, for estimates
+
+function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword, reloadDbStatus }) {
+  const [status, setStatus]       = useState(null);
+  const [showKey, setShowKey]     = useState(false);
+  const [prompting, setPrompting] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [pendingForce, setPendingForce] = useState(false);
+  const CONCURRENCY = 48; // fixed — empirically the fast, stable operating point
+
+  const j = job || {};
+  const isRunning = !!j.running;
+  const hasDone   = j.done !== undefined && j.done !== null;
+  const progress  = j.progress || null;
+
+  const reloadStatus = () =>
+    api.get("/api/database/media-describe/status").then(setStatus).catch(() => {});
+  useEffect(() => { reloadStatus(); }, []);
+  useEffect(() => {
+    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasDone, j.done]);
+
+  if (!dbStatus) return null;
+  const hasDB      = !!dbStatus.db_exists;
+  const total      = (status && status.total_images) || 0;
+  const described  = (status && status.described) || 0;
+  const cloudCount = (status && status.cloud_count) || 0;
+  const appleCount = (status && status.apple_count) || 0;
+  const hasKey     = !!(status && status.has_key);
+  const model      = (status && status.default_model) || "";
+
+  const missing = (status && status.missing) || 0;
+  // Images that CAN be described = total minus those absent from the
+  // backup (no file → undescribable). "done" and coverage are measured
+  // against this, so the 100%/done state is actually reachable.
+  const describable = Math.max(total - missing, 0);
+  const toProcess = Math.max(describable - cloudCount, 0); // still need cloud
+  const estCost = toProcess * CLOUD_COST_PER_IMAGE;
+  const coveragePct = describable > 0 ? Math.min(100, Math.round((cloudCount / describable) * 100)) : 0;
+  const allDone = cloudCount >= describable && describable > 0;
+
+  // The run flow chains through up-to-three just-in-time gates:
+  // confirm (force only) → API key (if none) → backup password (if not
+  // cached) → start. `force` re-describes everything (overwriting cloud
+  // rows); it's carried through the gates via pendingForce.
+  const proceed = (force) => {
+    if (hasSessionPassword) onMediaDescribe("", { model: "", concurrency: CONCURRENCY, force });
+    else { setPendingForce(force); setPrompting(true); }
+  };
+  const beginRun = (force) => {
+    if (!hasKey) { setPendingForce(force); setShowKey(true); return; }
+    proceed(force);
+  };
+  // launch is the single button action. When everything's already
+  // described, the only meaningful action is a full re-describe — which
+  // costs money, so it goes through a confirmation first.
+  const launch = () => {
+    if (allDone) { setShowConfirm(true); return; }
+    beginRun(false);
+  };
+
+  const stop = async () => {
+    if (!j.jobId) return;
+    setStopping(true);
+    try { await api.del(`/api/jobs/${j.jobId}`); } catch {}
+  };
+
+  const forgetKey = async () => {
+    try { await api.del("/api/session/openrouter-key"); } catch {}
+    reloadStatus();
+  };
+
+  // Reset the optimistic "stopping" flag once the run actually ends.
+  useEffect(() => { if (!isRunning) setStopping(false); }, [isRunning]);
+
+  let statusDot = "#9ca3af", title, subtitle, buttonLabel, buttonPrimary = true, buttonDisabled = isRunning;
+  if (!hasDB) {
+    title = "Run a messages sync first";
+    subtitle = "Cloud descriptions read the message database — sync that above first.";
+    buttonLabel = "Describe with cloud"; buttonPrimary = false; buttonDisabled = true;
+  } else if (total === 0) {
+    title = "No image messages on device";
+    subtitle = "There's nothing to describe."; buttonLabel = "Describe with cloud";
+    buttonPrimary = false; buttonDisabled = true;
+  } else {
+    // Always surface coverage — independent of whether a key is loaded
+    // this session (the key is just the action; the status is real).
+    const term = (n, label) => (
+      <button onClick={() => setShowInfo(true)}
+        className="underline decoration-dotted hover:text-gray-700">{n.toLocaleString()} {label}</button>
+    );
+    subtitle = (
+      <span>
+        {term(cloudCount, "described")} · {term(toProcess, "remaining")}
+        {missing > 0 && <> · {term(missing, "not in backup")}</>}
+        {" · "}Model: {model}.
+      </span>
+    );
+    if (allDone)          { statusDot = "#25D366"; title = "All available images described in the cloud"; }
+    else if (cloudCount)  { statusDot = "#25D366"; title = "Cloud descriptions partially done"; }
+    else                  { statusDot = "#f59e0b"; title = "Not yet described with cloud"; }
+
+    if (allDone) { buttonPrimary = false; }
+    else         { buttonPrimary = true; }
+    buttonLabel = "Re-describe images"; // unified across both engines
+  }
+
+  // While running, the status snapshot above is stale — show live
+  // cumulative coverage in the subtitle so it agrees with the bar.
+  if (isRunning && progress) {
+    const liveCloud = (progress.baseline || 0) + (progress.described || 0);
+    title = "Cloud descriptions in progress";
+    subtitle = `${liveCloud.toLocaleString()} of ${(progress.total || total).toLocaleString()} described in cloud. Model: ${model || (status && status.default_model) || ""}.`;
+  }
+
+  return (
+    <div className="p-5 border-t" style={{borderColor:'#DCF8C6'}}>
+      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">AI image descriptions · cloud</h3>
+      <p className="text-[11px] text-gray-400 mb-3">Sends each photo to a cloud AI for a fuller description and more accurate text reading, in any language. Costs a little per image.</p>
+
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
+              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+            </div>
+            <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+
+            {/* Static cloud-coverage bar — always shown (independent of
+                key) so opening the app reflects real progress. */}
+            {hasDB && total > 0 && !isRunning && (
+              <div className="mt-3">
+                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
+                </div>
+                <p className="text-[10px] text-gray-400 mt-1">{coveragePct}% described in cloud</p>
+              </div>
+            )}
+
+            {hasKey && hasDB && total > 0 && !isRunning && (
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-400">
+                  Upgrades all on-device images to cloud and retries any failures automatically.
+                  {toProcess > 0 && <> {toProcess.toLocaleString()} image{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
+                  <span className="mx-1.5">·</span>
+                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">use a different key</button>
+                </p>
+              </div>
+            )}
+          </div>
+
+          {isRunning ? (
+            <button onClick={stop} disabled={stopping || !j.jobId}
+              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background: '#b91c1c'}}>
+              {stopping ? "Stopping…" : "Stop"}
+            </button>
+          ) : (
+            <button onClick={launch} disabled={buttonDisabled}
+              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
+              <RefreshIcon />
+              {buttonLabel}
+            </button>
+          )}
+        </div>
+
+        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
+
+        {isRunning && (
+          <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
+            {progress ? (() => {
+              // Cumulative cloud coverage = already-cloud at run start
+              // (baseline) + described this run, over all images on device.
+              const cloudTotal = (progress.baseline || 0) + (progress.described || 0);
+              const grandTotal = progress.total || 0;
+              const pct = grandTotal > 0 ? Math.min(100, Math.round((cloudTotal / grandTotal) * 100)) : 0;
+              return (
+              <>
+                <div className="flex items-baseline justify-between text-xs mb-2">
+                  <span className="font-semibold text-gray-900">
+                    {cloudTotal.toLocaleString()} / {grandTotal.toLocaleString()} described in cloud
+                  </span>
+                  <span className="text-gray-500">
+                    {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)}/s` : ""}
+                    {progress.eta_seconds > 0 ? ` · ETA ${fmtEta(progress.eta_seconds)}` : ""}
+                  </span>
+                </div>
+                <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
+                  <div className="h-full rounded-full transition-all duration-500" style={{
+                    width: `${pct}%`,
+                    background:'#25D366',
+                  }}></div>
+                </div>
+                <div className="grid grid-cols-4 gap-2 mt-3 text-[11px] text-gray-600">
+                  <div title="Described this run (this session).">
+                    <span className="font-semibold text-gray-900">{(progress.described||0).toLocaleString()}</span> this run
+                  </div>
+                  <div title="Images where the model transcribed readable text (OCR).">
+                    <span className="font-semibold text-gray-900">{progress.with_ocr.toLocaleString()}</span> with OCR
+                  </div>
+                  <div title="Spend so far this run, reported by OpenRouter.">
+                    <span className="font-semibold text-gray-900">${(progress.cost_usd||0).toFixed(4)}</span> spent
+                  </div>
+                  <div title="Images that failed this run (auto-retried next run; almost always transient).">
+                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
+                  </div>
+                </div>
+              </>
+              );
+            })() : (
+              <p className="text-xs text-gray-500">Preparing…</p>
+            )}
+            {j.lines && j.lines.length > 0 && (
+              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
+                {j.lines[j.lines.length - 1]}
+              </p>
+            )}
+          </div>
+        )}
+
+        {hasDone && j.done === true && !isRunning && (
+          <p className="text-xs text-gray-500 mt-3">✓ Done. Your images are now searchable by their descriptions.</p>
+        )}
+
+      {showKey && (
+        <OpenRouterKeyModal
+          onClose={() => setShowKey(false)}
+          onSaved={() => { setShowKey(false); reloadStatus(); proceed(pendingForce); }}
+        />
+      )}
+
+      {prompting && (
+        <PasswordPromptModal
+          device={{ name: "the latest iPhone backup" }}
+          onConfirm={pw => { setPrompting(false); onMediaDescribe(pw, { model: "", concurrency: CONCURRENCY, force: pendingForce }); }}
+          onCancel={() => setPrompting(false)}
+          confirmLabel="Describe with cloud"
+        />
+      )}
+
+      {showConfirm && (
+        <ConfirmModal
+          title="Re-describe all images?"
+          body={`This re-runs the model on all ${describable.toLocaleString()} describable images, overwriting the existing cloud descriptions — useful after improving the prompt or switching models. Estimated cost ≈ $${(describable * CLOUD_COST_PER_IMAGE).toFixed(2)}.`}
+          confirmLabel="Re-describe all"
+          onConfirm={() => { setShowConfirm(false); beginRun(true); }}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+
+      {showInfo && <CloudTermsModal onClose={() => setShowInfo(false)} />}
+    </div>
+  );
+}
+
+// ConfirmModal — generic confirm/cancel dialog (used for the costly
+// "re-describe all" action).
+function ConfirmModal({ title, body, confirmLabel = "Confirm", onConfirm, onCancel }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onCancel}>
+      <div className="w-[420px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}} onClick={e => e.stopPropagation()}>
+        <h2 className="text-base font-semibold text-gray-900 mb-2">{title}</h2>
+        <p className="text-xs text-gray-600 mb-4 leading-relaxed">{body}</p>
+        <div className="flex gap-2">
+          <button onClick={onCancel}
+            className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">
+            Cancel
+          </button>
+          <button onClick={onConfirm}
+            className="flex-1 rounded-lg text-white px-4 py-2 text-sm font-semibold" style={{background:'#075E54'}}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ImageOcrTermsModal — explains the coverage terms on the Image OCR card.
+function ImageOcrTermsModal({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-[440px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}} onClick={e => e.stopPropagation()}>
+        <h2 className="text-base font-semibold text-gray-900 mb-3">What these mean</h2>
+        <dl className="space-y-3 text-sm">
+          <div>
+            <dt className="font-semibold text-gray-900">indexed</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images Apple Vision has processed on-device — OCR text + classification labels stored in <code>wa_image_text</code> and searchable. Free and private (nothing leaves your Mac).</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-gray-900">remaining</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images not yet indexed. Click Resume to process them; it picks up where it left off.</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-gray-900">not in backup</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images referenced in chats whose file was never downloaded to this phone, so there's nothing to index. They can't be processed and are excluded from "done" (see "View issues").</dd>
+          </div>
+        </dl>
+        <button onClick={onClose}
+          className="mt-5 w-full rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{background:'#128C7E'}}>
+          Got it
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// CloudTermsModal — explains the three coverage terms shown on the card.
+function CloudTermsModal({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-[440px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}} onClick={e => e.stopPropagation()}>
+        <h2 className="text-base font-semibold text-gray-900 mb-3">What these mean</h2>
+        <dl className="space-y-3 text-sm">
+          <div>
+            <dt className="font-semibold text-gray-900">described</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images a cloud vision model has processed — each gets a short summary plus a verbatim transcription of any text, stored in <code>wa_image_text</code> and searchable.</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-gray-900">remaining</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images not yet described in the cloud. They may already have a basic on-device (Apple Vision) description; the cloud run upgrades them and re-tries any that previously failed.</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-gray-900">not in backup</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images referenced in chats whose file was never downloaded to this phone, so there's nothing to describe. They can't be processed and are excluded from "done".</dd>
+          </div>
+        </dl>
+        <button onClick={onClose}
+          className="mt-5 w-full rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{background:'#128C7E'}}>
+          Got it
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// OpenRouterKeyModal — paste + validate an OpenRouter API key. On save
+// the server validates it (token-free auth check) and caches it for the
+// session; we never persist it client-side.
+function OpenRouterKeyModal({ onClose, onSaved }) {
+  const [key, setKey]   = useState("");
+  const [show, setShow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr]   = useState("");
+  const inputRef = useRef(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const save = async () => {
+    if (!key.trim() || busy) return;
+    setBusy(true); setErr("");
+    try {
+      await api.post("/api/session/openrouter-key", { key: key.trim() });
+      onSaved();
+      onClose();
+    } catch (ex) {
+      setErr(ex.message || "Could not validate key");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="w-[420px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
+        <h2 className="text-base font-semibold text-gray-900 mb-1">OpenRouter API key</h2>
+        <p className="text-xs text-gray-500 mb-4">
+          Paste your key (starts with <code>sk-or-</code>). It's validated now and kept only for this app
+          session — never written to disk. Get one at <span className="font-medium text-gray-700">openrouter.ai/keys</span>.
+        </p>
+        <div className="relative mb-3">
+          <input ref={inputRef} type={show ? "text" : "password"} value={key}
+            onChange={e => setKey(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === "Enter") { save(); return; }
+              // WKWebView (the webview lib) doesn't wire ⌘/Ctrl+V to the
+              // input, so handle paste ourselves via the Clipboard API
+              // (localhost is a secure context; keydown is a user gesture).
+              if ((e.metaKey || e.ctrlKey) && (e.key === "v" || e.key === "V")) {
+                e.preventDefault();
+                navigator.clipboard.readText().then(t => setKey(t.trim())).catch(() => {});
+              }
+            }}
+            className="w-full border rounded-lg px-3 py-2 pr-14 text-sm font-mono"
+            style={{borderColor:'#128C7E'}}
+            placeholder="sk-or-v1-…" />
+          <button onClick={() => setShow(x => !x)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-gray-600 px-1">
+            {show ? "hide" : "show"}
+          </button>
+        </div>
+        {err && <p className="text-xs text-red-500 mb-3">{err}</p>}
+        <div className="flex gap-2">
+          <button onClick={onClose}
+            className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">
+            Cancel
+          </button>
+          <button onClick={save} disabled={!key.trim() || busy}
+            className="flex-1 rounded-lg text-white disabled:opacity-40 px-4 py-2 text-sm font-semibold"
+            style={{background:'#128C7E'}}>
+            {busy ? "Validating…" : "Validate & save"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -2404,7 +2868,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       if (!active || !active.job_id) return;
       const isDbTask = !!active.task;
       const key = isDbTask ? `db:${active.task}` : (active.udid || "__adopted__");
-      patchJob(key, { running: true, done: null, lines: [], adopted: active.adopted, pid: active.pid, startedAt: active.started_at, error: "" });
+      patchJob(key, { running: true, done: null, lines: [], adopted: active.adopted, pid: active.pid, startedAt: active.started_at, error: "", jobId: active.job_id });
       streamJob(active.job_id, key, isDbTask);
       if (isDbTask) setTab("database");
     }).catch(() => {});
@@ -2518,7 +2982,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   // Uses key "db:media-index" so it matches what the server reports as
   // the active job's task on /api/jobs/active — that way a page reload
   // mid-run reconnects to the same in-memory job state.
-  const startMediaIndex = async (password) => {
+  const startMediaIndex = async (password, opts) => {
     const key = "db:media-index";
     patchJob(key, {
       running: true, done: null,
@@ -2527,7 +2991,34 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       startedAt: new Date().toISOString(), error: "",
     });
     try {
-      const { job_id } = await api.post("/api/database/media-index", { password });
+      const { job_id } = await api.post("/api/database/media-index", { password, force: !!(opts && opts.force) });
+      streamJob(job_id, key, true);
+    } catch(ex) {
+      patchJob(key, { running: false, done: false, error: ex.message });
+    }
+  };
+
+  // ── start cloud media descriptions (media-describe) ───────────────────
+  // Key "db:media-describe" matches the server task so a mid-run reload
+  // reconnects. opts = { model, reDescribe }. The OpenRouter key lives in
+  // the server session (set separately); only the backup password flows
+  // through here, same as the other indexers.
+  const startMediaDescribe = async (password, opts) => {
+    const key = "db:media-describe";
+    patchJob(key, {
+      running: true, done: null,
+      lines: [], progress: null,
+      adopted: false, pid: null,
+      startedAt: new Date().toISOString(), error: "",
+    });
+    try {
+      const { job_id } = await api.post("/api/database/media-describe", {
+        password,
+        model: (opts && opts.model) || "",
+        concurrency: (opts && opts.concurrency) || 0,
+        force: !!(opts && opts.force),
+      });
+      patchJob(key, { jobId: job_id });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -2771,11 +3262,13 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             reloadDbStatus={reloadDbStatus}
             job={jobs["db:sync"]}
             mediaJob={jobs["db:media-index"]}
+            cloudJob={jobs["db:media-describe"]}
             voiceJob={jobs["db:voice-index"]}
             modelJob={jobs["db:voice-model-download"]}
             documentJob={jobs["db:document-index"]}
             onSync={startSync}
             onMediaIndex={startMediaIndex}
+            onMediaDescribe={startMediaDescribe}
             onVoiceIndex={startVoiceIndex}
             onVoiceModelDownload={startVoiceModelDownload}
             onDocumentIndex={startDocumentIndex}
