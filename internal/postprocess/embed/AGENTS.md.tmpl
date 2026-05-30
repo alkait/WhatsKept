@@ -61,7 +61,8 @@ side tables so you can quote it:
 SELECT m.rowid, m.ts, m.chat_title, m.sender_name, m.message_type_name,
        COALESCE(
            NULLIF(m.text, ''),
-           NULLIF(t.ocr_text, ''),
+           NULLIF(t.description, ''),   -- compact image summary; full verbatim is t.ocr_text by rowid
+           NULLIF(t.ocr_text, ''),      -- fallback for Apple-described images (no description)
            NULLIF(v.transcript, ''),
            NULLIF(dt.text, ''),
            d.filename,
@@ -305,17 +306,26 @@ WHERE  m.rowid = :rowid;
 Avatars are pixel bytes — the no-ingest hard rule still applies. To show
 the user, `open <path>`; don't read it.
 
-### `wa_image_text` — image OCR + labels
+### `wa_image_text` — image description + OCR
 
-Optional. Populated by `whatskept media-index` (Apple Vision, on-device, via the bundled `whatskept-vision` helper).
+Optional. Populated by `whatskept media-index`, using one of two describers:
+on-device **Apple Vision** (the bundled `whatskept-vision` helper) or a **cloud**
+vision model. The `source` column says which produced each row.
 
 | column         | meaning                                                            |
 |----------------|--------------------------------------------------------------------|
 | `rowid`        | Joins to `v_messages.rowid`.                                       |
-| `ocr_text`     | Recognized text (may be empty).                                    |
-| `labels`       | Comma-separated classification labels (e.g. `document,screenshot`).|
-| `label_scores` | JSON `{label: confidence}`.                                        |
+| `ocr_text`     | **Verbatim** recognized text — original language/script, may be long. Survey with `description`; pull this by `rowid` only when drilling into one image. |
+| `description`  | 1–2 sentence summary (cloud describer). Empty for Apple rows. **Use this for browse/survey queries** — it's compact. |
+| `language`     | Dominant language/script code (Apple Vision; may be empty).        |
+| `labels`       | Comma-separated classification labels, e.g. `document,screenshot` (Apple Vision). Empty for cloud rows. |
+| `label_scores` | JSON `{label: confidence}` (Apple Vision).                         |
+| `source`       | Who produced the row: `apple` (on-device) or `cloud`.              |
+| `model`        | Cloud model slug (e.g. `qwen/qwen3-vl-8b-instruct`); empty for Apple. |
 | `generated_at` | UTC ISO timestamp.                                                 |
+
+An empty `labels` on a `source='cloud'` row is normal (cloud emits `description`,
+not labels); likewise an empty `description` on a `source='apple'` row.
 
 Companion `media_index(rowid, status)` tracks resume state; `status` ∈
 `described | missing | error`. Used for existence checks (see "Showing an
@@ -433,7 +443,10 @@ on the device since the last backup) — not an error, just unavailable.
 
 8. **Result-size discipline.** Always `LIMIT`, aggregate, or paginate. A
    naked `SELECT * FROM v_messages` dumps tens of thousands of rows into
-   your context. **Aggregate first**, drill down with `LIMIT`.
+   your context. **Aggregate first**, drill down with `LIMIT`. Image
+   `wa_image_text.ocr_text` is verbatim and can be long/multilingual —
+   survey with `t.description` + `snippet()`; pull full `ocr_text WHERE
+   rowid = ?` only when drilling into a single image.
 
 9. **Citing your work.** Cite `(rowid, ts, chat_title, sender_name)` so
    the user can verify with `SELECT * FROM v_messages WHERE rowid = ?`.
@@ -496,7 +509,7 @@ comma-separated list; wrap both sides with commas for exact-token matching:
 
 ```sql
 SELECT m.ts, m.chat_title, m.sender_name, t.labels,
-       SUBSTR(t.ocr_text, 1, 100) AS ocr_preview,
+       COALESCE(NULLIF(t.description, ''), SUBSTR(t.ocr_text, 1, 120)) AS summary,
        './media/' || m.rowid || '.jpg' AS image_path
 FROM   v_messages   m
 JOIN   wa_image_text t ON t.rowid = m.rowid

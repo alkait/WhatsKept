@@ -166,13 +166,23 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 		return nil, fmt.Errorf("probe old.wa_image_text: %w", err)
 	}
 	if hadOCR {
-		if _, err := db.Exec(createImageSidecarsSQL); err != nil {
-			return nil, fmt.Errorf("create image sidecar tables: %w", err)
+		if err := ensureImageSidecarSchema(db); err != nil {
+			return nil, err
 		}
-		res, err := db.Exec(
-			`INSERT OR REPLACE INTO main.wa_image_text
-			 SELECT * FROM old.wa_image_text
-			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
+		// Copy old rows forward by the old↔new column intersection
+		// rather than SELECT *. Two failure modes this avoids: (1) a
+		// column-count mismatch when old is narrower than the current
+		// schema (would error), and (2) silently dropping columns the
+		// old table already had — e.g. a user upgrading who already has
+		// cloud `description`/`source`/`model` keeps them.
+		imgCols, err := imageTextCopyColumns(db)
+		if err != nil {
+			return nil, fmt.Errorf("plan wa_image_text copy: %w", err)
+		}
+		res, err := db.Exec(fmt.Sprintf(
+			`INSERT OR REPLACE INTO main.wa_image_text (%[1]s)
+			 SELECT %[1]s FROM old.wa_image_text
+			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`, imgCols),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("preserve wa_image_text: %w", err)
@@ -300,10 +310,20 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 // merge-forward step here, and media-index's setup. Drift between
 // the two would be a silent corruption hazard.
 //
+// Always apply this via ensureImageSidecarSchema, which also runs
+// migrateImageSidecar to ADD COLUMN any fields missing on a table
+// created by an older whatskept (CREATE TABLE IF NOT EXISTS is a
+// no-op against an existing, narrower table).
+//
 // Schema notes (departures from the Python original, see DESIGN.md):
-//   - `engine` column dropped (we only have one engine; YAGNI).
-//   - `language` column added (Vision returns recognizedLanguages
-//     per request; useful for "find Arabic-text receipts" queries).
+//   - `source` / `model` record provenance now that there's more than
+//     one describer: `source` ∈ {'apple','cloud'}, `model` is the
+//     cloud model slug (empty for on-device Apple Vision). The old
+//     "one engine, drop the column (YAGNI)" assumption no longer holds.
+//   - `description` is a short natural-language summary produced by the
+//     cloud describer (empty for Apple rows, which emit `labels`).
+//   - `language` added (Vision returns recognizedLanguages per request;
+//     useful for "find Arabic-text receipts" queries).
 //   - `labels` kept as CSV alongside `label_scores` JSON, so FTS
 //     rebuild can splice in label words with a single REPLACE.
 const createImageSidecarsSQL = `
@@ -313,6 +333,9 @@ CREATE TABLE IF NOT EXISTS wa_image_text (
     language      TEXT NOT NULL DEFAULT '',
     labels        TEXT NOT NULL DEFAULT '',
     label_scores  TEXT,
+    description   TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'apple',
+    model         TEXT NOT NULL DEFAULT '',
     generated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS media_index (
@@ -326,6 +349,105 @@ CREATE TABLE IF NOT EXISTS media_index (
 );
 CREATE INDEX IF NOT EXISTS media_index_status_idx ON media_index(status);
 `
+
+// imageSidecarColumns is the full wa_image_text column set in schema
+// order. The canonical list used by migrateImageSidecar (to know what
+// must exist) and by the merge-forward copy (to compute the old↔new
+// column intersection so `SELECT *` schema drift can't bite us).
+var imageSidecarColumns = []string{
+	"rowid", "ocr_text", "language", "labels", "label_scores",
+	"description", "source", "model", "generated_at",
+}
+
+// ensureImageSidecarSchema creates wa_image_text + media_index if
+// absent, then migrates an older (narrower) wa_image_text up to the
+// current column set. Idempotent; the single entry point every caller
+// must use instead of exec'ing createImageSidecarsSQL directly.
+func ensureImageSidecarSchema(db dbExecQuerier) error {
+	if _, err := db.Exec(createImageSidecarsSQL); err != nil {
+		return fmt.Errorf("create image sidecar tables: %w", err)
+	}
+	return migrateImageSidecar(db)
+}
+
+// migrateImageSidecar ADD COLUMNs any wa_image_text field introduced
+// after the table was first created by an older whatskept. Each ALTER
+// carries a DEFAULT, so existing rows get a sane value with no
+// backfill — notably `source` defaults to 'apple', which is correct:
+// every pre-migration row was produced by Apple Vision.
+func migrateImageSidecar(db dbExecQuerier) error {
+	have, err := tableColumns(db, "main", "wa_image_text")
+	if err != nil {
+		return fmt.Errorf("inspect wa_image_text: %w", err)
+	}
+	// DDL keyed by column name; only the post-v1 additions need ALTERs.
+	adds := []struct{ col, ddl string }{
+		{"description", `ALTER TABLE wa_image_text ADD COLUMN description TEXT NOT NULL DEFAULT ''`},
+		{"source", `ALTER TABLE wa_image_text ADD COLUMN source TEXT NOT NULL DEFAULT 'apple'`},
+		{"model", `ALTER TABLE wa_image_text ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
+	}
+	for _, a := range adds {
+		if have[a.col] {
+			continue
+		}
+		if _, err := db.Exec(a.ddl); err != nil {
+			return fmt.Errorf("add column %s: %w", a.col, err)
+		}
+	}
+	return nil
+}
+
+// imageTextCopyColumns returns the comma-joined wa_image_text columns
+// present in BOTH the attached `old` DB and the current `main` DB, in
+// canonical schema order — the safe column list for a merge-forward
+// copy across a possible schema change.
+func imageTextCopyColumns(db dbExecQuerier) (string, error) {
+	mainCols, err := tableColumns(db, "main", "wa_image_text")
+	if err != nil {
+		return "", err
+	}
+	oldCols, err := tableColumns(db, "old", "wa_image_text")
+	if err != nil {
+		return "", err
+	}
+	keep := make([]string, 0, len(imageSidecarColumns))
+	for _, c := range imageSidecarColumns {
+		if mainCols[c] && oldCols[c] {
+			keep = append(keep, c)
+		}
+	}
+	return strings.Join(keep, ", "), nil
+}
+
+// tableColumns returns the set of column names on schema.table (e.g.
+// "main"."wa_image_text"). Empty set if the table doesn't exist.
+func tableColumns(db dbExecQuerier, schema, table string) (map[string]bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA %s.table_info(%s)", schema, table))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols := map[string]bool{}
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return nil, err
+		}
+		cols[name] = true
+	}
+	return cols, rows.Err()
+}
+
+// dbExecQuerier is the subset of *sql.DB used by the schema helpers,
+// so they work against either a *sql.DB or a *sql.Tx if ever needed.
+type dbExecQuerier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
+}
 
 // createVoiceSidecarsSQL — placeholder for the voice-index port.
 // Mirrors the Python schema so a future voice-index command can
@@ -582,6 +704,15 @@ func rebuildFTS(db *sql.DB) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("probe wa_image_text: %w", err)
 	}
+	if hasOCR {
+		// The FTS SELECT references t.description, so guarantee an
+		// older table has it. rebuildFTS is reached from the voice /
+		// document indexers too, which don't otherwise migrate the
+		// image sidecar — make it self-sufficient here.
+		if err := migrateImageSidecar(db); err != nil {
+			return 0, fmt.Errorf("migrate wa_image_text: %w", err)
+		}
+	}
 	hasVoice, err := tableExists(db, "wa_voice_text")
 	if err != nil {
 		return 0, fmt.Errorf("probe wa_voice_text: %w", err)
@@ -606,6 +737,10 @@ func rebuildFTS(db *sql.DB) (int, error) {
 	if hasOCR {
 		selectParts = append(selectParts,
 			"COALESCE(t.ocr_text, '')",
+			// description (cloud describer) is empty for Apple rows;
+			// indexing it lets MATCH hit summary words like "necklace"
+			// that aren't in the literal OCR.
+			"COALESCE(t.description, '')",
 			// labels is a CSV; replace ',' with ' ' so FTS
 			// tokenizes each label as its own term.
 			"COALESCE(REPLACE(t.labels, ',', ' '), '')",
