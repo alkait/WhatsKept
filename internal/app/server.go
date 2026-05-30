@@ -37,9 +37,10 @@ type server struct {
 
 	version string // build-time version string; "" for unknown
 
-	ws   *workspaceState
-	jobs *jobManager
-	pw   *passwordStore // session-only iOS-backup password cache
+	ws     *workspaceState
+	jobs   *jobManager
+	pw     *passwordStore // session-only iOS-backup password cache
+	apiKey *apiKeyStore   // session-only OpenRouter API key (cloud describer)
 }
 
 // newServer binds a free localhost TCP port, builds the route table,
@@ -58,6 +59,7 @@ func newServer(version string) (*server, error) {
 		ws:       newWorkspaceState(),
 		jobs:     newJobManager(),
 		pw:       newPasswordStore(),
+		apiKey:   newAPIKeyStore(),
 	}
 
 	mux := http.NewServeMux()
@@ -115,6 +117,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// Jobs (stubbed in Phase A, real in Phase D)
 	mux.HandleFunc("POST /api/backup/run", s.handleRunBackup)
 	mux.HandleFunc("GET /api/jobs/active", s.handleActiveJob)
+	mux.HandleFunc("DELETE /api/jobs/{id}", s.handleCancelJob)
 	mux.HandleFunc("GET /api/stream/{job_id}", s.handleStreamJob)
 	// Live size/file-count of a backup directory. Polled by the UI
 	// every couple of seconds while a backup job is running so we
@@ -130,6 +133,8 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/database/sync", s.handleSyncDatabase)
 	mux.HandleFunc("POST /api/database/media-index", s.handleMediaIndex)
 	mux.HandleFunc("GET /api/database/media-index/issues", s.handleMediaIndexIssues)
+	mux.HandleFunc("GET /api/database/media-describe/status", s.handleMediaDescribeStatus)
+	mux.HandleFunc("POST /api/database/media-describe", s.handleMediaDescribe)
 
 	// Voice transcription. The model-status route lets the GUI decide
 	// whether to open the "first run, please download model" modal
@@ -154,6 +159,9 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// (e.g. after a typo). The password value is never returned.
 	mux.HandleFunc("GET /api/session/password", s.handleSessionPasswordStatus)
 	mux.HandleFunc("DELETE /api/session/password", s.handleSessionPasswordClear)
+	mux.HandleFunc("GET /api/session/openrouter-key", s.handleSessionAPIKeyStatus)
+	mux.HandleFunc("POST /api/session/openrouter-key", s.handleSessionAPIKeySet)
+	mux.HandleFunc("DELETE /api/session/openrouter-key", s.handleSessionAPIKeyClear)
 
 	// Workspace binding — the on-disk identity record (.whatskept.json).
 	// Only DELETE is exposed; reads come back as part of /api/workspace/current
@@ -284,6 +292,7 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
 	s.pw.clear()
+	s.apiKey.clear()
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -328,6 +337,7 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ws.set(abs)
 	s.pw.clear()
+	s.apiKey.clear()
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -387,6 +397,7 @@ func (s *server) handleDeleteWorkspace(w http.ResponseWriter, _ *http.Request) {
 	removeRecent(cur)
 	s.ws.set("")
 	s.pw.clear()
+	s.apiKey.clear()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1044,6 +1055,7 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 // else (workspace, backup picking) is implicit in server state.
 type mediaIndexRequest struct {
 	Password string `json:"password"`
+	Force    bool   `json:"force"` // re-scan every image, overwriting existing rows (incl. cloud)
 }
 
 // handleMediaIndex starts a `postprocess.MediaIndex` run as an
@@ -1088,6 +1100,7 @@ func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 				Workspace:  cur,
 				BackupRoot: backup.DefaultRoot(),
 				Password:   attempted,
+				Force:      req.Force,
 				Log:        log,
 				Progress: func(p postprocess.MediaIndexProgress) {
 					progress(p)
@@ -1095,6 +1108,120 @@ func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 			})
 			if err == nil {
 				s.pw.set(attempted)
+			}
+			return err
+		})
+
+	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// mediaDescribeStatusResponse drives the Cloud descriptions card:
+// whether a key is held this session, how many images exist, and how
+// many are described on-device (Apple) vs in the cloud.
+type mediaDescribeStatusResponse struct {
+	HasKey       bool   `json:"has_key"`
+	TotalImages  int    `json:"total_images"`
+	Described    int    `json:"described"`   // any source
+	CloudCount   int    `json:"cloud_count"` // wa_image_text.source = 'cloud'
+	AppleCount   int    `json:"apple_count"` // wa_image_text.source = 'apple'
+	Missing      int    `json:"missing"`     // referenced but not in the backup — undescribable
+	DefaultModel string `json:"default_model"`
+}
+
+// handleMediaDescribeStatus reports cloud-describe readiness + coverage
+// for the Cloud descriptions card. Read-only; counts are best-effort
+// (an un-indexed workspace simply reports zeros).
+func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := mediaDescribeStatusResponse{
+		HasKey:       s.apiKey.has(),
+		DefaultModel: postprocess.DefaultCloudModel,
+	}
+	cur := s.ws.get()
+	if cur == "" {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	defer db.Close()
+
+	_ = db.QueryRow(`SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`).Scan(&resp.TotalImages)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'described'`).Scan(&resp.Described)
+	// source counts depend on the migrated wa_image_text; ignore errors
+	// (old/absent table simply leaves these at 0).
+	_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = 'cloud'`).Scan(&resp.CloudCount)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = 'apple'`).Scan(&resp.AppleCount)
+	// Images referenced by a message but absent from the backup (never
+	// downloaded on device) can't be described — exclude them from
+	// "done" math so coverage can actually reach 100%.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&resp.Missing)
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// mediaDescribeRequest is the body of POST /api/database/media-describe.
+// The OpenRouter key comes from the session store (never the body), so
+// it isn't logged or echoed.
+type mediaDescribeRequest struct {
+	Password    string `json:"password"`
+	Model       string `json:"model"`
+	Concurrency int    `json:"concurrency"` // 0 = server default
+	Force       bool   `json:"force"`       // re-describe everything, overwriting cloud rows
+}
+
+// handleMediaDescribe starts a cloud media-describe run as an SSE job,
+// mirroring handleMediaIndex but with Engine=cloud. The session API key
+// is required; the backup password is still needed to decrypt images.
+func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+
+	var req mediaDescribeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	key := s.apiKey.get()
+	if key == "" {
+		httpError(w, http.StatusBadRequest, "OpenRouter API key required — set it first")
+		return
+	}
+	pwd := req.Password
+	if pwd == "" {
+		pwd = s.pw.get()
+	}
+	if pwd == "" {
+		httpError(w, http.StatusBadRequest, "backup password is required")
+		return
+	}
+
+	jobID := s.jobs.startInProcessProgressCtx("media-describe",
+		func(ctx context.Context, log func(string), progress func(any)) error {
+			_, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
+				Workspace:   cur,
+				BackupRoot:  backup.DefaultRoot(),
+				Password:    pwd,
+				Engine:      postprocess.SourceCloud,
+				APIKey:      key,
+				Model:       req.Model,
+				Concurrency: req.Concurrency,
+				Force:       req.Force,
+				Ctx:         ctx,
+				Log:         log,
+				Progress: func(p postprocess.MediaIndexProgress) {
+					progress(p)
+				},
+			})
+			if err == nil {
+				s.pw.set(pwd)
 			}
 			return err
 		})
@@ -1243,6 +1370,62 @@ func (s *server) handleSessionPasswordStatus(w http.ResponseWriter, _ *http.Requ
 // failure that was likely a wrong-password error.
 func (s *server) handleSessionPasswordClear(w http.ResponseWriter, _ *http.Request) {
 	s.pw.clear()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCancelJob cancels a running cancellable in-process job (the
+// cloud describer). Idempotent-ish: a 404 means the job is unknown or
+// not cancellable; the run winds down gracefully, preserving committed
+// rows.
+func (s *server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.jobs.cancelJob(id) {
+		httpError(w, http.StatusNotFound, "no cancellable job with that id")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleSessionAPIKeyStatus reports whether an OpenRouter key is held
+// in this session (mirrors the password status endpoint). Never
+// returns the key itself.
+func (s *server) handleSessionAPIKeyStatus(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]bool{"has": s.apiKey.has()})
+}
+
+// apiKeySetRequest carries a pasted OpenRouter key.
+type apiKeySetRequest struct {
+	Key string `json:"key"`
+}
+
+// handleSessionAPIKeySet validates the key against OpenRouter (a cheap,
+// token-free auth check) and, on success, caches it for the session.
+// The key is held in RAM only — never written to the workspace, .env,
+// or any file.
+func (s *server) handleSessionAPIKeySet(w http.ResponseWriter, r *http.Request) {
+	var req apiKeySetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Key) == "" {
+		httpError(w, http.StatusBadRequest, "key is required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	if err := postprocess.ValidateOpenRouterKey(ctx, req.Key); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.apiKey.set(req.Key)
+	writeJSON(w, http.StatusOK, map[string]bool{"has": true})
+}
+
+// handleSessionAPIKeyClear forgets the cached OpenRouter key (the "use
+// a different key" affordance).
+func (s *server) handleSessionAPIKeyClear(w http.ResponseWriter, _ *http.Request) {
+	s.apiKey.clear()
 	w.WriteHeader(http.StatusNoContent)
 }
 

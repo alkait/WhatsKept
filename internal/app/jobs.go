@@ -50,6 +50,8 @@ type job struct {
 	pid       int
 	adopted   bool
 
+	cancel context.CancelFunc // non-nil for cancellable in-process jobs
+
 	mu          sync.Mutex
 	history     []jobEvent
 	finished    bool
@@ -242,6 +244,56 @@ func (m *jobManager) startInProcessProgress(
 	}()
 
 	return j.id
+}
+
+// startInProcessProgressCtx is the cancellable variant of
+// startInProcessProgress. The work function receives a context.Context
+// that is cancelled when DELETE /api/jobs/{id} → jobManager.cancelJob
+// is called, so a long run (notably the cloud describer) can be stopped
+// from the UI without quitting the app. Committed work is preserved.
+func (m *jobManager) startInProcessProgressCtx(
+	task string,
+	work func(ctx context.Context, log func(string), progress func(any)) error,
+) string {
+	ctx, cancel := context.WithCancel(context.Background())
+	j := &job{
+		id:        uuid.NewString(),
+		task:      task,
+		startedAt: time.Now(),
+		cancel:    cancel,
+	}
+	m.put(j)
+
+	go func() {
+		defer cancel() // release the context when the goroutine exits
+		log := func(s string) { j.emit(jobEvent{Type: "line", Data: s}) }
+		progress := func(payload any) {
+			b, err := json.Marshal(payload)
+			if err != nil {
+				return
+			}
+			j.emit(jobEvent{Type: "progress", Data: string(b)})
+		}
+		err := work(ctx, log, progress)
+		if err != nil {
+			j.emit(jobEvent{Type: "done", Status: "error", Error: err.Error()})
+			return
+		}
+		j.emit(jobEvent{Type: "done", Status: "ok", Code: 0})
+	}()
+
+	return j.id
+}
+
+// cancelJob cancels a running cancellable in-process job. Returns false
+// if the job is unknown or isn't cancellable (e.g. a subprocess job).
+func (m *jobManager) cancelJob(id string) bool {
+	j, ok := m.get(id)
+	if !ok || j.cancel == nil {
+		return false
+	}
+	j.cancel()
+	return true
 }
 
 // startBackup spawns a backup subprocess and registers it. The caller

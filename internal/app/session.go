@@ -47,3 +47,41 @@ func (p *passwordStore) has() bool {
 	defer p.mu.RUnlock()
 	return p.v != ""
 }
+
+// apiKeyStore holds the OpenRouter API key in RAM for the lifetime of
+// a single app session, exactly like passwordStore holds the backup
+// password. Same lifecycle: set when the user enters it, used by the
+// cloud media describer, cleared on workspace switch / "use a different
+// key" / process exit. Deliberately not persisted to disk — the key
+// never lands in the workspace or any file (a durable Keychain variant
+// is separate future work, mirroring the password's option C).
+type apiKeyStore struct {
+	mu sync.RWMutex
+	v  string
+}
+
+func newAPIKeyStore() *apiKeyStore { return &apiKeyStore{} }
+
+func (a *apiKeyStore) get() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.v
+}
+
+func (a *apiKeyStore) set(v string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.v = v
+}
+
+func (a *apiKeyStore) clear() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.v = ""
+}
+
+func (a *apiKeyStore) has() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.v != ""
+}
