@@ -12,6 +12,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"whatskept/internal/backup"
@@ -51,6 +53,18 @@ const (
 	MediaStatusDescribed = "described"
 	MediaStatusMissing   = "missing"
 	MediaStatusError     = "error"
+
+	// statusCancelled is an internal, never-persisted sentinel: an
+	// in-flight row that processOne abandoned because the context was
+	// cancelled. The collector ignores it (no media_index row written,
+	// so the image is simply re-queued on the next run).
+	statusCancelled = "cancelled"
+
+	// defaultCloudConcurrency is the in-flight cloud request cap when
+	// the caller doesn't specify one. Conservative enough to stay well
+	// under typical provider rate limits while still ~Nx faster than
+	// sequential.
+	defaultCloudConcurrency = 8
 
 	// All WhatsApp ChatStorage references to media files are
 	// relative paths under the Message/ subtree of WhatsApp's
@@ -147,6 +161,24 @@ type MediaIndexOptions struct {
 	LabelTopN    int
 	LabelMinConf float32
 
+	// Engine selects the describer: SourceApple (default, on-device
+	// Apple Vision) or SourceCloud (an OpenRouter vision model). Cloud
+	// requires APIKey; Model defaults to DefaultCloudModel.
+	Engine string
+	APIKey string
+	Model  string
+
+	// Concurrency caps in-flight Describe calls. 0 = sensible default
+	// per engine (cloud parallelises HTTP; Apple is forced to 1 since
+	// the Swift helper is a single-stdin subprocess). The decrypt step
+	// and DB writes are serialised internally regardless.
+	Concurrency int
+
+	// Force re-describes every describable image, overwriting rows
+	// already done by this engine (e.g. to apply an improved prompt or
+	// switch models). Without it, cloud runs skip already-cloud rows.
+	Force bool
+
 	// Ctx is checked between rows for graceful cancellation.
 	// Cancelling closes the Swift subprocess's stdin (it exits
 	// cleanly) and the current row's commit either finishes or
@@ -167,16 +199,19 @@ type MediaIndexOptions struct {
 // MediaIndexProgress is what callers see during a run.
 type MediaIndexProgress struct {
 	Done       int     `json:"done"`         // processed this run (any status)
-	Total      int     `json:"total"`        // total candidates ever
+	Total      int     `json:"total"`        // total images on device
 	Pending    int     `json:"pending"`      // queued for this run
+	Baseline   int     `json:"baseline"`     // already done by this engine at run start (for cumulative coverage)
 	Described  int     `json:"described"`    // OCR succeeded count this run
 	Missing    int     `json:"missing"`      // file absent in backup this run
 	Errors     int     `json:"errors"`       // failures this run
 	WithOCR    int     `json:"with_ocr"`     // rows with non-empty ocr_text
-	WithLabels int     `json:"with_labels"`  // rows with at least one label
+	WithLabels int     `json:"with_labels"`  // rows with at least one label (Apple)
+	WithDesc   int     `json:"with_desc"`    // rows with a description (cloud)
 	RatePerSec float64 `json:"rate_per_sec"` // images/sec over the run so far
 	ETASeconds float64 `json:"eta_seconds"`  // estimated remaining seconds
 	ElapsedSec float64 `json:"elapsed_sec"`
+	CostUSD    float64 `json:"cost_usd"` // running OpenRouter spend (cloud; 0 for Apple)
 }
 
 // MediaIndexResult is the final stats summary.
@@ -191,8 +226,10 @@ type MediaIndexResult struct {
 	Errors           int     `json:"errors"`
 	WithOCR          int     `json:"with_ocr"`
 	WithLabels       int     `json:"with_labels"`
+	WithDesc         int     `json:"with_desc"`
 	DurationSec      float64 `json:"duration_sec"`
 	FTSCountAfter    int     `json:"fts_count_after"`
+	CostUSD          float64 `json:"cost_usd,omitempty"`
 	Cancelled        bool    `json:"cancelled,omitempty"`
 }
 
@@ -235,8 +272,8 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	defer db.Close()
-	if _, err := db.Exec(createImageSidecarsSQL); err != nil {
-		return nil, fmt.Errorf("create sidecar tables: %w", err)
+	if err := ensureImageSidecarSchema(db); err != nil {
+		return nil, err
 	}
 
 	// --- Locate and unlock the backup ---------------------------
@@ -265,7 +302,15 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	candidates, err := selectMediaCandidates(db, opts.RetryMissing, opts.RetryErrors, opts.Limit)
+	// The cloud describer always upgrades: it re-queues every row not
+	// already described by cloud (Apple rows, never-described, and
+	// transient 'error' rows), and never downgrades a cloud row (those
+	// are excluded). Apple Vision is the base layer and never upgrades.
+	upgradeSource := ""
+	if opts.Engine == SourceCloud && !opts.Force {
+		upgradeSource = SourceCloud
+	}
+	candidates, err := selectMediaCandidates(db, opts.RetryMissing, opts.RetryErrors, upgradeSource, opts.Force, opts.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -284,69 +329,129 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	opts.Log(fmt.Sprintf("Already described:        %d", alreadyDescribed))
 	opts.Log(fmt.Sprintf("Queued this run:          %d", len(candidates)))
 
-	// --- Start the Swift Vision worker -------------------------
-	helperPath, err := resolveVisionHelper()
+	// --- Build the describer (Apple Vision or cloud) -----------
+	describer, err := buildDescriber(opts)
 	if err != nil {
-		return nil, fmt.Errorf("locate vision helper: %w", err)
+		return nil, err
 	}
-	worker, err := startVisionWorker(opts.Ctx, helperPath, opts.LabelTopN, opts.LabelMinConf)
-	if err != nil {
-		return nil, fmt.Errorf("start vision helper: %w", err)
-	}
-	defer worker.Close()
+	defer describer.Close()
+	concurrency := resolveConcurrency(opts.Engine, opts.Concurrency)
+	opts.Log(fmt.Sprintf("Describer: %s%s (concurrency %d)",
+		describer.Source(), modelSuffix(describer.Model()), concurrency))
 
-	// --- Main loop ---------------------------------------------
+	// --- Worker pool -------------------------------------------
+	// Each worker runs the full decrypt → describe → commit pipeline.
+	// The describe call (HTTP, for cloud) is the parallel part; the
+	// decrypt is serialised behind decryptMu (the backup reader isn't
+	// known-concurrency-safe) and DB writes are serialised by capping
+	// the SQLite pool to a single connection. Both are sub-millisecond
+	// next to a multi-second model call, so we still get ~Nx speedup.
+	db.SetMaxOpenConns(1)
+	var decryptMu sync.Mutex
+
+	// runCtx is cancelled either by the caller (user Stop) or internally
+	// when a worker hits a FatalError (bad key / no credits) — both make
+	// the feeder stop and the workers drain.
+	runCtx, cancelRun := context.WithCancel(opts.Ctx)
+	defer cancelRun()
+	var fatalErr error
+	var fatalMu sync.Mutex
+
 	res := &MediaIndexResult{
 		BackupPath:       info.Path,
 		Workspace:        opts.Workspace,
 		TotalCandidates:  total,
 		AlreadyDescribed: alreadyDescribed,
 	}
+
+	// baseline = images already done by THIS engine at run start, so the
+	// UI can show cumulative coverage (baseline + described-this-run)
+	// rather than a per-run count that looks tiny next to prior progress.
+	baseline := alreadyDescribed
+	if opts.Engine == SourceCloud {
+		_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = ?`, SourceCloud).Scan(&baseline)
+	}
 	tStart := time.Now()
 
-	for i, c := range candidates {
-		// SIGINT / Cancel between rows.
-		select {
-		case <-opts.Ctx.Done():
-			res.Cancelled = true
-			opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
-			res.DurationSec = time.Since(tStart).Seconds()
-			return res, nil
-		default:
-		}
+	jobsCh := make(chan candidate)
+	resCh := make(chan oneResult, concurrency)
 
-		status := processOne(db, bundle, manifestIdx, worker, mediaDir, c, opts.Log)
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range jobsCh {
+				resCh <- processOne(runCtx, db, bundle, &decryptMu, manifestIdx, describer, mediaDir, c, opts.Log)
+			}
+		}()
+	}
+	// Feeder: stops early (closing jobsCh) when the run context is
+	// cancelled, so workers drain and exit.
+	go func() {
+		defer close(jobsCh)
+		for _, c := range candidates {
+			select {
+			case <-runCtx.Done():
+				return
+			case jobsCh <- c:
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(resCh) }()
+
+	// Collector (this goroutine) tallies results and emits progress.
+	processed := 0
+	for r := range resCh {
+		if r.fatal != nil {
+			// First fatal wins; cancel the run so the feeder/workers
+			// wind down without marking the rest as errored.
+			fatalMu.Lock()
+			if fatalErr == nil {
+				fatalErr = r.fatal
+				opts.Log("Aborting: " + r.fatal.Error())
+			}
+			fatalMu.Unlock()
+			cancelRun()
+			continue
+		}
+		if r.status == statusCancelled {
+			continue // in-flight row aborted by cancel; not a real outcome
+		}
 		res.Processed++
-		switch status {
+		switch r.status {
 		case MediaStatusDescribed:
 			res.Described++
-			// Quick re-read to count ocr/labels hits for the
-			// progress display. Cheap (single PK lookup).
-			var hasOCR, hasLabels int
-			_ = db.QueryRow(
-				`SELECT ocr_text != '' AS o, labels != '' AS l FROM wa_image_text WHERE rowid = ?`,
-				c.rowid,
-			).Scan(&hasOCR, &hasLabels)
-			if hasOCR == 1 {
+			if r.withOCR {
 				res.WithOCR++
 			}
-			if hasLabels == 1 {
+			if r.withLabels {
 				res.WithLabels++
+			}
+			if r.withDescription {
+				res.WithDesc++
 			}
 		case MediaStatusMissing:
 			res.Missing++
 		case MediaStatusError:
 			res.Errors++
 		}
-
-		if opts.Progress != nil && (i+1)%opts.ProgressEvery == 0 {
-			emitProgress(opts.Progress, res, total, alreadyDescribed, len(candidates), tStart)
+		processed++
+		if opts.Progress != nil && processed%opts.ProgressEvery == 0 {
+			res.CostUSD = describerCost(describer)
+			emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
 		}
 	}
 
+	res.CostUSD = describerCost(describer)
 	res.DurationSec = time.Since(tStart).Seconds()
+	// A user Stop cancels opts.Ctx; a fatal abort cancels only runCtx.
+	if fatalErr == nil && opts.Ctx.Err() != nil {
+		res.Cancelled = true
+		opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
+	}
 	if opts.Progress != nil {
-		emitProgress(opts.Progress, res, total, alreadyDescribed, len(candidates), tStart)
+		emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
 	}
 
 	opts.Log(fmt.Sprintf(
@@ -365,7 +470,76 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
 	}
 
+	// A fatal failure is surfaced as an error (the committed rows above
+	// are kept and searchable) so the caller/job reports WHY it stopped
+	// instead of a misleading "success".
+	if fatalErr != nil {
+		return res, fmt.Errorf("describe run aborted after %d images: %w", res.Described, fatalErr)
+	}
 	return res, nil
+}
+
+// buildDescriber constructs the Describer selected by opts.Engine.
+// Apple is the default; cloud requires an API key. The caller owns
+// Close().
+func buildDescriber(opts MediaIndexOptions) (Describer, error) {
+	switch opts.Engine {
+	case SourceCloud:
+		return newCloudDescriber(opts.APIKey, opts.Model)
+	case "", SourceApple:
+		helperPath, err := resolveVisionHelper()
+		if err != nil {
+			return nil, fmt.Errorf("locate vision helper: %w", err)
+		}
+		worker, err := startVisionWorker(opts.Ctx, helperPath, opts.LabelTopN, opts.LabelMinConf)
+		if err != nil {
+			return nil, fmt.Errorf("start vision helper: %w", err)
+		}
+		return &appleDescriber{w: worker}, nil
+	default:
+		return nil, fmt.Errorf("media-index: unknown engine %q (want %q or %q)", opts.Engine, SourceApple, SourceCloud)
+	}
+}
+
+func modelSuffix(m string) string {
+	if m == "" {
+		return ""
+	}
+	return " (" + m + ")"
+}
+
+// resolveConcurrency picks the in-flight Describe cap. Apple is pinned
+// to 1 (the Swift helper is a single-stdin subprocess); cloud honours
+// an explicit value or falls back to defaultCloudConcurrency.
+func resolveConcurrency(engine string, requested int) int {
+	if engine != SourceCloud {
+		return 1
+	}
+	if requested > 0 {
+		return requested
+	}
+	return defaultCloudConcurrency
+}
+
+// costReporter is optionally implemented by a Describer that can
+// report cumulative spend (cloudDescriber does; Apple doesn't).
+type costReporter interface{ CostUSD() float64 }
+
+func describerCost(d Describer) float64 {
+	if c, ok := d.(costReporter); ok {
+		return c.CostUSD()
+	}
+	return 0
+}
+
+// oneResult is processOne's outcome, carrying the per-row tallies so
+// the collector needn't re-query the DB for progress counts.
+type oneResult struct {
+	status          string
+	withOCR         bool
+	withLabels      bool
+	withDescription bool
+	fatal           error // non-nil → a global failure; abort the whole run
 }
 
 // pickMediaIndexBackup honours opts.BackupPath if set, otherwise
@@ -448,20 +622,47 @@ func countMediaCandidates(db *sql.DB) (total, already int, err error) {
 
 // selectMediaCandidates is the resume query. Rows already in
 // media_index with a "skip" status are excluded.
-func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int) ([]candidate, error) {
-	skip := []any{MediaStatusDescribed}
-	if !retryMissing {
-		skip = append(skip, MediaStatusMissing)
+//
+// upgradeSource changes the meaning of "done". When empty (the normal
+// case) any 'described' row is skipped. When set (e.g. SourceCloud
+// during a re-describe), 'described' is NOT in the skip set — instead
+// only rows already described by THAT source are excluded, so rows
+// produced by a different describer get re-queued (an upgrade) while
+// same-source rows stay idempotently skipped.
+func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, upgradeSource string, force bool, limit int) ([]candidate, error) {
+	// force = re-describe everything describable (overwrite even cloud
+	// rows), e.g. to apply an improved prompt or a different model.
+	var skip []any
+	if upgradeSource == "" && !force {
+		skip = append(skip, MediaStatusDescribed)
 	}
-	if !retryErrors {
+	if !retryMissing {
+		skip = append(skip, MediaStatusMissing) // no file → undescribable
+	}
+	// In upgrade mode (cloud) and force mode we always re-attempt
+	// 'error' rows: these failures are virtually always transient (no
+	// credits, network, rate limit), not the model refusing an image.
+	// Outside those, honour the explicit retryErrors flag.
+	if !retryErrors && upgradeSource == "" && !force {
 		skip = append(skip, MediaStatusError)
 	}
-	placeholders := make([]byte, 0, len(skip)*2)
-	for i := range skip {
-		if i > 0 {
-			placeholders = append(placeholders, ',')
-		}
-		placeholders = append(placeholders, '?')
+
+	var where strings.Builder
+	where.WriteString("m.ZMEDIALOCALPATH LIKE '%.jpg'")
+	args := make([]any, 0, len(skip)+2)
+
+	if len(skip) > 0 {
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",")
+		fmt.Fprintf(&where,
+			"\n\t\t  AND m.ZMESSAGE NOT IN (SELECT rowid FROM media_index WHERE status IN (%s))", ph)
+		args = append(args, skip...)
+	}
+	if upgradeSource != "" {
+		where.WriteString(
+			"\n\t\t  AND m.ZMESSAGE NOT IN (SELECT mi.rowid FROM media_index mi" +
+				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
+				" WHERE mi.status = ? AND t.source = ?)")
+		args = append(args, MediaStatusDescribed, upgradeSource)
 	}
 
 	q := fmt.Sprintf(`
@@ -470,17 +671,14 @@ func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int
 		       wm.ZMESSAGETYPE
 		FROM   ZWAMEDIAITEM m
 		JOIN   ZWAMESSAGE   wm ON wm.Z_PK = m.ZMESSAGE
-		WHERE  m.ZMEDIALOCALPATH LIKE '%%.jpg'
-		  AND  m.ZMESSAGE NOT IN (
-		         SELECT rowid FROM media_index WHERE status IN (%s)
-		       )
+		WHERE  %s
 		ORDER BY m.ZMESSAGE ASC`,
-		mediaManifestPrefix, string(placeholders))
+		mediaManifestPrefix, where.String())
 	if limit > 0 {
 		q += fmt.Sprintf("\n\t\tLIMIT %d", limit)
 	}
 
-	rows, err := db.Query(q, skip...)
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("select candidates: %w", err)
 	}
@@ -497,25 +695,29 @@ func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int
 	return out, nil
 }
 
-// processOne runs the full decrypt → vision → commit pipeline for
-// one candidate. Returns the terminal status so the caller can
-// accumulate counts. Per-row commit means a SIGINT mid-loop is safe.
+// processOne runs the full decrypt → describe → commit pipeline for
+// one candidate and returns the outcome (status + per-row tallies).
+// Safe to run from multiple goroutines: the decrypt is serialised
+// behind decryptMu and DB writes go through a single-connection pool
+// (see MediaIndex). Per-row commit means a cancel mid-run is safe.
 func processOne(
+	ctx context.Context,
 	db *sql.DB,
 	bundle *backup.Bundle,
+	decryptMu *sync.Mutex,
 	manifestIdx map[string]*backup.Record,
-	worker *visionWorker,
+	describer Describer,
 	mediaDir string,
 	c candidate,
 	log func(string),
-) string {
+) oneResult {
 	now := nowUTC()
 
 	// 1. Find the file in the manifest.
 	rec, ok := manifestIdx[c.manifestPath]
 	if !ok {
 		writeMediaIndex(db, c, MediaStatusMissing, 0, "", now)
-		return MediaStatusMissing
+		return oneResult{status: MediaStatusMissing}
 	}
 
 	// 2. Decrypt to memory. WhatsApp images are small (~50-500 KB);
@@ -527,26 +729,32 @@ func processOne(
 	//    backup, or a media item that's still uploading). User-side
 	//    that's identical to "file not in manifest", so reclassify
 	//    as missing instead of error.
+	// The backup reader isn't known-concurrency-safe, so serialise the
+	// decrypt+read. It's milliseconds next to the describe call, so
+	// holding the lock here costs the worker pool almost nothing.
+	decryptMu.Lock()
 	rd, err := bundle.FileReader(*rec)
 	if err != nil {
+		decryptMu.Unlock()
 		if errors.Is(err, io.EOF) {
 			writeMediaIndex(db, c, MediaStatusMissing, 0, "", now)
-			return MediaStatusMissing
+			return oneResult{status: MediaStatusMissing}
 		}
 		writeMediaIndex(db, c, MediaStatusError, 0,
 			fmt.Sprintf("decrypt: %v", err), now)
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 	data, err := io.ReadAll(rd)
 	_ = rd.Close()
+	decryptMu.Unlock()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			writeMediaIndex(db, c, MediaStatusMissing, 0, "", now)
-			return MediaStatusMissing
+			return oneResult{status: MediaStatusMissing}
 		}
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
 			fmt.Sprintf("read: %v", err), now)
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 
 	// 3. Format check. WhatsApp's ZMEDIALOCALPATH always ends in
@@ -561,7 +769,7 @@ func processOne(
 	if !ok {
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
 			"unrecognized image format", now)
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 
 	// 4. Write to disk. Atomic via tmp+rename so an interrupted
@@ -573,40 +781,50 @@ func processOne(
 	if err := writeFileAtomic(out, data); err != nil {
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
 			fmt.Sprintf("write: %v", err), now)
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 
-	// 5. Vision call.
-	vres, err := worker.describe(c.rowid, out)
+	// 5. Describe (Apple Vision subprocess or cloud HTTP).
+	dres, err := describer.Describe(ctx, c.rowid, out, data)
 	if err != nil {
+		// A global failure (bad key, no credits) must abort the whole
+		// run — don't write an error row (so the image re-queues next
+		// time) and signal fatal to the collector.
+		var fatal *FatalError
+		if errors.As(err, &fatal) {
+			return oneResult{status: statusCancelled, fatal: err}
+		}
+		// Cancellation isn't a per-row error — report it as the
+		// internal sentinel so the row is left un-described and simply
+		// re-queued next run (no error row written).
+		if ctx.Err() != nil {
+			return oneResult{status: statusCancelled}
+		}
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
-			fmt.Sprintf("vision: %v", err), now)
-		return MediaStatusError
-	}
-	if !vres.OK {
-		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
-			fmt.Sprintf("vision: %s", vres.Error), now)
-		return MediaStatusError
+			fmt.Sprintf("describe: %v", err), now)
+		return oneResult{status: MediaStatusError}
 	}
 
 	// 6. Persist results. One transaction so wa_image_text and
 	//    media_index are atomic. INSERT OR REPLACE so a re-run
-	//    (e.g. after --retry-errors) overwrites cleanly.
+	//    (--retry-errors, or a cloud re-describe upgrade) overwrites
+	//    cleanly, including the source/model provenance.
 	tx, err := db.Begin()
 	if err != nil {
 		log(fmt.Sprintf("[rowid=%d] begin tx: %v", c.rowid, err))
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
-	labelsCSV, labelsJSON := encodeLabels(vres.Labels)
+	labelsCSV, labelsJSON := encodeLabels(dres.Labels)
 	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO wa_image_text
-		 (rowid, ocr_text, language, labels, label_scores, generated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		c.rowid, vres.OCRText, vres.Language, labelsCSV, labelsJSON, now,
+		 (rowid, ocr_text, language, labels, label_scores, description, source, model, generated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.rowid, dres.OCRText, dres.Language, labelsCSV, labelsJSON,
+		dres.Description, describer.Source(), describer.Model(), now,
 	); err != nil {
 		_ = tx.Rollback()
 		log(fmt.Sprintf("[rowid=%d] insert wa_image_text: %v", c.rowid, err))
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO media_index
@@ -616,13 +834,18 @@ func processOne(
 	); err != nil {
 		_ = tx.Rollback()
 		log(fmt.Sprintf("[rowid=%d] insert media_index: %v", c.rowid, err))
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
 	if err := tx.Commit(); err != nil {
 		log(fmt.Sprintf("[rowid=%d] commit: %v", c.rowid, err))
-		return MediaStatusError
+		return oneResult{status: MediaStatusError}
 	}
-	return MediaStatusDescribed
+	return oneResult{
+		status:          MediaStatusDescribed,
+		withOCR:         dres.OCRText != "",
+		withLabels:      len(dres.Labels) > 0,
+		withDescription: dres.Description != "",
+	}
 }
 
 // writeMediaIndex commits a single media_index row outside any
@@ -720,14 +943,17 @@ func emitProgress(cb func(MediaIndexProgress), res *MediaIndexResult, total, alr
 		Done:       res.Processed,
 		Total:      total,
 		Pending:    pending,
+		Baseline:   already,
 		Described:  res.Described,
 		Missing:    res.Missing,
 		Errors:     res.Errors,
 		WithOCR:    res.WithOCR,
 		WithLabels: res.WithLabels,
+		WithDesc:   res.WithDesc,
 		RatePerSec: rate,
 		ETASeconds: eta,
 		ElapsedSec: elapsed,
+		CostUSD:    res.CostUSD,
 	})
 }
 

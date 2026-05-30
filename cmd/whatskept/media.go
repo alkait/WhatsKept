@@ -38,6 +38,8 @@ func newMediaIndexCmd() *cobra.Command {
 		labelTopN    int
 		labelMinConf float64
 		emitJSON     bool
+		engine       string
+		model        string
 	)
 
 	cmd := &cobra.Command{
@@ -101,6 +103,18 @@ After a successful run, agent queries can MATCH on image content:
 				os.Exit(130)
 			}()
 
+			// Cloud engine reads its key from the environment so it
+			// never lands on argv. The GUI sets it per-session; the CLI
+			// honours an exported OPENROUTER_API_KEY (or one in the
+			// workspace .env, already loaded into the process by now).
+			apiKey := ""
+			if engine == postprocess.SourceCloud {
+				apiKey = os.Getenv("OPENROUTER_API_KEY")
+				if apiKey == "" {
+					return fmt.Errorf("--engine cloud requires OPENROUTER_API_KEY to be set")
+				}
+			}
+
 			res, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
 				Workspace:    absWS,
 				BackupPath:   backupPath,
@@ -111,6 +125,9 @@ After a successful run, agent queries can MATCH on image content:
 				RetryErrors:  retryErrors,
 				LabelTopN:    labelTopN,
 				LabelMinConf: float32(labelMinConf),
+				Engine:       engine,
+				APIKey:       apiKey,
+				Model:        model,
 				Ctx:          ctx,
 				Log: func(s string) {
 					if !emitJSON {
@@ -153,6 +170,8 @@ After a successful run, agent queries can MATCH on image content:
 	cmd.Flags().IntVar(&labelTopN, "label-top-n", 5, "Keep at most this many classification labels per image")
 	cmd.Flags().Float64Var(&labelMinConf, "label-min-conf", 0.50, "Drop classification labels below this confidence")
 	cmd.Flags().BoolVar(&emitJSON, "json", false, "Emit final result as JSON on stdout (suppresses progress)")
+	cmd.Flags().StringVar(&engine, "engine", "apple", "Describer: 'apple' (on-device Vision) or 'cloud' (OpenRouter; needs OPENROUTER_API_KEY)")
+	cmd.Flags().StringVar(&model, "model", "", "Cloud model slug (default: "+postprocess.DefaultCloudModel+"; ignored for --engine apple)")
 
 	return cmd
 }
