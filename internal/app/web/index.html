@@ -962,7 +962,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJob, modelJob, documentJob, onSync, onMediaIndex, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJob, modelJob, documentJob, onSync, onMediaIndex, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, hasSessionPassword, onForgetPassword, binding, onForgetBinding, onOpenAgents }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -1034,15 +1034,17 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
   }
 
   const buttonDisabled = isRunning || !hasBackups;
+  const isUpToDate = hasBackups && dbExists && !isStale;
 
   return (
     <>
     <section>
-      <div className="flex items-center justify-between mb-3">
-        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Messages database</h2>
-        <button onClick={reloadDbStatus} className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1">
-          <RefreshIcon /> Refresh
-        </button>
+      <div className="mb-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Core database</h2>
+          <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Required</span>
+        </div>
+        <p className="text-[11px] text-gray-400 mt-1">Setup database and foundational files, text messages, iOS contacts and WhatsApp avatars</p>
       </div>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
@@ -1059,9 +1061,6 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
               )}
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
-            {dbExists && dbStatus.db_path && (
-              <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{dbStatus.db_path}</p>
-            )}
           </div>
           <button onClick={launch} disabled={buttonDisabled}
             className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
@@ -1097,18 +1096,30 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
           successLabel="Sync complete."
           failureLabel="Sync failed."
         />
+
+        {isUpToDate && !isRunning && !j.error && (
+          <p className="text-xs text-gray-600 mt-4 pt-4 border-t flex items-center gap-1.5" style={{borderColor:'#F0F0F0'}}>
+            <span style={{color:'#25D366'}}>✓</span>
+            You're all set to query your WhatsApp.
+            <button onClick={onOpenAgents} className="text-xs font-semibold rounded-lg text-white px-3 py-1.5 hover:opacity-90 transition-opacity" style={{background:'#075E54'}}>
+              Open an agent →
+            </button>
+          </p>
+        )}
       </div>
 
-      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
-        Decrypts the latest backup's ChatStorage.sqlite into your workspace, applies the SQL view layer
-        (chats, messages, FTS5 index), syncs iOS Contacts + WhatsApp avatars, and writes <code>AGENTS.md</code>
-        plus per-agent ignore files. Voice transcription is a separate, opt-in stage that will land in a
-        future update.
-      </p>
     </section>
 
+    {/* Enrichment is meaningless without a synced database to enrich, so
+        the optional image/voice/document sections only appear once the
+        first sync has produced ChatStorage.sqlite. */}
+    {dbExists && (<>
     <section className="mt-6">
-      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Image enrichment</h2>
+      <div className="flex items-center gap-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Image enrichment</h2>
+        <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with image descriptions so agents can see the description of the images too</p>
       <div className="rounded-xl bg-white border overflow-hidden" style={{borderColor:'#DCF8C6'}}>
         <MediaIndexCard
           dbStatus={dbStatus}
@@ -1144,6 +1155,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
       hasSessionPassword={hasSessionPassword}
       reloadDbStatus={reloadDbStatus}
     />
+    </>)}
 
     {prompting && (
       <PasswordPromptModal
@@ -1242,7 +1254,11 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
     buttonPrimary = true;
     statusDot     = "#f59e0b";
   }
-  buttonLabel = "Re-describe images"; // unified across both engines
+  // Unify the verb with the cloud card, but only relabel as a *re*-run
+  // once at least one image has actually been indexed. A fresh, no-DB, or
+  // not-yet-indexed workspace keeps its per-state call-to-action ("Sync
+  // images") so the button never claims to redo work that never happened.
+  if (indexed > 0) buttonLabel = "Re-describe images";
 
   const pct = (describable != null && describable > 0)
     ? Math.min(100, Math.round((indexed / describable) * 100))
@@ -1266,14 +1282,14 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
 
   return (
     <div className="p-5">
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">Apple Vision · local</h3>
+      <h3 className="text-sm font-semibold text-gray-900">Apple Vision · local</h3>
       <p className="text-[11px] text-gray-400 mb-3">Reads any text and tags what's in each photo, right on your Mac — free and private.</p>
 
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
-              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+              <p className="font-medium text-gray-700 text-sm">{title}</p>
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
@@ -1512,7 +1528,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword,
 
     if (allDone) { buttonPrimary = false; }
     else         { buttonPrimary = true; }
-    buttonLabel = "Re-describe images"; // unified across both engines
+    // Only call it a *re*-run once something has actually been described
+    // in the cloud; otherwise the first-run call-to-action is "Describe".
+    buttonLabel = cloudCount > 0 ? "Re-describe images" : "Describe with cloud";
   }
 
   // While running, the status snapshot above is stale — show live
@@ -1525,14 +1543,14 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword,
 
   return (
     <div className="p-5 border-t" style={{borderColor:'#DCF8C6'}}>
-      <h3 className="text-[11px] font-semibold uppercase tracking-wider text-gray-500">AI image descriptions · cloud</h3>
+      <h3 className="text-sm font-semibold text-gray-900">AI image descriptions · cloud</h3>
       <p className="text-[11px] text-gray-400 mb-3">Sends each photo to a cloud AI for a fuller description and more accurate text reading, in any language. Costs a little per image.</p>
 
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
-              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+              <p className="font-medium text-gray-700 text-sm">{title}</p>
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
@@ -1948,14 +1966,21 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
 
   return (
     <section className="mt-6">
-      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Voice transcription</h2>
+      <div className="flex items-center gap-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Voice messages enrichment</h2>
+        <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with voice transcriptions so the agents can read the voice messages</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
+        <h3 className="text-sm font-semibold text-gray-900">Whisper · local</h3>
+        <p className="text-[11px] text-gray-400 mb-3">Transcribes each voice note on your Mac — auto-detects language (Arabic / English / mixed), free and private.</p>
+
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
-              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+              <p className="font-medium text-gray-700 text-sm">{title}</p>
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
@@ -2035,12 +2060,6 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
         )}
       </div>
 
-      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
-        Decrypts each <code>.opus</code> voice note from the iOS backup to <code>./voice/&lt;rowid&gt;.opus</code>,
-        then transcribes via the bundled <code>whisper-cli</code> (Metal-accelerated, large-v3-turbo) and stores
-        the result in <code>wa_voice_text</code>. Auto-detects language per clip — handles Arabic / English /
-        code-switching out of the box. Resumable: cancel anytime and re-run.
-      </p>
 
       {prompting && (
         <PasswordPromptModal
@@ -2161,14 +2180,21 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
 
   return (
     <section className="mt-6">
-      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Document extraction</h2>
+      <div className="flex items-center gap-2">
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Document enrichment</h2>
+        <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
+      </div>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with document text so the agents can read the documents too</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
+        <h3 className="text-sm font-semibold text-gray-900">Apple PDFKit · local</h3>
+        <p className="text-[11px] text-gray-400 mb-3">Extracts text from each PDF on your Mac, with Vision OCR for scanned pages — free and private.</p>
+
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
               <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
-              <p className="font-semibold text-gray-900 text-sm">{title}</p>
+              <p className="font-medium text-gray-700 text-sm">{title}</p>
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
@@ -2254,12 +2280,6 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
         )}
       </div>
 
-      <p className="text-[11px] text-gray-400 leading-relaxed mt-3">
-        Decrypts each PDF attachment from the iOS backup to <code>./documents/&lt;rowid&gt;.pdf</code>,
-        then extracts text via Apple PDFKit (with Vision OCR fallback for scanned pages) and stores
-        the result in <code>wa_document_text</code>. Non-PDF formats are recorded as
-        <code>unsupported</code> — their filenames remain searchable via <code>wa_document</code>. Resumable: cancel anytime and re-run.
-      </p>
 
       {prompting && (
         <PasswordPromptModal
@@ -2482,14 +2502,12 @@ function WorkspaceTotalBadge() {
   );
 }
 
-// WorkspaceSizes renders the size breakdown as a single grey one-liner:
-//
-//   12.4 MB  ·  Database 2.1 MB  ·  Profiles 800 KB  ·  Media 8.2 MB
-//
-// Each segment is independently clickable and reveals its section in
-// Finder. Segments for sections that don't exist yet are skipped
-// entirely (rather than rendered greyed-out) so the line stays short
-// and the visible segments are always actionable.
+// WorkspaceSizes renders the size breakdown as a grid of clickable
+// metric boxes — one per workspace section plus a highlighted Workspace
+// total. Each box reveals its folder in macOS Finder on click; the hover
+// state (border tint + ↗ glyph) signals that the box is actionable.
+// Sections that don't exist yet are skipped so every visible box opens
+// something real.
 function WorkspaceSizes() {
   const { sizes, error } = useWorkspaceSizes();
 
@@ -2509,36 +2527,164 @@ function WorkspaceSizes() {
     .filter(row => sizes[row.key] && sizes[row.key].exists)
     .map(row => ({ key: row.key, label: row.label, bytes: sizes[row.key].bytes || 0 }));
 
+  // OpenArrow — appears on hover to reinforce "this opens a folder".
+  const OpenArrow = ({ light }) => (
+    <span className={`ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity ${light ? "text-white" : ""}`}
+      style={light ? undefined : {color:'#075E54'}} aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M7 17 17 7M9 7h8v8"/>
+      </svg>
+    </span>
+  );
+
   return (
-    <p className="text-[11px] text-gray-400 leading-relaxed">
+    // Outer card = the Workspace folder; the section boxes are nested
+    // inside it so the containment (sections live within the workspace)
+    // reads visually, not as siblings sitting next to it.
+    <div className="rounded-xl border overflow-hidden" style={{borderColor:'#075E54'}}>
+      {/* Header — the workspace total, clickable to open the root folder. */}
       <button onClick={() => revealInFinder("root")}
-        title="Show workspace in Finder"
-        className="font-medium hover:underline hover:text-gray-600">
-        Total <span className="tabular-nums">{total > 0 ? formatBytes(total) : "0 B"}</span>
-      </button>
-      {segments.map(seg => (
-        <span key={seg.key}>
-          <span className="mx-2 text-gray-300">•</span>
-          <button onClick={() => revealInFinder(seg.key)}
-            title={`Show ${seg.label} in Finder`}
-            className="hover:underline hover:text-gray-600">
-            {seg.label} <span className="tabular-nums">{formatBytes(seg.bytes)}</span>
-          </button>
+        title="Open workspace folder in Finder"
+        className="group w-full flex items-center gap-3 p-3 text-left transition"
+        style={{background:'#075E54'}}>
+        <span className="flex h-9 w-9 items-center justify-center rounded-lg shrink-0 text-white" style={{background:'rgba(255,255,255,0.18)'}}>
+          <FolderOpenIcon />
         </span>
-      ))}
-    </p>
+        <span className="min-w-0">
+          <span className="block text-[10px] uppercase tracking-wider" style={{color:'rgba(255,255,255,0.7)'}}>Workspace</span>
+          <span className="block text-sm font-semibold tabular-nums text-white">{total > 0 ? formatBytes(total) : "0 B"}</span>
+        </span>
+        <OpenArrow light />
+      </button>
+
+      {/* Nested section boxes, on a tinted inset so they read as contents. */}
+      {segments.length > 0 && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 p-3" style={{background:'#F2FBF5'}}>
+          {segments.map(seg => (
+            <button key={seg.key} onClick={() => revealInFinder(seg.key)}
+              title={`Open ${seg.label} folder in Finder`}
+              className="group flex items-center gap-3 rounded-xl border border-[#DCF8C6] bg-white p-3 text-left transition hover:border-[#128C7E] hover:shadow-sm">
+              <span className="flex h-9 w-9 items-center justify-center rounded-lg shrink-0" style={{background:'#DCF8C6', color:'#075E54'}}>
+                <FolderOpenIcon />
+              </span>
+              <span className="min-w-0">
+                <span className="block text-[10px] uppercase tracking-wider text-gray-400">{seg.label}</span>
+                <span className="block text-sm font-semibold tabular-nums" style={{color:'#075E54'}}>{formatBytes(seg.bytes)}</span>
+              </span>
+              <OpenArrow />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NiceSelect — a styled dropdown replacing the native <select>. Options
+// are { value, label, tag? }. Closes on outside-click / Escape, supports
+// keyboard (↑/↓/Enter), and themes to the WhatsApp palette.
+// ═══════════════════════════════════════════════════════════════════════════
+function NiceSelect({ value, onChange, options, className, ariaLabel }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  const selected = options.find(o => o.value === value) || null;
+
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onKey); };
+  }, [open]);
+
+  const pick = (v) => { onChange(v); setOpen(false); };
+
+  return (
+    <div ref={ref} className={`relative ${className || ""}`}>
+      <button type="button" aria-label={ariaLabel} aria-haspopup="listbox" aria-expanded={open}
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-center gap-2 rounded-lg border bg-white px-3 py-2 text-sm font-semibold text-left transition hover:border-[#128C7E]"
+        style={{borderColor: open ? '#128C7E' : '#8FCBA6', color:'#075E54'}}>
+        <span className="flex-1 min-w-0 truncate">
+          {selected ? selected.label : "Select…"}
+          {selected && selected.tag && (
+            <span className="ml-2 text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium">{selected.tag}</span>
+          )}
+        </span>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"
+          strokeLinecap="round" strokeLinejoin="round"
+          className={`shrink-0 transition-transform ${open ? "rotate-180" : ""}`} style={{color:'#128C7E'}}>
+          <path d="m6 9 6 6 6-6"/>
+        </svg>
+      </button>
+
+      {open && (
+        <div role="listbox"
+          className="absolute z-30 mt-1 w-full max-h-72 overflow-auto rounded-lg border bg-white shadow-lg py-1"
+          style={{borderColor:'#8FCBA6'}}>
+          {options.map(o => {
+            const active = o.value === value;
+            return (
+              <button key={o.value} type="button" role="option" aria-selected={active}
+                onClick={() => pick(o.value)}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition ${active ? "" : "hover:bg-[#F2FBF5]"}`}
+                style={active ? {background:'#DCF8C6', color:'#075E54'} : {color:'#374151'}}>
+                <span className="flex-1 min-w-0 truncate font-medium">{o.label}</span>
+                {o.tag && (
+                  <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium shrink-0">{o.tag}</span>
+                )}
+                <span className="w-4 shrink-0" style={{color:'#075E54'}}>{active && <CheckIcon />}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // AgentsPanel — Agents tab content
 // ═══════════════════════════════════════════════════════════════════════════
-function AgentsPanel({ workspace }) {
+function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
   const [agents, setAgents] = useState(null); // null = loading
   const [openingId, setOpeningId] = useState(null);
+  // "" until prefs load; "__terminal__" for the Terminal escape hatch.
+  // Persisted server-side (not localStorage) because the app binds a new
+  // random port each launch, so localStorage would reset every restart.
+  const [selectedId, setSelectedId] = useState("");
+  const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [error, setError] = useState("");
 
+  // Persist every change so the next launch reopens with the same agent.
+  const chooseAgent = (id) => {
+    setSelectedId(id);
+    api.post("/api/prefs/ui", { agent_choice: id }).catch(() => {});
+  };
+
   useEffect(() => { api.get("/api/agents").then(setAgents).catch(e => setError(e.message)); }, []);
+
+  // Seed the saved choice once on mount, then let the agents-validation
+  // effect below pick a default if it's empty or no longer valid.
+  useEffect(() => {
+    api.get("/api/prefs/ui")
+      .then(p => { if (p && p.agent_choice) setSelectedId(p.agent_choice); })
+      .catch(() => {})
+      .finally(() => setPrefsLoaded(true));
+  }, []);
+
+  // Default the dropdown to the first installed agent (falling back to Terminal)
+  // when there's no stored choice, or when the stored agent no longer exists.
+  useEffect(() => {
+    if (!agents || !prefsLoaded) return;
+    const valid = selectedId === "__terminal__" || agents.some(a => a.id === selectedId);
+    if (!valid) {
+      const firstInstalled = agents.find(a => a.installed);
+      setSelectedId(firstInstalled ? firstInstalled.id : "__terminal__");
+    }
+  }, [agents, selectedId, prefsLoaded]);
 
   const launch = async (agent) => {
     setOpeningId(agent.id); setError("");
@@ -2558,83 +2704,86 @@ function AgentsPanel({ workspace }) {
 
   return (
     <section className="space-y-4">
-      {!workspace.has_chat && (
+      {!workspace.has_chat ? (
+        // Empty workspace: nothing to open in an agent and nothing to
+        // explore yet, so we suppress both sections below and show only
+        // the call-to-action that actually moves the user forward.
         <div className="rounded-xl border p-4 text-sm" style={{borderColor:'#f4c542',background:'#FFF8E1',color:'#7a5b00'}}>
           <div className="font-medium mb-1">Workspace is empty</div>
-          <div className="text-xs leading-relaxed">
-            <code>ChatStorage.sqlite</code>, <code>AGENTS.md</code>, and <code>CLAUDE.md</code> haven't been generated yet.
-            Run a backup from the <span className="font-medium">Backups</span> tab, then come back —
-            the agent will have a documented database to query.
-          </div>
+          {dbStatus && dbStatus.has_backups ? (
+            // A backup already exists — what's missing is the sync that
+            // turns it into ChatStorage.sqlite + the agent docs. Point the
+            // user at "Sync messages" on the Database tab, not at running
+            // another backup.
+            <div className="text-xs leading-relaxed">
+              <code>ChatStorage.sqlite</code>, <code>AGENTS.md</code>, and <code>CLAUDE.md</code> haven't been generated yet.
+              A device backup is ready — run your first sync to build them, then come back so the agent has a documented database to query.
+              <div className="mt-3">
+                <button onClick={onOpenDatabase}
+                  className="rounded-lg text-white px-4 py-2 text-sm font-semibold hover:opacity-90 transition-opacity"
+                  style={{background:'#075E54'}}>
+                  Sync messages
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs leading-relaxed">
+              <code>ChatStorage.sqlite</code>, <code>AGENTS.md</code>, and <code>CLAUDE.md</code> haven't been generated yet.
+              Run a backup from the <span className="font-medium">Backups</span> tab, then sync it under{" "}
+              <span className="font-medium">Database</span> — the agent will have a documented database to query.
+            </div>
+          )}
         </div>
+      ) : (
+        <>
+          {(() => {
+            const isTerminal    = selectedId === "__terminal__";
+            const selectedAgent = isTerminal ? null : (agents.find(a => a.id === selectedId) || null);
+            const opening       = openingId === selectedId;
+            const canOpen       = isTerminal || (selectedAgent && selectedAgent.installed);
+            const description    = isTerminal
+              ? "Open the workspace in macOS Terminal — handy for any CLI agent we don't yet detect natively (Codex CLI, Gemini CLI, …)."
+              : (selectedAgent ? selectedAgent.description : "");
+            const openSelected = () => {
+              if (isTerminal) openTerminal();
+              else if (selectedAgent) launch(selectedAgent);
+            };
+            const buttonLabel = opening ? "Opening…" : (isTerminal ? "Open in Terminal" : `Open in ${selectedAgent ? selectedAgent.name : "agent"}`);
+            return (
+              <div>
+                <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Open in agent</h2>
+                <div className="rounded-xl border bg-white p-4" style={{borderColor:'#DCF8C6'}}>
+                  <div className="flex items-center gap-3">
+                    <NiceSelect value={selectedId} onChange={chooseAgent} className="flex-1 min-w-0"
+                      ariaLabel="Choose agent"
+                      options={[
+                        ...agents.map(a => ({ value: a.id, label: a.name, tag: a.installed ? null : "not installed" })),
+                        { value: "__terminal__", label: "Terminal", tag: "built-in" },
+                      ]} />
+                    <button onClick={openSelected} disabled={!canOpen || opening}
+                      className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
+                      style={{background:'#075E54'}}
+                      title={canOpen ? "Open this workspace" : `${selectedAgent ? selectedAgent.name : "This agent"} is not installed in /Applications`}>
+                      {buttonLabel}
+                    </button>
+                  </div>
+                  {description && <p className="text-xs text-gray-500 mt-3">{description}</p>}
+                  {selectedAgent && selectedAgent.installed && selectedAgent.app_path && (
+                    <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{selectedAgent.app_path}</p>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
+          <div>
+            <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Explore workspace</h2>
+            <WorkspaceSizes />
+          </div>
+        </>
       )}
 
-      <WorkspaceSizes />
-
-      <div>
-        <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Open in agent</h2>
-        <div className="space-y-3">
-          {agents.map(a => (
-            <div key={a.id} className="rounded-xl border bg-white p-4 flex items-center gap-4" style={{borderColor:'#DCF8C6'}}>
-              <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{background:'#DCF8C6',border:'1px solid #128C7E'}}>
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#075E54" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
-                </svg>
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <p className="text-sm font-semibold" style={{color:'#075E54'}}>{a.name}</p>
-                  {a.installed
-                    ? <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>Installed</span>
-                    : <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Not installed</span>}
-                </div>
-                <p className="text-xs text-gray-500 mt-0.5">{a.description}</p>
-                {a.installed && a.app_path && (
-                  <p className="text-[11px] text-gray-400 mt-0.5 font-mono truncate">{a.app_path}</p>
-                )}
-              </div>
-              <button onClick={() => launch(a)} disabled={!a.installed || openingId === a.id}
-                className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
-                style={{background:'#075E54'}}
-                title={a.installed ? `Open this workspace in ${a.name}` : `${a.name} is not installed in /Applications`}>
-                {openingId === a.id ? "Opening…" : `Open in ${a.name}`}
-              </button>
-            </div>
-          ))}
-
-          {/* Escape hatch — opens the workspace in Terminal so the user can
-              run any CLI agent (claude, codex, gemini-cli, …) we don't yet
-              detect natively. */}
-          <div className="rounded-xl border bg-white p-4 flex items-center gap-4" style={{borderColor:'#DCF8C6'}}>
-            <div className="w-10 h-10 rounded-lg flex items-center justify-center shrink-0" style={{background:'#DCF8C6',border:'1px solid #128C7E'}}>
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#075E54" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
-              </svg>
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="flex items-center gap-2">
-                <p className="text-sm font-semibold" style={{color:'#075E54'}}>Terminal</p>
-                <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded" style={{background:'#DCF8C6',color:'#075E54'}}>Built-in</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-0.5">Open the workspace in macOS Terminal — handy for any CLI agent we don't yet detect natively (Codex CLI, Gemini CLI, …).</p>
-            </div>
-            <button onClick={openTerminal} disabled={openingId === "__terminal__"}
-              className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
-              style={{background:'#075E54'}}
-              title="Open this workspace in a new Terminal window">
-              {openingId === "__terminal__" ? "Opening…" : "Open in Terminal"}
-            </button>
-          </div>
-        </div>
-      </div>
-
       {error && <p className="text-sm text-red-500">{error}</p>}
-
-      <p className="text-[11px] text-gray-400 leading-relaxed">
-        Agents are launched detached — GUI apps via <code>open -a</code>, CLI agents in a fresh Terminal
-        window — so closing WhatsKept doesn't affect them. Support for more agents (Codex CLI, Gemini CLI)
-        lands as we test each integration.
-      </p>
     </section>
   );
 }
@@ -3253,7 +3402,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         </>)}
 
         {/* ══ AGENTS TAB ══ */}
-        {tab === "agents" && <AgentsPanel workspace={workspace} />}
+        {tab === "agents" && <AgentsPanel workspace={workspace} dbStatus={dbStatus} onOpenDatabase={() => setTab("database")} />}
 
         {/* ══ DATABASE TAB ══ */}
         {tab === "database" && (
@@ -3276,6 +3425,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             onForgetPassword={forgetSessionPassword}
             binding={workspace.binding}
             onForgetBinding={forgetBinding}
+            onOpenAgents={() => setTab("agents")}
           />
         )}
 

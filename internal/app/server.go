@@ -154,6 +154,12 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agents/{id}/open", s.handleOpenAgent)
 	mux.HandleFunc("POST /api/open-terminal", s.handleOpenTerminal)
 
+	// UI prefs — small machine-local settings that must survive restarts
+	// (e.g. the Agents-tab dropdown choice). Persisted to a JSON file
+	// rather than localStorage because the server port changes per launch.
+	mux.HandleFunc("GET /api/prefs/ui", s.handleGetUIPrefs)
+	mux.HandleFunc("POST /api/prefs/ui", s.handleSetUIPrefs)
+
 	// Session password — lets the UI skip the modal when a backup
 	// password is already cached, and lets it explicitly forget one
 	// (e.g. after a typo). The password value is never returned.
@@ -1142,7 +1148,20 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 		return
 	}
 	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
-	db, err := sql.Open("sqlite3", dbPath)
+	// Bail before touching SQLite if the DB doesn't exist yet. Opening in
+	// the driver's default read-write-create mode would otherwise
+	// materialise an empty ChatStorage.sqlite (zero tables, 0 bytes) on a
+	// never-synced workspace, simply because the Cloud-descriptions card
+	// polls this endpoint on mount. That phantom file then trips
+	// "DB exists / up to date" everywhere downstream and shows a bogus
+	// 0 B database in the Agents-tab size breakdown. Mirror the
+	// stat-guarded, read-only pattern of handleDatabaseStatus and
+	// handleMediaIndexIssues.
+	if _, err := os.Stat(dbPath); err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
 	if err != nil {
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -1427,6 +1446,29 @@ func (s *server) handleSessionAPIKeySet(w http.ResponseWriter, r *http.Request) 
 func (s *server) handleSessionAPIKeyClear(w http.ResponseWriter, _ *http.Request) {
 	s.apiKey.clear()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------------------------------------------------------------------------
+// UI prefs
+// ---------------------------------------------------------------------------
+
+// handleGetUIPrefs returns the persisted UI prefs (defaults if none saved).
+func (s *server) handleGetUIPrefs(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, loadUIPrefs())
+}
+
+// handleSetUIPrefs persists the posted UI prefs and echoes them back.
+func (s *server) handleSetUIPrefs(w http.ResponseWriter, r *http.Request) {
+	var p uiPrefs
+	if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if err := saveUIPrefs(p); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("save prefs: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 // ---------------------------------------------------------------------------
