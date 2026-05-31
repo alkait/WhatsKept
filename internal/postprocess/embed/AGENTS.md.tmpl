@@ -492,17 +492,27 @@ GROUP  BY sender_jid
 ORDER  BY msgs DESC;
 ```
 
-**Slice a conversation as a transcript** (placeholder for media):
+**Slice a conversation as a transcript** — include image descriptions and voice transcripts so synthesis queries see ALL surfaces, not just typed text:
 
 ```sql
-SELECT ts, sender_name, message_type_name,
-       COALESCE(text, '<' || message_type_name || '>')
-FROM   v_messages
-WHERE  chat_title = 'Alice'
-  AND  ts BETWEEN '2024-06-01' AND '2024-06-30'
-ORDER  BY ts ASC
+SELECT m.ts, m.sender_name, m.message_type_name,
+       COALESCE(
+           NULLIF(m.text, ''),
+           NULLIF(t.description, ''),   -- cloud image summary
+           NULLIF(t.ocr_text, ''),      -- Apple Vision OCR / fallback
+           NULLIF(v.transcript, ''),    -- voice note transcript
+           '<' || m.message_type_name || '>'
+       ) AS content
+FROM   v_messages m
+LEFT JOIN wa_image_text t ON t.rowid = m.rowid
+LEFT JOIN wa_voice_text v ON v.rowid = m.rowid
+WHERE  m.chat_title = 'Alice'
+  AND  m.ts BETWEEN '2024-06-01' AND '2024-06-30'
+ORDER  BY m.ts ASC
 LIMIT  500;
 ```
+
+Drop the `LEFT JOIN` lines for tables that don't exist yet (optional indexers never ran).
 
 **Find images by classification label.** `wa_image_text.labels` is a
 comma-separated list; wrap both sides with commas for exact-token matching:
