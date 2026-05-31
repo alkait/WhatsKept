@@ -285,6 +285,20 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err))
 		return
 	}
+	// Refuse to "create" over something that already exists. MkdirAll would
+	// silently succeed and just re-select the existing folder — confusing,
+	// because the Create screen promises a fresh folder and gives no signal
+	// that the user actually re-opened an existing (possibly populated)
+	// workspace. Send them to Open instead. The 409 lets the frontend offer
+	// a one-click "Open it instead".
+	if st, statErr := os.Stat(abs); statErr == nil {
+		if st.IsDir() {
+			httpError(w, http.StatusConflict, fmt.Sprintf("A folder already exists at %s. Use “Open existing workspace” to open it, or choose a different name.", abs))
+		} else {
+			httpError(w, http.StatusConflict, fmt.Sprintf("A file already exists at %s. Choose a different path.", abs))
+		}
+		return
+	}
 	if err := os.MkdirAll(abs, 0o755); err != nil {
 		httpError(w, http.StatusInternalServerError, fmt.Sprintf("Cannot create directory: %v", err))
 		return
