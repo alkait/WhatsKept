@@ -2988,19 +2988,34 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
 
   // ── load backups ──────────────────────────────────────────────────────
   const [backupsError, setBackupsError] = useState(null);
-  const reloadBackups = useCallback(async () => {
-    setLoading(true);
-    setBackupsError(null);
+  // silent=true skips the loading spinner and is used by the live poll
+  // below, so a background refresh never flashes "Loading…" over a list
+  // that's already on screen. The initial load and post-backup refresh
+  // (backupsKey bump) run non-silent.
+  const reloadBackups = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) setLoading(true);
     try {
       const data = await api.get("/api/backups");
       setBackups(data);
+      setBackupsError(null);
     } catch(e) {
       setBackupsError(e.message || "Failed to read backup directory.");
       setBackups([]);
-    } finally { setLoading(false); }
+    } finally { if (!silent) setLoading(false); }
   }, []);
 
   useEffect(() => { reloadBackups(); }, [backupsKey]);
+
+  // Keep the Available Backups list live while the tab is open, mirroring
+  // the Database tab (which re-reads status on entry). A 3s silent poll —
+  // same cadence as the device scan — means hiding or creating a backup on
+  // disk is reflected automatically, so there's no manual Refresh button.
+  useEffect(() => {
+    if (tab !== "backups") return;
+    reloadBackups({ silent: true });
+    const id = setInterval(() => reloadBackups({ silent: true }), 3000);
+    return () => clearInterval(id);
+  }, [tab, reloadBackups]);
 
   // ── poll devices every 3 s ────────────────────────────────────────────
   useEffect(() => {
@@ -3330,13 +3345,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         {tab === "backups" && (<>
           {/* ── Available Backups ── */}
           <section>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Available Backups</h2>
-              <button onClick={() => setBackupsKey(k => k + 1)}
-                className="text-xs text-gray-400 hover:text-gray-600 flex items-center gap-1">
-                <RefreshIcon /> Refresh
-              </button>
-            </div>
+            <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Available Backups</h2>
             {loading ? (
               <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>
             ) : backupsError ? (
