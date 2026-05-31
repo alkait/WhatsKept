@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"os/exec"
 	"runtime"
 
 	webview "github.com/webview/webview_go"
@@ -72,6 +73,15 @@ func runWindow(opts windowOptions, pickFolder pickFolderFunc) error {
 		w.Terminate()
 	}); err != nil {
 		return fmt.Errorf("bind quit: %w", err)
+	}
+
+	// Open the Full Disk Access pane in System Settings. iOS backups live
+	// in a protected directory, so without FDA we cannot read the backup
+	// root; this deep-link drops the user straight onto the right pane.
+	if err := w.Bind("_wkpOpenFullDiskAccess", func() {
+		_ = exec.Command("/usr/bin/open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles").Start()
+	}); err != nil {
+		return fmt.Errorf("bind openFullDiskAccess: %w", err)
 	}
 
 	w.Navigate(opts.URL)

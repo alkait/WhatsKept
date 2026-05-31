@@ -3376,15 +3376,16 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
               <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>
             ) : backupsError ? (
               <div className="rounded-xl border p-5 text-sm" style={{borderColor:'#128C7E',background:'#fff'}}>
-                <div className="font-medium mb-2" style={{color:'#075E54'}}>Cannot read backup directory</div>
-                <div className="text-gray-600 mb-3">{backupsError}</div>
-                <div className="text-xs text-gray-500 leading-relaxed">
-                  On macOS, iOS backups live in a protected directory. Grant
-                  <span className="font-medium"> Full Disk Access</span> to WhatsKept:
-                  System Settings → Privacy &amp; Security → Full Disk Access → add
-                  this app (or your terminal if you launched from the command line),
-                  then quit and reopen WhatsKept.
+                <div className="font-medium mb-2" style={{color:'#075E54'}}>Full Disk Access required</div>
+                <div className="text-gray-600 mb-4 leading-relaxed">
+                  WhatsKept needs Full Disk Access to read your iOS backups. Turn it on
+                  for WhatsKept in System Settings, then quit and reopen the app.
                 </div>
+                <button onClick={() => window._wkpOpenFullDiskAccess && window._wkpOpenFullDiskAccess()}
+                  className="rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
+                  style={{background:'#075E54'}}>
+                  Open Full Disk Access settings
+                </button>
               </div>
             ) : backups.length === 0 ? (
               <div className="rounded-xl border border-dashed p-8 text-center text-sm text-gray-400" style={{borderColor:'#128C7E'}}>
