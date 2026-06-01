@@ -64,7 +64,7 @@ chmod +x "$APP_MACOS/whatskept"
 # bundle shows the brand icon in Finder / Dock / Spotlight even before
 # launch. iconutil wants a .iconset dir of named, sips-scaled PNGs.
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ICON_SRC="$REPO_ROOT/internal/app/assets/appicon.png"
+ICON_SRC="$REPO_ROOT/internal/app/web/logo.png"
 HAS_ICON=0
 if [[ -f "$ICON_SRC" ]]; then
   ICONSET_PARENT="$(mktemp -d)"

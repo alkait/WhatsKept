@@ -24,7 +24,7 @@ import (
 	"unsafe"
 )
 
-//go:embed assets/appicon.png
+//go:embed web/logo.png
 var appIconPNG []byte
 
 // setDockIcon sets the running app's Dock / app-switcher icon from the

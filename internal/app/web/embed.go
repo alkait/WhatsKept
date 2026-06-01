@@ -9,5 +9,5 @@ package web
 
 import "embed"
 
-//go:embed index.html vendor
+//go:embed index.html vendor logo.png
 var FS embed.FS
