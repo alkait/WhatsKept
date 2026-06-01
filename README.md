@@ -1,4 +1,8 @@
-# WhatsKept
+<p align="center">
+  <img src="docs/logo.png" alt="WhatsKept logo" width="140" height="140">
+</p>
+
+<h1 align="center">WhatsKept</h1>
 
 Agent-queryable WhatsApp history from an iOS backup, in Go.
 
@@ -51,6 +55,14 @@ agent-friendly workspace on disk.
   Apple's Vision framework, voice-note transcription through
   `whisper.cpp` with Metal, and PDF document text extraction through
   Apple PDFKit (with Vision OCR fallback for scanned pages).
+- **Optional cloud image descriptions** (opt-in): instead of the
+  on-device Vision OCR, you can describe images with a cloud vision
+  model through [OpenRouter](https://openrouter.ai), using your own
+  API key. This is the **one feature that sends your data off the
+  device** — each described image is uploaded to OpenRouter. It is off
+  by default, lives behind its own button, and is the only cloud
+  alternative to the otherwise fully on-device pipeline. See
+  [Privacy](#privacy).
 - **Normalizes** everything into a single SQLite database (with FTS5)
   alongside extracted `media/`, `voice/`, `documents/`, and
   `profiles/` folders, joined against your macOS Contacts so chats
@@ -61,16 +73,27 @@ agent-friendly workspace on disk.
 
 **What it does *not* do**
 
-- **No built-in chat, no built-in LLM, no agent runtime.** WhatsKept
-  never sends your messages to OpenAI, Anthropic, Google, or anyone
-  else. It does not embed a model, does not call an inference API,
-  does not "summarize your chats" on its own.
+- **No built-in chat, no built-in agent runtime.** WhatsKept never
+  sends your messages, transcripts, or contacts to a cloud LLM, and it
+  does not "summarize your chats" or answer questions on its own —
+  that is the agent's job (see below). The one exception is the
+  **opt-in cloud image-description** feature: if you turn it on and
+  supply an OpenRouter API key, your images (and only your images) are
+  uploaded to OpenRouter for OCR + captioning. It is off by default.
 - **No cloud sync, no account, no telemetry.** WhatsKept makes only
-  two kinds of outbound request, both to well-known hosts and neither
-  carrying any of your data: a version check against the GitHub
-  Releases API when the app window opens (so it can offer an Update
-  button), and — only if you opt into voice transcription — a one-time
-  HTTPS download of the whisper model from HuggingFace.
+  these outbound requests, all to well-known hosts:
+  - a version check against the **GitHub** Releases API when the app
+    window opens (so it can offer an Update button) — carries none of
+    your data;
+  - only if you opt into voice transcription, a one-time HTTPS
+    download of the whisper model from **HuggingFace** — carries none
+    of your data;
+  - only if you opt into cloud image descriptions, an API-key
+    validation check and one chat-completion request per image to
+    **OpenRouter** — these **do** carry image content from your backup.
+
+  Nothing else leaves the machine. There is no account, no analytics,
+  and no background sync.
 - **No querying for you.** Asking questions like *"what did Alice say
   about the trip?"* is the **agent's** job — you open the workspace
   in Windsurf / VS Code + Copilot / Claude Code / Cursor / etc. and
@@ -101,10 +124,12 @@ End-to-end data flow, from the encrypted backup on disk to a
 workspace your agent can `MATCH` against. The four side-car
 indexers (avatars/contacts, images, voice, documents) are all
 **opt-in** — each one lives behind its own button in the Database
-tab and can be skipped, re-run, or resumed independently. Everything
-runs **on-device**; the only outbound network call is the one-time
+tab and can be skipped, re-run, or resumed independently. The default
+pipeline runs **on-device**; the only outbound call is the one-time
 whisper-model download from HuggingFace if you enable voice
-transcription.
+transcription. The lone exception is the **opt-in cloud image
+descriptions** path — if you enable it, images are uploaded to
+OpenRouter instead of being OCR'd locally by Apple Vision.
 
 ```mermaid
 %%{init: {'flowchart': {'subGraphTitleMargin': {'top': 32, 'bottom': 32}}}}%%
@@ -127,7 +152,7 @@ flowchart TD
     subgraph SIDE["Optional on-device processors"]
         direction LR
         PS{{"Sync contacts &amp; avatars"}}:::proc
-        MI{{"Image OCR &amp; classification"}}:::proc
+        MI{{"Image OCR &amp; classification<br/>(on-device · or opt-in cloud)"}}:::proc
         VI{{"Voice-note transcription"}}:::proc
         XI{{"PDF text extraction"}}:::proc
     end
@@ -218,12 +243,14 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 
 **The good**
 
-- **No telemetry, no analytics, no accounts.** WhatsKept never sends
-  your data anywhere. Its only outbound calls are a version check to
-  GitHub when the window opens and the opt-in whisper-model download
-  (both below); each contacts a well-known host and carries none of
-  your WhatsApp data. The GUI's HTTP server binds to `127.0.0.1`
-  only — it is not reachable from other devices on your network.
+- **No telemetry, no analytics, no accounts.** By default WhatsKept
+  sends none of your data anywhere. Its always-on outbound call is a
+  version check to GitHub when the window opens; the whisper-model
+  download and the cloud image-description feature are both opt-in
+  (all three below). The version check and model download contact a
+  well-known host and carry none of your WhatsApp data. The GUI's HTTP
+  server binds to `127.0.0.1` only — it is not reachable from other
+  devices on your network.
 - **All processing is on-device.** Image OCR + classification runs
   through Apple's Vision framework (`whatskept-vision`); voice
   transcription runs through `whisper.cpp` with Metal acceleration.
@@ -237,6 +264,12 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   transcription, the ~574 MB whisper model is downloaded from
   HuggingFace over HTTPS and SHA-256 verified. After that, that
   feature is fully offline.
+- **Cloud image descriptions use your own key, held in RAM only.** The
+  opt-in OpenRouter feature (below) uses an API key *you* supply. It is
+  validated against `openrouter.ai`, kept in process memory for the
+  session, and never written to disk by WhatsKept; it is cleared when
+  you switch workspaces or quit. WhatsKept sends no account or
+  identifier of its own — just your key and the image being described.
 - **Update check on launch.** When the app window opens it asks the
   GitHub Releases API whether a newer version exists, so it can show
   the **Update** button in the header. It's a single unauthenticated
@@ -247,6 +280,18 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 
 **What to be cautious about**
 
+- **Cloud image descriptions send your images off the device.** This is
+  the one feature that breaks the on-device guarantee. When you enable
+  it, each described image is uploaded to OpenRouter
+  (`https://openrouter.ai/api/v1/chat/completions`) along with a fixed
+  OCR + caption prompt; OpenRouter (and the upstream model provider it
+  routes to) sees those image bytes, and they are subject to
+  OpenRouter's data-retention policy, not WhatsKept's. Only images are
+  sent — never your text messages, voice notes, or contacts — and only
+  for the images you choose to run. The feature is **off by default**;
+  if you never enter an API key and never start a cloud run, nothing is
+  ever uploaded. Prefer the on-device Apple Vision OCR if you want zero
+  data to leave the machine.
 - **The workspace contains *decrypted* WhatsApp data.** `ChatStorage.sqlite`,
   `media/`, `voice/`, `documents/`, and `profiles/` are plaintext on
   disk, and the Messages sync also joins your macOS Contacts (names + phone
