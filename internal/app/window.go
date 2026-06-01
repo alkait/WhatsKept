@@ -41,6 +41,11 @@ func runWindow(opts windowOptions, pickFolder pickFolderFunc) error {
 	}
 	defer w.Destroy()
 
+	// webview.New initialised the shared NSApplication; set our Dock /
+	// app-switcher icon now so a bare-binary launch (`make app`) shows
+	// the brand icon instead of the generic executable glyph.
+	setDockIcon()
+
 	w.SetTitle(opts.Title)
 	var hint webview.Hint = webview.HintNone
 	if !opts.Resizable {

@@ -59,10 +59,38 @@ mkdir -p "$APP_MACOS" "$APP_RES"
 cp "$BIN" "$APP_MACOS/whatskept"
 chmod +x "$APP_MACOS/whatskept"
 
+# App icon. Build a multi-resolution .icns from the single source PNG
+# (the same file the binary embeds for its runtime Dock icon) so the
+# bundle shows the brand icon in Finder / Dock / Spotlight even before
+# launch. iconutil wants a .iconset dir of named, sips-scaled PNGs.
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ICON_SRC="$REPO_ROOT/internal/app/assets/appicon.png"
+HAS_ICON=0
+if [[ -f "$ICON_SRC" ]]; then
+  ICONSET_PARENT="$(mktemp -d)"
+  ICONSET="$ICONSET_PARENT/AppIcon.iconset"
+  mkdir -p "$ICONSET"
+  for pair in "16 16x16" "32 16x16@2x" "32 32x32" "64 32x32@2x" \
+              "128 128x128" "256 128x128@2x" "256 256x256" "512 256x256@2x" \
+              "512 512x512" "1024 512x512@2x"; do
+    px="${pair% *}"; name="${pair#* }"
+    sips -z "$px" "$px" "$ICON_SRC" --out "$ICONSET/icon_$name.png" >/dev/null
+  done
+  iconutil -c icns "$ICONSET" -o "$APP_RES/appicon.icns"
+  rm -rf "$ICONSET_PARENT"
+  HAS_ICON=1
+else
+  echo "$0: warning: $ICON_SRC not found; bundling without an icon" >&2
+fi
+
 # Info.plist. Hand-written here rather than checked in as a static
 # file so VERSION can be substituted on each build without a
 # `sed` dance, and so any plist tweak shows up in `git diff` of this
 # script (loud and reviewable) instead of a binary plist.
+ICON_KEY=""
+if [[ "$HAS_ICON" -eq 1 ]]; then
+  ICON_KEY="  <key>CFBundleIconFile</key>            <string>appicon</string>"
+fi
 cat > "$APP_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -72,6 +100,7 @@ cat > "$APP_PLIST" <<PLIST
   <key>CFBundleDisplayName</key>           <string>WhatsKept</string>
   <key>CFBundleIdentifier</key>            <string>com.whatskept.app</string>
   <key>CFBundleExecutable</key>            <string>whatskept</string>
+$ICON_KEY
   <key>CFBundlePackageType</key>           <string>APPL</string>
   <key>CFBundleVersion</key>               <string>$VERSION</string>
   <key>CFBundleShortVersionString</key>    <string>$VERSION</string>
