@@ -1819,8 +1819,7 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
       <div className="w-[420px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
         <h2 className="text-base font-semibold text-gray-900 mb-1">OpenRouter API key</h2>
         <p className="text-xs text-gray-500 mb-4">
-          Paste your key (starts with <code>sk-or-</code>). It's validated now and kept only for this app
-          session — never written to disk. Get one at <span className="font-medium text-gray-700">openrouter.ai/keys</span>.
+          Enter your OpenRouter key. <a href="#" onClick={e => { e.preventDefault(); api.post("/api/open-url", { url: "https://openrouter.ai/keys" }).catch(() => {}); }} className="font-medium text-gray-700 underline">Get one</a>.
         </p>
         <div className="relative mb-3">
           <input ref={inputRef} type={show ? "text" : "password"} value={key}
