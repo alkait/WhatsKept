@@ -1151,6 +1151,12 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
           hasSessionPassword={hasSessionPassword}
           reloadDbStatus={reloadDbStatus}
         />
+        <FindPeopleCard
+          job={faceJob}
+          modelJob={faceModelJob}
+          onFaceIndex={onFaceIndex}
+          onFaceModelDownload={onFaceModelDownload}
+        />
         <CloudDescribeCard
           dbStatus={dbStatus}
           job={cloudJob}
@@ -1159,13 +1165,6 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
           reloadDbStatus={reloadDbStatus}
         />
       </div>
-
-      <FindPeopleCard
-        job={faceJob}
-        modelJob={faceModelJob}
-        onFaceIndex={onFaceIndex}
-        onFaceModelDownload={onFaceModelDownload}
-      />
     </section>
 
     <VoiceIndexCard
@@ -1295,14 +1294,9 @@ function FindPeopleCard({ job, modelJob, onFaceIndex, onFaceModelDownload }) {
   const busy = isRunning || mjRunning;
 
   return (
-    <section className="mt-6">
-      <div className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>People</h2>
-        <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
-      </div>
-      <p className="text-[11px] text-gray-400 mb-3 mt-1">Group the faces in your photos so you can find everyone who recurs — your kids, family, friends.</p>
-
-      <div className="rounded-xl bg-white border overflow-hidden p-5" style={{borderColor:'#DCF8C6'}}>
+    <div className="border-t p-5" style={{borderColor:'#DCF8C6'}}>
+      <h3 className="text-sm font-semibold text-gray-900">People</h3>
+      <p className="text-[11px] text-gray-400 mb-3">Group the faces in your photos so you can find everyone who recurs — your kids, family, friends. Runs on your Mac.</p>
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -1355,10 +1349,8 @@ function FindPeopleCard({ job, modelJob, onFaceIndex, onFaceModelDownload }) {
             )}
           </div>
         </div>
-      </div>
-
       {showGrid && <PeopleGrid onClose={() => setShowGrid(false)} />}
-    </section>
+    </div>
   );
 }
 
