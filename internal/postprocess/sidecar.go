@@ -57,6 +57,7 @@ type OrphanPruneStats struct {
 	VoiceIndexRowsDeleted    int `json:"voice_index_rows_deleted"`
 	DocumentTextRowsDeleted  int `json:"document_text_rows_deleted"`
 	DocumentIndexRowsDeleted int `json:"document_index_rows_deleted"`
+	PersonFaceRowsDeleted    int `json:"person_face_rows_deleted"`
 	MediaFilesDeleted        int `json:"media_files_deleted"`
 	MediaFilesFailed         int `json:"media_files_failed"`
 	VoiceFilesDeleted        int `json:"voice_files_deleted"`
@@ -301,8 +302,55 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 		}
 	}
 
+	// wa_person + wa_person_face — user-authored people tags. wa_person is
+	// carried forward UNCONDITIONALLY (a name is irreplaceable user input,
+	// not keyed to any one message); wa_person_face is filtered by surviving
+	// rowid like the other per-message sidecars.
+	hadPerson, err := attachedTableExists(db, "old", "wa_person")
+	if err != nil {
+		return nil, fmt.Errorf("probe old.wa_person: %w", err)
+	}
+	if hadPerson {
+		if _, err := db.Exec(PersonSidecarsSQL); err != nil {
+			return nil, fmt.Errorf("create person sidecar tables: %w", err)
+		}
+		if _, err := db.Exec(
+			`INSERT OR REPLACE INTO main.wa_person SELECT * FROM old.wa_person`); err != nil {
+			return nil, fmt.Errorf("preserve wa_person: %w", err)
+		}
+		if had, _ := attachedTableExists(db, "old", "wa_person_face"); had {
+			if _, err := db.Exec(
+				`INSERT OR REPLACE INTO main.wa_person_face
+				 SELECT * FROM old.wa_person_face
+				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`); err != nil {
+				return nil, fmt.Errorf("preserve wa_person_face: %w", err)
+			}
+		}
+	}
+
 	return stats, nil
 }
+
+// PersonSidecarsSQL is the canonical schema for the people-tagging
+// sidecar tables. Mirrors the CREATE IF NOT EXISTS in views.sql; keep the
+// two in sync. Co-created here so mergeSidecarsForward can recreate the
+// tables in a fresh staging DB before copying rows into them.
+const PersonSidecarsSQL = `
+CREATE TABLE IF NOT EXISTS wa_person (
+    person_id  INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    hidden     INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS wa_person_name_idx ON wa_person(name);
+CREATE TABLE IF NOT EXISTS wa_person_face (
+    rowid     INTEGER NOT NULL,
+    face_idx  INTEGER NOT NULL,
+    person_id INTEGER NOT NULL,
+    PRIMARY KEY (rowid, face_idx)
+);
+CREATE INDEX IF NOT EXISTS wa_person_face_person_idx ON wa_person_face(person_id);
+`
 
 // createImageSidecarsSQL is the canonical schema for the
 // image-OCR sidecar tables. Embedded as a Go string (rather than a
@@ -569,6 +617,7 @@ func pruneOrphans(dbPath, mediaDir, voiceDir, documentsDir string) (*OrphanPrune
 		{"voice_index", &stats.VoiceIndexRowsDeleted},
 		{"wa_document_text", &stats.DocumentTextRowsDeleted},
 		{"document_index", &stats.DocumentIndexRowsDeleted},
+		{"wa_person_face", &stats.PersonFaceRowsDeleted},
 	}
 	for _, t := range tables {
 		has, err := tableExists(db, t.name)

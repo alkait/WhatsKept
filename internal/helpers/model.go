@@ -52,6 +52,29 @@ var WhisperModel = ModelSpec{
 	Bytes:   574041195,
 }
 
+// AdaFaceModel is the on-device face-recognition model used by the
+// "Find people" feature. It's a CoreML conversion of AdaFace IR-101
+// trained on WebFace12M (minchul/cvlface, MIT-licensed): 112×112 RGB
+// aligned face chips in, a 512-dim L2-normalized identity embedding out.
+// Unlike Apple's general feature-print — or the smaller IR-18 backbone —
+// it actually distinguishes look-alike individuals.
+//
+// Distributed as a zipped .mlpackage, fetched on first use and SHA-256
+// verified, then unzipped beside the archive. Name is the .zip we
+// download and verify; the unzipped AdaFace_IR101.mlpackage/ dir is what
+// the faces helper loads (see internal/app/faces.go).
+//
+// Hosted as a dedicated GitHub release asset (decoupled from app version
+// tags — the model rarely changes). See build/faces-helper/convert/ for
+// how the .mlpackage was produced and its licensing.
+var AdaFaceModel = ModelSpec{
+	Name:    "AdaFace_IR101.mlpackage.zip",
+	Display: "AdaFace IR-101 / WebFace12M (face recognition, MIT)",
+	URL:     "https://github.com/alkait/WhatsKept/releases/download/model-adaface-ir101-v1/AdaFace_IR101.mlpackage.zip",
+	SHA256:  "e897eee264645c90132ad042c999c958b325fc37e4bc2329860330d49803d653",
+	Bytes:   121192622,
+}
+
 // AppSupportDir returns ~/Library/Application Support/whatskept,
 // creating it if it doesn't exist. This is where persistent app
 // data (recent_workspaces.json, models, etc) lives — distinct from

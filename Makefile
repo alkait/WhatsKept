@@ -3,6 +3,8 @@ APP            := dist/WhatsKept.app
 PKG            := ./cmd/whatskept
 VISION_HELPER  := internal/helpers/bundle/whatskept-vision
 VISION_SRC     := build/vision-helper/main.swift
+FACES_HELPER   := internal/helpers/bundle/whatskept-faces
+FACES_SRC      := build/faces-helper/main.swift
 WHISPER_HELPER := internal/helpers/bundle/whisper-cli
 VERSION        ?= 0.0.0-dev
 
@@ -14,7 +16,7 @@ VERSION        ?= 0.0.0-dev
 #                  this tag. Required for the Database tab's sync.
 GO_TAGS := sqlite_fts5
 
-.PHONY: build bundle vision-helper whisper-helper run list extract app clean tidy fmt vet test
+.PHONY: build bundle vision-helper faces-helper whisper-helper run list extract app clean tidy fmt vet test
 
 build: $(BIN)
 
@@ -25,7 +27,7 @@ build: $(BIN)
 # also gives us free incremental rebuilds via Make's file-mtime
 # checking: edit main.swift and `make build` rebuilds the helper +
 # Go binary; no edits and nothing happens.
-$(BIN): vision-helper $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -path './internal/helpers/bundle/*' \) -not -path './dist/*' -not -path './.git/*')
+$(BIN): vision-helper faces-helper $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -path './internal/helpers/bundle/*' \) -not -path './dist/*' -not -path './.git/*')
 	@mkdir -p dist
 	go build -tags "$(GO_TAGS)" -ldflags "-X main.Version=$(VERSION)" -o $(BIN) $(PKG)
 	@chmod +x build/sign.sh
@@ -48,6 +50,21 @@ $(VISION_HELPER): $(VISION_SRC)
 	swiftc -O -o $(VISION_HELPER) $(VISION_SRC)
 	@chmod +x build/sign.sh
 	@./build/sign.sh $(VISION_HELPER)
+
+# Apple Vision face detector + clusterer used by the "Find people" card.
+# A standalone Swift binary (not the persistent vision helper) that walks
+# the workspace media/ folder, detects + embeds + clusters faces across
+# all cores in one shot, and writes faces/clusters.json + crop thumbnails.
+# Like the vision helper, the compiled binary is committed so a fresh
+# clone can `make build` without touching Swift until you edit the .swift.
+faces-helper: $(FACES_HELPER)
+
+$(FACES_HELPER): $(FACES_SRC)
+	@command -v swiftc >/dev/null || { echo "swiftc not found — install Xcode CLT: xcode-select --install"; exit 1; }
+	@mkdir -p $(dir $(FACES_HELPER))
+	swiftc -O -o $(FACES_HELPER) $(FACES_SRC)
+	@chmod +x build/sign.sh
+	@./build/sign.sh $(FACES_HELPER)
 
 # whisper-helper rebuilds internal/helpers/bundle/whisper-cli from
 # a fresh checkout of ggerganov/whisper.cpp. The binary is committed

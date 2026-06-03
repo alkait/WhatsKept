@@ -419,6 +419,57 @@ LEFT JOIN ZWAMEDIAITEM    mi ON mi.ZMESSAGE = m.Z_PK AND m.ZMESSAGETYPE = 7;
 
 
 -- ----------------------------------------------------------------------------
+-- People tagging (GUI-written, agent-read). The user identifies people in
+-- the app's People view (on-device face clustering + naming); those tags
+-- are stored here as sidecar tables and carried forward across re-syncs by
+-- mergeSidecarsForward (like wa_image_text / wa_voice_text), so naming work
+-- is never lost. CREATE IF NOT EXISTS so re-applying views.sql never wipes
+-- existing tags; the canonical DDL also lives in sidecar.go's
+-- createPersonSidecarsSQL — keep the two in sync.
+--
+--   wa_person       — one row per identified person (name is lowercase &
+--                     unique: same name = same person). hidden=1 removes a
+--                     group from the grid + from v_person_photo (junk).
+--   wa_person_face  — which detected face (message rowid + face index)
+--                     belongs to which person. rowid = ZWAMESSAGE.Z_PK.
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS wa_person (
+    person_id  INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    hidden     INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT
+);
+CREATE INDEX IF NOT EXISTS wa_person_name_idx ON wa_person(name);
+CREATE TABLE IF NOT EXISTS wa_person_face (
+    rowid     INTEGER NOT NULL,
+    face_idx  INTEGER NOT NULL,
+    person_id INTEGER NOT NULL,
+    PRIMARY KEY (rowid, face_idx)
+);
+CREATE INDEX IF NOT EXISTS wa_person_face_person_idx ON wa_person_face(person_id);
+
+
+-- ----------------------------------------------------------------------------
+-- v_person_photo: the agent's "show me photos of <name>" surface. One row
+-- per (named, non-hidden) person × photo they appear in. Names are
+-- lowercase — match case-insensitively. `image_path` is a hint; the real
+-- extension may differ (see ./media/), so prefer `open ./media/<rowid>.*`.
+-- ----------------------------------------------------------------------------
+DROP VIEW IF EXISTS v_person_photo;
+CREATE VIEW v_person_photo AS
+SELECT DISTINCT
+    p.name                                    AS person,
+    m.rowid                                   AS rowid,
+    m.ts                                      AS ts,
+    m.chat_title                              AS chat_title,
+    m.sender_name                             AS sender_name,
+    './media/' || m.rowid || '.jpg'           AS image_path
+FROM   wa_person_face pf
+JOIN   wa_person      p ON p.person_id = pf.person_id AND p.name <> '' AND p.hidden = 0
+JOIN   v_messages     m ON m.rowid = pf.rowid;
+
+
+-- ----------------------------------------------------------------------------
 -- messages_fts: FTS5 full-text index over message text.
 --   - rowid joins back to ZWAMESSAGE.Z_PK (i.e. v_messages.rowid).
 --   - Use MATCH for queries: SELECT rowid, snippet(messages_fts, 0, '[[', ']]', '...', 12)

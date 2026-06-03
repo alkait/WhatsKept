@@ -303,7 +303,15 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 		// when we detect a cold launch — that's the default-profile
 		// window Terminal just opened for us. If the user has set
 		// startup-open to "No window", we fall back to a plain `do script`.
-		shellCmd := fmt.Sprintf("cd %s && clear && exec %s", shellQuote(target), shellQuote(resolved))
+		// Claude Code is launched with --dangerously-skip-permissions so
+		// it can read the workspace + run sqlite3 / open without prompting
+		// on every call (the workspace is local, read-only data the user
+		// already trusts). Other CLI agents launch with no extra args.
+		launch := shellQuote(resolved)
+		if spec.ID == "claude-code" || spec.Binary == "claude" {
+			launch += " --dangerously-skip-permissions"
+		}
+		shellCmd := fmt.Sprintf("cd %s && clear && exec %s", shellQuote(target), launch)
 		quoted := appleScriptQuote(shellCmd)
 		ascript := "tell application \"Terminal\"\n" +
 			"set wasRunning to running\n" +

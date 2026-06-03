@@ -148,6 +148,17 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// model required, so no model-status pre-flight unlike voice.
 	mux.HandleFunc("POST /api/database/document-index", s.handleDocumentIndex)
 
+	// People (face clustering) — MVP. Reads only <ws>/media (no backup,
+	// no DB). face-index runs the clusterer; face-clusters returns the
+	// grid; face-crop serves one thumbnail from <ws>/faces/crops.
+	mux.HandleFunc("GET /api/database/face-status", s.handleFaceStatus)
+	mux.HandleFunc("GET /api/database/face-index/model-status", s.handleFaceModelStatus)
+	mux.HandleFunc("POST /api/database/face-index/model-download", s.handleFaceModelDownload)
+	mux.HandleFunc("POST /api/database/face-index", s.handleFaceIndex)
+	mux.HandleFunc("GET /api/database/face-clusters", s.handleFaceClusters)
+	mux.HandleFunc("POST /api/database/face-label", s.handleFaceLabel)
+	mux.HandleFunc("GET /api/faces/crop/{name}", s.handleFaceCrop)
+
 	// Agents — list supported agents (with installed flag) and launch
 	// one with the current workspace as its working folder.
 	mux.HandleFunc("GET /api/agents", s.handleListAgents)
