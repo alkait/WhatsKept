@@ -184,7 +184,7 @@ func (s *server) handleFaceIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	mediaDir := filepath.Join(cur, "media")
 	if countImages(mediaDir) == 0 {
-		httpError(w, http.StatusBadRequest, "no images in media/ — run Sync images first")
+		httpError(w, http.StatusBadRequest, "no images in media/ — download images first")
 		return
 	}
 

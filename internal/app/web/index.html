@@ -1020,6 +1020,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
   const ftsCount    = dbStatus.fts_count;
   const avatarCount  = dbStatus.avatar_count;
   const contactCount = dbStatus.contact_count;
+  const imageCount   = dbStatus.image_downloaded;
   const lastSynced  = dbStatus.last_synced_at;
   const latestBkp   = dbStatus.latest_backup_at;
 
@@ -1049,6 +1050,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
     if (ftsCount != null) parts.push(`${ftsCount.toLocaleString()} in FTS`);
     if (contactCount != null && contactCount > 0) parts.push(`${contactCount.toLocaleString()} contacts`);
     if (avatarCount != null && avatarCount > 0) parts.push(`${avatarCount.toLocaleString()} avatars`);
+    if (imageCount != null && imageCount > 0) parts.push(`${imageCount.toLocaleString()} images`);
     parts.push(`synced ${relativeTime(lastSynced)}`);
     subtitle      = parts.join(" · ");
     buttonLabel   = "Sync again";
@@ -1067,7 +1069,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
           <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Core database</h2>
           <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Required</span>
         </div>
-        <p className="text-[11px] text-gray-400 mt-1">Setup database and foundational files, text messages, iOS contacts and WhatsApp avatars</p>
+        <p className="text-[11px] text-gray-400 mt-1">Setup database and foundational files, text messages, iOS contacts, WhatsApp avatars and image files</p>
       </div>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
@@ -1144,26 +1146,33 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
       </div>
       <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with image descriptions so agents can see the description of the images too</p>
       <div className="rounded-xl bg-white border overflow-hidden" style={{borderColor:'#DCF8C6'}}>
-        <MediaIndexCard
-          dbStatus={dbStatus}
-          job={mediaJob}
-          onMediaIndex={onMediaIndex}
-          hasSessionPassword={hasSessionPassword}
-          reloadDbStatus={reloadDbStatus}
-        />
-        <FindPeopleCard
-          job={faceJob}
-          modelJob={faceModelJob}
-          onFaceIndex={onFaceIndex}
-          onFaceModelDownload={onFaceModelDownload}
-        />
-        <CloudDescribeCard
-          dbStatus={dbStatus}
-          job={cloudJob}
-          onMediaDescribe={onMediaDescribe}
-          hasSessionPassword={hasSessionPassword}
-          reloadDbStatus={reloadDbStatus}
-        />
+        {/* Image FILES are downloaded as part of the messages sync (like
+            avatars/contacts), so these enrichment cards — all password-free
+            consumers of media/ — appear once images are on disk. */}
+        {(dbStatus?.image_downloaded ?? 0) > 0 ? (<>
+          <MediaIndexCard
+            dbStatus={dbStatus}
+            job={mediaJob}
+            onMediaIndex={onMediaIndex}
+            reloadDbStatus={reloadDbStatus}
+          />
+          <FindPeopleCard
+            job={faceJob}
+            modelJob={faceModelJob}
+            onFaceIndex={onFaceIndex}
+            onFaceModelDownload={onFaceModelDownload}
+          />
+          <CloudDescribeCard
+            dbStatus={dbStatus}
+            job={cloudJob}
+            onMediaDescribe={onMediaDescribe}
+            reloadDbStatus={reloadDbStatus}
+          />
+        </>) : (
+          <p className="p-5 text-xs text-gray-500">
+            Images are downloaded as part of the messages sync above. Run a sync to enable image enrichment.
+          </p>
+        )}
       </div>
     </section>
 
@@ -1250,7 +1259,7 @@ function FindPeopleCard({ job, modelJob, onFaceIndex, onFaceModelDownload }) {
   let statusDot = "#9ca3af", title, subtitle, buttonLabel, buttonPrimary = false, action = onFaceIndex;
   if (!hasMedia) {
     title = "No photos to scan yet";
-    subtitle = "Run “Sync images” above first — face grouping reads the photos it extracts into media/.";
+    subtitle = "Download images above first — face grouping reads the photos in media/.";
     buttonLabel = "Find people";
   } else if (needsModel && !mjRunning) {
     // One-time model download gate (the "whisper way").
@@ -1332,19 +1341,32 @@ function FindPeopleCard({ job, modelJob, onFaceIndex, onFaceModelDownload }) {
           </div>
 
           <div className="flex flex-col items-end gap-2 shrink-0">
-            <button
-              onClick={action}
-              disabled={busy || !hasMedia}
-              className="text-xs font-semibold rounded-lg px-3 py-1.5 transition-opacity disabled:opacity-40"
-              style={buttonPrimary ? {background:'#075E54', color:'white'} : {background:'#ECE5DD', color:'#075E54'}}>
-              {mjRunning ? "Downloading…" : isRunning ? "Scanning…" : buttonLabel}
-            </button>
-            {hasClusters && !busy && hasModel && (
+            {hasClusters && !busy && hasModel ? (
+              <>
+                {/* Once people are grouped, the primary action is viewing
+                    them — full-size to match the sibling cards' buttons —
+                    and a re-scan is a low-key dotted-underline link. */}
+                <button
+                  onClick={() => setShowGrid(true)}
+                  className="shrink-0 flex items-center gap-2 rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
+                  style={{background:'#075E54'}}>
+                  View people →
+                </button>
+                <button
+                  onClick={action}
+                  disabled={busy || !hasMedia}
+                  className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted disabled:opacity-40">
+                  Re-scan
+                </button>
+              </>
+            ) : (
               <button
-                onClick={() => setShowGrid(true)}
-                className="text-xs font-semibold rounded-lg px-3 py-1.5 text-white hover:opacity-90 transition-opacity"
-                style={{background:'#075E54'}}>
-                View people →
+                onClick={action}
+                disabled={busy || !hasMedia}
+                className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+                style={{background: busy ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
+                <RefreshIcon />
+                {mjRunning ? "Downloading…" : isRunning ? "Scanning…" : buttonLabel}
               </button>
             )}
           </div>
@@ -1687,19 +1709,17 @@ function PeopleGrid({ onClose }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MediaIndexCard — "Sync images" section under the Database tab
+// MediaIndexCard — "Scan with Apple Vision" section under the Database tab
 // ═══════════════════════════════════════════════════════════════════════════
 // Lifecycle parallels DatabaseTab's messages card: read counts from
 // dbStatus, decide a state ("idle / partial / done / no-db / running"),
 // render the button accordingly, and (when running) show a structured
 // progress card driven by the "progress" events the media-index job
 // emits over SSE.
-function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloadDbStatus }) {
-  const [prompting, setPrompting] = useState(false);
+function MediaIndexCard({ dbStatus, job, onMediaIndex, reloadDbStatus }) {
   const [showIssues, setShowIssues] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [pendingForce, setPendingForce] = useState(false);
   const j = job || {};
   const isRunning = !!j.running;
   const hasDone   = j.done !== undefined && j.done !== null;
@@ -1715,78 +1735,52 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
 
   if (!dbStatus) return null;
   const hasDB    = !!dbStatus.db_exists;
-  const total    = dbStatus.image_total ?? null;
   const indexed  = dbStatus.image_described ?? 0;
-  const missing  = dbStatus.image_missing ?? 0;
-  // Missing files (referenced but not in the backup) can't be indexed,
-  // so measure completion against the *describable* set — otherwise the
-  // card is stuck on "N remaining / Resume" forever.
-  const describable = total != null ? Math.max(total - missing, 0) : null;
-  const remaining = describable != null ? Math.max(describable - indexed, 0) : null;
-  const allDone   = describable != null && describable > 0 && indexed >= describable;
+  // Apple Vision can only scan images that are already on disk, so the
+  // denominator is the downloaded set — not every image on the device.
+  // (The card is only rendered once image_downloaded > 0.)
+  const downloaded = dbStatus.image_downloaded ?? 0;
+  const remaining  = Math.max(downloaded - indexed, 0);
+  const allDone    = downloaded > 0 && indexed >= downloaded;
 
   let title, subtitle, buttonLabel, buttonPrimary, statusDot;
-  if (!hasDB) {
-    title         = "Run a messages sync first";
-    subtitle      = "Image indexing reads the message database — sync that above before scanning images.";
-    buttonLabel   = "Sync images";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (total === 0) {
-    title         = "No image messages on device";
-    subtitle      = "There's nothing to index — your WhatsApp has no JPG images.";
-    buttonLabel   = "Sync images";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (allDone) {
-    title         = "All images indexed";
+  if (allDone) {
+    title         = "All downloaded images scanned";
     subtitle      = (
       <span>
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} indexed</button>
-        {missing > 0 && <> · <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{missing.toLocaleString()} not in backup</button></>}
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} scanned</button>
       </span>
     );
     buttonLabel   = "Re-scan images";
     buttonPrimary = false;
     statusDot     = "#25D366";
   } else if (indexed === 0) {
-    title         = "Images not yet indexed";
-    subtitle      = total != null
-      ? `${total.toLocaleString()} images on the device. Scanning will OCR + classify each one via Apple Vision (~0.2 s / image).`
-      : "Scan will OCR + classify each image via Apple Vision (~0.2 s / image).";
-    buttonLabel   = "Sync images";
+    title         = "Images not yet scanned";
+    subtitle      = `${downloaded.toLocaleString()} downloaded images. Scanning will OCR + classify each one via Apple Vision (~0.2 s / image).`;
+    buttonLabel   = "Scan with Apple Vision";
     buttonPrimary = true;
     statusDot     = "#f59e0b";
   } else {
-    title         = "Resume image indexing";
+    title         = "Resume scanning";
     subtitle      = (
       <span>
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} indexed</button>
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} scanned</button>
         {" · "}
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{remaining.toLocaleString()} remaining</button>
-        {missing > 0 && <> · <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{missing.toLocaleString()} not in backup</button></>}.
+        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{remaining.toLocaleString()} remaining</button>.
       </span>
     );
     buttonLabel   = "Resume";
     buttonPrimary = true;
     statusDot     = "#f59e0b";
   }
-  // Unify the verb with the cloud card, but only relabel as a *re*-run
-  // once at least one image has actually been indexed. A fresh, no-DB, or
-  // not-yet-indexed workspace keeps its per-state call-to-action ("Sync
-  // images") so the button never claims to redo work that never happened.
-  if (indexed > 0) buttonLabel = "Re-describe images";
 
-  const pct = (describable != null && describable > 0)
-    ? Math.min(100, Math.round((indexed / describable) * 100))
+  const pct = downloaded > 0
+    ? Math.min(100, Math.round((indexed / downloaded) * 100))
     : 0;
 
-  // run flow: password gate (if not cached) → start. `force` re-scans
-  // everything with Apple Vision, overwriting existing rows.
-  const run = (force) => {
-    if (hasSessionPassword) onMediaIndex("", { force });
-    else { setPendingForce(force); setPrompting(true); }
-  };
+  // run flow: no password — Apple Vision reads images already on disk.
+  // `force` re-scans everything, overwriting existing rows.
+  const run = (force) => onMediaIndex({ force });
   // The button: when everything's already enriched, the only action is
   // a full Apple re-scan — which overwrites other enrichment (incl.
   // paid cloud descriptions), so confirm first. Otherwise just run.
@@ -1795,7 +1789,7 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
     run(false);
   };
 
-  const buttonDisabled = isRunning || !hasDB || total === 0;
+  const buttonDisabled = isRunning || downloaded === 0;
 
   return (
     <div className="p-5">
@@ -1810,26 +1804,13 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
-            {/* Static (non-running) progress bar, when there's progress to show. */}
-            {!isRunning && hasDB && total != null && total > 0 && (
+            {/* Static (non-running) progress bar, against the downloaded set. */}
+            {!isRunning && downloaded > 0 && (
               <div className="mt-3">
                 <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
                   <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
                 </div>
-                <div className="flex items-center justify-between mt-1">
-                  <p className="text-[10px] text-gray-400">{pct}% indexed</p>
-                  {/* Idle-state issues link — driven by dbStatus, not the
-                      current run (which may not exist yet). Hidden when
-                      both counts are zero so the card stays uncluttered
-                      in the happy path. */}
-                  {((dbStatus.image_errors ?? 0) > 0 || (dbStatus.image_missing ?? 0) > 0) && (
-                    <button onClick={() => setShowIssues(true)}
-                      className="text-[10px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
-                      View {((dbStatus.image_errors ?? 0) + (dbStatus.image_missing ?? 0)).toLocaleString()} issue
-                      {((dbStatus.image_errors ?? 0) + (dbStatus.image_missing ?? 0)) === 1 ? "" : "s"}
-                    </button>
-                  )}
-                </div>
+                <p className="text-[10px] text-gray-400 mt-1">{pct}% scanned</p>
               </div>
             )}
           </div>
@@ -1838,7 +1819,7 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
             className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
             style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
             <RefreshIcon />
-            {isRunning ? "Indexing…" : buttonLabel}
+            {isRunning ? "Scanning…" : buttonLabel}
           </button>
         </div>
 
@@ -1905,19 +1886,10 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
           <p className="text-xs text-gray-500 mt-3">✓ Done. Your images are now searchable by their text and contents.</p>
         )}
 
-      {prompting && (
-        <PasswordPromptModal
-          device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onMediaIndex(pw, { force: pendingForce }); }}
-          onCancel={() => setPrompting(false)}
-          confirmLabel="Sync images"
-        />
-      )}
-
       {showConfirm && (
         <ConfirmModal
           title="Re-scan with Apple Vision?"
-          body={`This re-runs on-device Apple Vision over all ${describable.toLocaleString()} describable images and OVERWRITES their current enrichment — including any AI (cloud) descriptions you've already paid for. Apple Vision is free and private but more basic. Only do this if you want to revert to on-device results.`}
+          body={`This re-runs on-device Apple Vision over all ${downloaded.toLocaleString()} downloaded images and OVERWRITES their current enrichment — including any AI (cloud) descriptions you've already paid for. Apple Vision is free and private but more basic. Only do this if you want to revert to on-device results.`}
           confirmLabel="Re-scan & overwrite"
           onConfirm={() => { setShowConfirm(false); run(true); }}
           onCancel={() => setShowConfirm(false)}
@@ -1933,17 +1905,16 @@ function MediaIndexCard({ dbStatus, job, onMediaIndex, hasSessionPassword, reloa
 // ═══════════════════════════════════════════════════════════════════════════
 // CloudDescribeCard — "Cloud descriptions" section under Image OCR
 // ═══════════════════════════════════════════════════════════════════════════
-// Opt-in cloud describer (OpenRouter). Needs (1) a session API key —
+// Opt-in cloud describer (OpenRouter). Needs only a session API key —
 // prompted via OpenRouterKeyModal, held in RAM by the server, never on
-// disk — and (2) the backup password (reused from the session like the
-// other indexers). Shows coverage (cloud vs on-device), a cost estimate,
-// and a live cost meter while running.
+// disk. It reads the already-downloaded images off disk, so no backup
+// password. Shows coverage (cloud vs on-device), a cost estimate, and a
+// live cost meter while running.
 const CLOUD_COST_PER_IMAGE = 0.0002; // measured ~$ / image, for estimates
 
-function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword, reloadDbStatus }) {
+function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const [status, setStatus]       = useState(null);
   const [showKey, setShowKey]     = useState(false);
-  const [prompting, setPrompting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
@@ -1973,23 +1944,21 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword,
   const model      = (status && status.default_model) || "";
 
   const missing = (status && status.missing) || 0;
-  // Images that CAN be described = total minus those absent from the
-  // backup (no file → undescribable). "done" and coverage are measured
-  // against this, so the 100%/done state is actually reachable.
-  const describable = Math.max(total - missing, 0);
+  // Cloud can only describe images already on disk, so coverage is
+  // measured against the downloaded set — making the 100%/done state
+  // actually reachable.
+  const describable = (status && status.downloaded) || 0;
   const toProcess = Math.max(describable - cloudCount, 0); // still need cloud
   const estCost = toProcess * CLOUD_COST_PER_IMAGE;
   const coveragePct = describable > 0 ? Math.min(100, Math.round((cloudCount / describable) * 100)) : 0;
   const allDone = cloudCount >= describable && describable > 0;
 
-  // The run flow chains through up-to-three just-in-time gates:
-  // confirm (force only) → API key (if none) → backup password (if not
-  // cached) → start. `force` re-describes everything (overwriting cloud
-  // rows); it's carried through the gates via pendingForce.
-  const proceed = (force) => {
-    if (hasSessionPassword) onMediaDescribe("", { model: "", concurrency: CONCURRENCY, force });
-    else { setPendingForce(force); setPrompting(true); }
-  };
+  // The run flow chains through up-to-two just-in-time gates:
+  // confirm (force only) → API key (if none) → start. No backup password
+  // — cloud reads the downloaded images off disk. `force` re-describes
+  // everything (overwriting cloud rows); it's carried through via
+  // pendingForce.
+  const proceed = (force) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, force });
   const beginRun = (force) => {
     if (!hasKey) { setPendingForce(force); setShowKey(true); return; }
     proceed(force);
@@ -2172,15 +2141,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, hasSessionPassword,
         <OpenRouterKeyModal
           onClose={() => setShowKey(false)}
           onSaved={() => { setShowKey(false); reloadStatus(); proceed(pendingForce); }}
-        />
-      )}
-
-      {prompting && (
-        <PasswordPromptModal
-          device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onMediaDescribe(pw, { model: "", concurrency: CONCURRENCY, force: pendingForce }); }}
-          onCancel={() => setPrompting(false)}
-          confirmLabel="Describe with cloud"
         />
       )}
 
@@ -3659,10 +3619,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── start image-OCR (media-index) ─────────────────────────────────────
-  // Uses key "db:media-index" so it matches what the server reports as
-  // the active job's task on /api/jobs/active — that way a page reload
-  // mid-run reconnects to the same in-memory job state.
-  const startMediaIndex = async (password, opts) => {
+  // Apple Vision over the already-downloaded images — no password. Uses
+  // key "db:media-index" so it matches what the server reports as the
+  // active job's task on /api/jobs/active — that way a page reload mid-run
+  // reconnects to the same in-memory job state.
+  const startMediaIndex = async (opts) => {
     const key = "db:media-index";
     patchJob(key, {
       running: true, done: null,
@@ -3671,7 +3632,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       startedAt: new Date().toISOString(), error: "",
     });
     try {
-      const { job_id } = await api.post("/api/database/media-index", { password, force: !!(opts && opts.force) });
+      const { job_id } = await api.post("/api/database/media-index", { force: !!(opts && opts.force) });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -3680,10 +3641,10 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
 
   // ── start cloud media descriptions (media-describe) ───────────────────
   // Key "db:media-describe" matches the server task so a mid-run reload
-  // reconnects. opts = { model, reDescribe }. The OpenRouter key lives in
-  // the server session (set separately); only the backup password flows
-  // through here, same as the other indexers.
-  const startMediaDescribe = async (password, opts) => {
+  // reconnects. opts = { model, concurrency, force }. Cloud describe reads
+  // the already-downloaded images off disk, so no backup password is
+  // needed; the OpenRouter key lives in the server session (set separately).
+  const startMediaDescribe = async (opts) => {
     const key = "db:media-describe";
     patchJob(key, {
       running: true, done: null,
@@ -3693,7 +3654,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     });
     try {
       const { job_id } = await api.post("/api/database/media-describe", {
-        password,
         model: (opts && opts.model) || "",
         concurrency: (opts && opts.concurrency) || 0,
         force: !!(opts && opts.force),

@@ -21,13 +21,24 @@ import (
 )
 
 // This file is the Go port of the Python whatskept.media_indexer
-// module. It owns one user-visible operation:
+// module. It owns two user-visible operations, split so that only the
+// first needs the backup password:
 //
-//   `whatskept media-index` (CLI) / "Sync images" (GUI):
-//   walk every WhatsApp image message in ChatStorage.sqlite,
-//   decrypt the JPEG from the iOS backup, run Apple Vision via the
-//   bundled Swift helper to get OCR text + classification labels,
-//   and persist the results in wa_image_text. Resumable per-row.
+//   1. DownloadMedia — `whatskept media-download` (CLI) / "Download
+//      images" (GUI): walk every WhatsApp image message in
+//      ChatStorage.sqlite, decrypt the JPEG from the iOS backup, and
+//      write it to <workspace>/media/<rowid>.<ext>, marking the row
+//      'downloaded'. The ONLY image step that touches the backup.
+//
+//   2. MediaIndex — `whatskept media-index` (CLI) / "Scan with Apple
+//      Vision" (GUI): for every 'downloaded' row, read the file back
+//      off disk, run the describer (Apple Vision via the bundled Swift
+//      helper, or a cloud vision model) to get OCR text + labels /
+//      description, persist them in wa_image_text, and flip the row to
+//      'described'. A pure consumer of media/ — no password.
+//
+// Both are resumable per-row. Face clustering (faces.go) is a third
+// pure consumer of media/.
 //
 // Design notes (departures from the Python original):
 //
@@ -54,10 +65,19 @@ const (
 	MediaStatusMissing   = "missing"
 	MediaStatusError     = "error"
 
+	// MediaStatusDownloaded means the decrypted image is on disk at
+	// <Workspace>/media/<rowid>.<ext> but has not yet been described.
+	// It is the resting state between the (password-gated) download
+	// step and the enrichment steps (Apple Vision / cloud), which are
+	// pure consumers of the media/ folder. A per-image describe failure
+	// keeps this status and records the reason in describe_error, so the
+	// download step never re-downloads a file that's already on disk.
+	MediaStatusDownloaded = "downloaded"
+
 	// statusCancelled is an internal, never-persisted sentinel: an
-	// in-flight row that processOne abandoned because the context was
-	// cancelled. The collector ignores it (no media_index row written,
-	// so the image is simply re-queued on the next run).
+	// in-flight row that downloadOne/describeOne abandoned because the
+	// context was cancelled. The collector ignores it (the row is left
+	// in its prior state, so the image is simply re-queued next run).
 	statusCancelled = "cancelled"
 
 	// defaultCloudConcurrency is the in-flight cloud request cap when
@@ -65,6 +85,12 @@ const (
 	// under typical provider rate limits while still ~Nx faster than
 	// sequential.
 	defaultCloudConcurrency = 8
+
+	// defaultDownloadConcurrency is the worker count for the download
+	// step. The decrypt itself is serialised (the backup reader isn't
+	// concurrency-safe), so this just overlaps disk writes and DB
+	// commits with the next decrypt — a modest fan-out is plenty.
+	defaultDownloadConcurrency = 4
 
 	// All WhatsApp ChatStorage references to media files are
 	// relative paths under the Message/ subtree of WhatsApp's
@@ -79,7 +105,7 @@ const (
 	defaultLabelMinConf = 0.50
 )
 
-// mediaImageExts lists every on-disk extension processOne is allowed
+// mediaImageExts lists every on-disk extension downloadOne is allowed
 // to write under <Workspace>/media/. Used by the orphan-prune walk
 // to know which suffixes mean "indexer output" vs "user-dropped
 // files we don't touch". Keep in sync with detectImageFormat.
@@ -201,8 +227,9 @@ type MediaIndexProgress struct {
 	Done       int     `json:"done"`         // processed this run (any status)
 	Total      int     `json:"total"`        // total images on device
 	Pending    int     `json:"pending"`      // queued for this run
-	Baseline   int     `json:"baseline"`     // already done by this engine at run start (for cumulative coverage)
-	Described  int     `json:"described"`    // OCR succeeded count this run
+	Baseline   int     `json:"baseline"`     // already done by this phase at run start (for cumulative coverage)
+	Downloaded int     `json:"downloaded"`   // images written to media/ this run (download phase)
+	Described  int     `json:"described"`    // OCR/describe succeeded count this run
 	Missing    int     `json:"missing"`      // file absent in backup this run
 	Errors     int     `json:"errors"`       // failures this run
 	WithOCR    int     `json:"with_ocr"`     // rows with non-empty ocr_text
@@ -221,6 +248,7 @@ type MediaIndexResult struct {
 	TotalCandidates  int     `json:"total_candidates"`
 	AlreadyDescribed int     `json:"already_described"`
 	Processed        int     `json:"processed"`
+	Downloaded       int     `json:"downloaded"`
 	Described        int     `json:"described"`
 	Missing          int     `json:"missing"`
 	Errors           int     `json:"errors"`
@@ -233,28 +261,25 @@ type MediaIndexResult struct {
 	Cancelled        bool    `json:"cancelled,omitempty"`
 }
 
-// MediaIndex runs the full image-OCR pipeline against the workspace.
-// See package doc-comment in media.go for the design notes.
-func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
+// DownloadMedia decrypts every WhatsApp image referenced in
+// ChatStorage.sqlite from the encrypted iOS backup and writes it to
+// <Workspace>/media/<rowid>.<ext>. This is the only image step that
+// touches the backup, so it is the only one that needs Password. The
+// enrichment steps (MediaIndex / face clustering) are pure consumers of
+// the media/ folder. Resumable per-row: a row is marked 'downloaded'
+// only after its atomic write + DB commit succeed.
+func DownloadMedia(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if opts.Workspace == "" {
-		return nil, errors.New("media-index: Workspace required")
+		return nil, errors.New("media-download: Workspace required")
 	}
 	if opts.Password == "" {
-		return nil, errors.New("media-index: Password required for encrypted backups")
+		return nil, errors.New("media-download: Password required for encrypted backups")
 	}
 	if opts.Ctx == nil {
 		opts.Ctx = context.Background()
 	}
 	if opts.Log == nil {
 		opts.Log = func(string) {}
-	}
-	if opts.LabelTopN <= 0 {
-		opts.LabelTopN = defaultLabelTopN
-	}
-	if opts.LabelMinConf < 0 {
-		opts.LabelMinConf = defaultLabelMinConf
-	} else if opts.LabelMinConf == 0 {
-		opts.LabelMinConf = defaultLabelMinConf
 	}
 	if opts.ProgressEvery <= 0 {
 		opts.ProgressEvery = 25
@@ -266,7 +291,6 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		return nil, fmt.Errorf("mkdir media dir: %w", err)
 	}
 
-	// --- Open DB + ensure schema --------------------------------
 	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
@@ -282,7 +306,7 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		return nil, err
 	}
 	if !info.IsEncrypted {
-		return nil, errors.New("media-index: backup is not encrypted (whatskept media-index requires an encrypted backup)")
+		return nil, errors.New("media-download: backup is not encrypted (whatskept requires an encrypted backup)")
 	}
 	opts.Log(fmt.Sprintf("Backup: %s", info.Path))
 	opts.Log("Unlocking iOS backup…")
@@ -290,44 +314,161 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open backup: %w", err)
 	}
+	res := &MediaIndexResult{BackupPath: info.Path, Workspace: opts.Workspace}
+	if err := downloadMediaWithBundle(opts, db, bundle, mediaDir, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
 
-	// Build manifest lookup: (domain, path) -> *Record. The whole
-	// scan is O(N) once; per-row lookup is O(1). Allocating ~50K
-	// pointers costs ~400 KB which is fine.
-	opts.Log("Indexing backup manifest…")
+// downloadMediaDuringSync decrypts WhatsApp images into <workspace>/media/
+// as a step of the core SyncMessages pipeline, reusing the backup bundle
+// the sync already opened. Image files are cheap (decryption is
+// milliseconds each), so — like SyncContacts/SyncProfiles — they're pulled
+// as part of the sync; only the enrichment (Apple Vision / cloud) is
+// optional and deferred. Fail-soft: the caller logs an error and continues.
+func downloadMediaDuringSync(bundle *backup.Bundle, workspace, dbPath string, log func(string)) (*MediaIndexResult, error) {
+	mediaDir := filepath.Join(workspace, "media")
+	if err := os.MkdirAll(mediaDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir media dir: %w", err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+	if err := ensureImageSidecarSchema(db); err != nil {
+		return nil, err
+	}
+
+	opts := MediaIndexOptions{
+		Workspace:     workspace,
+		Ctx:           context.Background(),
+		Log:           log,
+		ProgressEvery: 500, // periodic "Downloading images…" log lines
+		// The sync's SSE stream is log-only, so render progress as lines.
+		Progress: func(p MediaIndexProgress) {
+			log(fmt.Sprintf("Downloading images… %d / %d", p.Done, p.Pending))
+		},
+	}
+	res := &MediaIndexResult{Workspace: workspace}
+	if err := downloadMediaWithBundle(opts, db, bundle, mediaDir, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// downloadMediaWithBundle runs the decrypt→write pipeline against an
+// already-open backup bundle and DB. Shared by DownloadMedia (which opens
+// its own bundle) and downloadMediaDuringSync (which reuses the sync's).
+// mediaDir must already exist. Fills res with the run tallies.
+func downloadMediaWithBundle(opts MediaIndexOptions, db *sql.DB, bundle *backup.Bundle, mediaDir string, res *MediaIndexResult) error {
 	manifestIdx := buildManifestIndex(bundle, backup.WhatsAppDomain)
 
-	// --- Pick candidates ---------------------------------------
+	total, _, err := countMediaCandidates(db)
+	if err != nil {
+		return err
+	}
+	alreadyDownloaded, err := countDownloaded(db)
+	if err != nil {
+		return err
+	}
+	candidates, err := selectDownloadCandidates(db, opts.RetryMissing, opts.RetryErrors, opts.Limit)
+	if err != nil {
+		return err
+	}
+	res.TotalCandidates = total
+	res.AlreadyDescribed = alreadyDownloaded // here: images already on disk
+	if len(candidates) == 0 {
+		opts.Log(fmt.Sprintf("Images: %d / %d already on disk; nothing to download.", alreadyDownloaded, total))
+		return nil
+	}
+	opts.Log(fmt.Sprintf("Images on device: %d · already on disk: %d · to download: %d",
+		total, alreadyDownloaded, len(candidates)))
+
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultDownloadConcurrency
+	}
+	var decryptMu sync.Mutex
+	process := func(ctx context.Context, c candidate) oneResult {
+		return downloadOne(ctx, db, bundle, &decryptMu, manifestIdx, mediaDir, c, opts.Log)
+	}
+	// Download never changes ocr_text/labels, so no FTS rebuild.
+	_ = runMediaPipeline(opts, res, db, candidates, total, alreadyDownloaded, concurrency, nil, false, process)
+
+	opts.Log(fmt.Sprintf(
+		"Downloaded %d images (%d missing, %d errors) in %.0fs.",
+		res.Downloaded, res.Missing, res.Errors, res.DurationSec,
+	))
+	return nil
+}
+
+// MediaIndex describes images that are already on disk in
+// <Workspace>/media/ (written by DownloadMedia). It runs the selected
+// describer (Apple Vision on-device, or a cloud vision model) over every
+// 'downloaded' row, writes the OCR/labels/description into wa_image_text,
+// and transitions the row to 'described'. It needs NO backup password —
+// it never touches the encrypted backup. Resumable per-row.
+func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
+	if opts.Workspace == "" {
+		return nil, errors.New("media-index: Workspace required")
+	}
+	if opts.Ctx == nil {
+		opts.Ctx = context.Background()
+	}
+	if opts.Log == nil {
+		opts.Log = func(string) {}
+	}
+	if opts.LabelTopN <= 0 {
+		opts.LabelTopN = defaultLabelTopN
+	}
+	if opts.LabelMinConf <= 0 {
+		opts.LabelMinConf = defaultLabelMinConf
+	}
+	if opts.ProgressEvery <= 0 {
+		opts.ProgressEvery = 25
+	}
+
+	dbPath := filepath.Join(opts.Workspace, "ChatStorage.sqlite")
+	mediaDir := filepath.Join(opts.Workspace, "media")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+	if err := ensureImageSidecarSchema(db); err != nil {
+		return nil, err
+	}
+
 	total, alreadyDescribed, err := countMediaCandidates(db)
 	if err != nil {
 		return nil, err
 	}
-	// The cloud describer always upgrades: it re-queues every row not
-	// already described by cloud (Apple rows, never-described, and
-	// transient 'error' rows), and never downgrades a cloud row (those
-	// are excluded). Apple Vision is the base layer and never upgrades.
-	upgradeSource := ""
-	if opts.Engine == SourceCloud && !opts.Force {
-		upgradeSource = SourceCloud
-	}
-	candidates, err := selectMediaCandidates(db, opts.RetryMissing, opts.RetryErrors, upgradeSource, opts.Force, opts.Limit)
+	downloaded, err := countDownloaded(db)
 	if err != nil {
 		return nil, err
 	}
-	if len(candidates) == 0 {
-		opts.Log(fmt.Sprintf("Nothing to do: %d / %d already described.", alreadyDescribed, total))
-		ftsN, _ := rebuildFTS(db)
-		return &MediaIndexResult{
-			BackupPath:       info.Path,
-			Workspace:        opts.Workspace,
-			TotalCandidates:  total,
-			AlreadyDescribed: alreadyDescribed,
-			FTSCountAfter:    ftsN,
-		}, nil
+	candidates, err := selectDescribeCandidates(db, opts.Engine, opts.RetryErrors, opts.Force, opts.Limit)
+	if err != nil {
+		return nil, err
 	}
-	opts.Log(fmt.Sprintf("Image messages on device: %d", total))
-	opts.Log(fmt.Sprintf("Already described:        %d", alreadyDescribed))
-	opts.Log(fmt.Sprintf("Queued this run:          %d", len(candidates)))
+
+	res := &MediaIndexResult{
+		Workspace:        opts.Workspace,
+		TotalCandidates:  total,
+		AlreadyDescribed: alreadyDescribed,
+	}
+	if len(candidates) == 0 {
+		opts.Log(fmt.Sprintf("Nothing to describe: %d / %d downloaded images already described.", alreadyDescribed, downloaded))
+		ftsN, _ := rebuildFTS(db)
+		res.FTSCountAfter = ftsN
+		return res, nil
+	}
+	opts.Log(fmt.Sprintf("Images downloaded:  %d", downloaded))
+	opts.Log(fmt.Sprintf("Already described:  %d", alreadyDescribed))
+	opts.Log(fmt.Sprintf("Queued this run:    %d", len(candidates)))
 
 	// --- Build the describer (Apple Vision or cloud) -----------
 	describer, err := buildDescriber(opts)
@@ -339,15 +480,56 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	opts.Log(fmt.Sprintf("Describer: %s%s (concurrency %d)",
 		describer.Source(), modelSuffix(describer.Model()), concurrency))
 
-	// --- Worker pool -------------------------------------------
-	// Each worker runs the full decrypt → describe → commit pipeline.
-	// The describe call (HTTP, for cloud) is the parallel part; the
-	// decrypt is serialised behind decryptMu (the backup reader isn't
-	// known-concurrency-safe) and DB writes are serialised by capping
-	// the SQLite pool to a single connection. Both are sub-millisecond
-	// next to a multi-second model call, so we still get ~Nx speedup.
+	// baseline = images already done by THIS engine at run start, so the
+	// UI can show cumulative coverage (baseline + described-this-run)
+	// rather than a per-run count that looks tiny next to prior progress.
+	baseline := alreadyDescribed
+	if opts.Engine == SourceCloud {
+		_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = ?`, SourceCloud).Scan(&baseline)
+	}
+
+	process := func(ctx context.Context, c candidate) oneResult {
+		return describeOne(ctx, db, describer, mediaDir, c, opts.Log)
+	}
+	fatalErr := runMediaPipeline(opts, res, db, candidates, total, baseline, concurrency,
+		func() float64 { return describerCost(describer) }, true, process)
+
+	opts.Log(fmt.Sprintf(
+		"Done in %.0fs. described=%d errors=%d (rate %.1f/s)",
+		res.DurationSec, res.Described, res.Errors,
+		float64(res.Processed)/maxF(res.DurationSec, 0.001),
+	))
+
+	// A fatal failure is surfaced as an error (the committed rows above
+	// are kept and searchable) so the caller/job reports WHY it stopped
+	// instead of a misleading "success".
+	if fatalErr != nil {
+		return res, fmt.Errorf("describe run aborted after %d images: %w", res.Described, fatalErr)
+	}
+	return res, nil
+}
+
+// runMediaPipeline drives the worker pool + collector shared by the
+// download and describe phases. `process` does the per-row work; the
+// rest — graceful cancellation, fatal-error abort, tallies, progress
+// emission, and an optional FTS rebuild — is identical across phases.
+// It fills res and returns the first FatalError seen (download never
+// produces one). DB writes are serialised by capping the SQLite pool to
+// a single connection.
+func runMediaPipeline(
+	opts MediaIndexOptions,
+	res *MediaIndexResult,
+	db *sql.DB,
+	candidates []candidate,
+	total, baseline, concurrency int,
+	costFn func() float64,
+	rebuildFTSAfter bool,
+	process func(ctx context.Context, c candidate) oneResult,
+) error {
+	if opts.ProgressEvery <= 0 {
+		opts.ProgressEvery = 25 // guard the progress-emit modulo
+	}
 	db.SetMaxOpenConns(1)
-	var decryptMu sync.Mutex
 
 	// runCtx is cancelled either by the caller (user Stop) or internally
 	// when a worker hits a FatalError (bad key / no credits) — both make
@@ -357,22 +539,14 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	var fatalErr error
 	var fatalMu sync.Mutex
 
-	res := &MediaIndexResult{
-		BackupPath:       info.Path,
-		Workspace:        opts.Workspace,
-		TotalCandidates:  total,
-		AlreadyDescribed: alreadyDescribed,
+	cost := func() float64 {
+		if costFn == nil {
+			return 0
+		}
+		return costFn()
 	}
 
-	// baseline = images already done by THIS engine at run start, so the
-	// UI can show cumulative coverage (baseline + described-this-run)
-	// rather than a per-run count that looks tiny next to prior progress.
-	baseline := alreadyDescribed
-	if opts.Engine == SourceCloud {
-		_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = ?`, SourceCloud).Scan(&baseline)
-	}
 	tStart := time.Now()
-
 	jobsCh := make(chan candidate)
 	resCh := make(chan oneResult, concurrency)
 
@@ -382,7 +556,7 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		go func() {
 			defer wg.Done()
 			for c := range jobsCh {
-				resCh <- processOne(runCtx, db, bundle, &decryptMu, manifestIdx, describer, mediaDir, c, opts.Log)
+				resCh <- process(runCtx, c)
 			}
 		}()
 	}
@@ -420,6 +594,8 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		}
 		res.Processed++
 		switch r.status {
+		case MediaStatusDownloaded:
+			res.Downloaded++
 		case MediaStatusDescribed:
 			res.Described++
 			if r.withOCR {
@@ -438,12 +614,12 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		}
 		processed++
 		if opts.Progress != nil && processed%opts.ProgressEvery == 0 {
-			res.CostUSD = describerCost(describer)
+			res.CostUSD = cost()
 			emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
 		}
 	}
 
-	res.CostUSD = describerCost(describer)
+	res.CostUSD = cost()
 	res.DurationSec = time.Since(tStart).Seconds()
 	// A user Stop cancels opts.Ctx; a fatal abort cancels only runCtx.
 	if fatalErr == nil && opts.Ctx.Err() != nil {
@@ -454,29 +630,18 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 		emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
 	}
 
-	opts.Log(fmt.Sprintf(
-		"Done in %.0fs. described=%d missing=%d errors=%d (rate %.1f/s)",
-		res.DurationSec, res.Described, res.Missing, res.Errors,
-		float64(res.Processed)/maxF(res.DurationSec, 0.001),
-	))
-
-	// Rebuild FTS so the new ocr_text + labels are searchable.
-	opts.Log("Rebuilding messages_fts…")
-	ftsN, err := rebuildFTS(db)
-	if err != nil {
-		opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
-	} else {
-		res.FTSCountAfter = ftsN
-		opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
+	if rebuildFTSAfter {
+		// Rebuild FTS so the new ocr_text + labels are searchable.
+		opts.Log("Rebuilding messages_fts…")
+		ftsN, err := rebuildFTS(db)
+		if err != nil {
+			opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
+		} else {
+			res.FTSCountAfter = ftsN
+			opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
+		}
 	}
-
-	// A fatal failure is surfaced as an error (the committed rows above
-	// are kept and searchable) so the caller/job reports WHY it stopped
-	// instead of a misleading "success".
-	if fatalErr != nil {
-		return res, fmt.Errorf("describe run aborted after %d images: %w", res.Described, fatalErr)
-	}
-	return res, nil
+	return fatalErr
 }
 
 // buildDescriber constructs the Describer selected by opts.Engine.
@@ -532,8 +697,8 @@ func describerCost(d Describer) float64 {
 	return 0
 }
 
-// oneResult is processOne's outcome, carrying the per-row tallies so
-// the collector needn't re-query the DB for progress counts.
+// oneResult is downloadOne/describeOne's outcome, carrying the per-row
+// tallies so the collector needn't re-query the DB for progress counts.
 type oneResult struct {
 	status          string
 	withOCR         bool
@@ -620,51 +785,86 @@ func countMediaCandidates(db *sql.DB) (total, already int, err error) {
 	return total, already, nil
 }
 
-// selectMediaCandidates is the resume query. Rows already in
-// media_index with a "skip" status are excluded.
-//
-// upgradeSource changes the meaning of "done". When empty (the normal
-// case) any 'described' row is skipped. When set (e.g. SourceCloud
-// during a re-describe), 'described' is NOT in the skip set — instead
-// only rows already described by THAT source are excluded, so rows
-// produced by a different describer get re-queued (an upgrade) while
-// same-source rows stay idempotently skipped.
-func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, upgradeSource string, force bool, limit int) ([]candidate, error) {
-	// force = re-describe everything describable (overwrite even cloud
-	// rows), e.g. to apply an improved prompt or a different model.
-	var skip []any
-	if upgradeSource == "" && !force {
-		skip = append(skip, MediaStatusDescribed)
+// countDownloaded returns how many images are on disk in media/ — rows
+// that are either 'downloaded' (awaiting describe) or 'described' (a
+// described row's file is still on disk). This is the denominator the
+// describe phase and the UI gate measure against.
+func countDownloaded(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM media_index WHERE status IN (?, ?)`,
+		MediaStatusDownloaded, MediaStatusDescribed,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count downloaded: %w", err)
 	}
+	return n, nil
+}
+
+// selectDownloadCandidates is the resume query for the download phase:
+// every WhatsApp image whose file is NOT already on disk. Rows already
+// 'downloaded' or 'described' are skipped (file present); 'missing' and
+// download-'error' rows are skipped unless the matching retry flag asks
+// to re-attempt them.
+func selectDownloadCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int) ([]candidate, error) {
+	skip := []any{MediaStatusDownloaded, MediaStatusDescribed}
 	if !retryMissing {
-		skip = append(skip, MediaStatusMissing) // no file → undescribable
+		skip = append(skip, MediaStatusMissing)
 	}
-	// In upgrade mode (cloud) and force mode we always re-attempt
-	// 'error' rows: these failures are virtually always transient (no
-	// credits, network, rate limit), not the model refusing an image.
-	// Outside those, honour the explicit retryErrors flag.
-	if !retryErrors && upgradeSource == "" && !force {
+	if !retryErrors {
 		skip = append(skip, MediaStatusError)
 	}
-
-	var where strings.Builder
-	where.WriteString("m.ZMEDIALOCALPATH LIKE '%.jpg'")
-	args := make([]any, 0, len(skip)+2)
-
-	if len(skip) > 0 {
-		ph := strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",")
-		fmt.Fprintf(&where,
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",")
+	where := fmt.Sprintf(
+		"m.ZMEDIALOCALPATH LIKE '%%.jpg'"+
 			"\n\t\t  AND m.ZMESSAGE NOT IN (SELECT rowid FROM media_index WHERE status IN (%s))", ph)
-		args = append(args, skip...)
-	}
-	if upgradeSource != "" {
-		where.WriteString(
-			"\n\t\t  AND m.ZMESSAGE NOT IN (SELECT mi.rowid FROM media_index mi" +
-				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
-				" WHERE mi.status = ? AND t.source = ?)")
-		args = append(args, MediaStatusDescribed, upgradeSource)
+	return queryCandidates(db, where, skip, limit)
+}
+
+// selectDescribeCandidates is the resume query for the describe phase.
+// It only ever queues rows whose file is already on disk.
+//
+//   - Apple (default): every 'downloaded' row not yet described. A prior
+//     per-image describe failure (describe_error set) is skipped unless
+//     retryErrors. With force, also re-describes apple-sourced rows.
+//   - Cloud: upgrades — every 'downloaded' row plus any 'described' row
+//     NOT produced by cloud, never re-doing a cloud row. With force,
+//     re-describes every on-disk row regardless of source.
+func selectDescribeCandidates(db *sql.DB, engine string, retryErrors, force bool, limit int) ([]candidate, error) {
+	downloadedReady := "status = '" + MediaStatusDownloaded + "'"
+	if !retryErrors {
+		downloadedReady += " AND describe_error IS NULL"
 	}
 
+	var sub string
+	switch engine {
+	case SourceCloud:
+		if force {
+			sub = "SELECT rowid FROM media_index WHERE status IN ('" +
+				MediaStatusDownloaded + "','" + MediaStatusDescribed + "')"
+		} else {
+			sub = "SELECT rowid FROM media_index WHERE " + downloadedReady +
+				" UNION SELECT mi.rowid FROM media_index mi" +
+				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
+				" WHERE mi.status = '" + MediaStatusDescribed + "' AND t.source <> '" + SourceCloud + "'"
+		}
+	default: // apple
+		if force {
+			sub = "SELECT rowid FROM media_index WHERE status = '" + MediaStatusDownloaded + "'" +
+				" UNION SELECT mi.rowid FROM media_index mi" +
+				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
+				" WHERE mi.status = '" + MediaStatusDescribed + "' AND t.source = '" + SourceApple + "'"
+		} else {
+			sub = "SELECT rowid FROM media_index WHERE " + downloadedReady
+		}
+	}
+	where := "m.ZMEDIALOCALPATH LIKE '%.jpg'\n\t\t  AND m.ZMESSAGE IN (" + sub + ")"
+	return queryCandidates(db, where, nil, limit)
+}
+
+// queryCandidates runs the shared candidate SELECT against the given
+// WHERE clause (which both selectors build) and scans the rows into
+// candidate structs.
+func queryCandidates(db *sql.DB, whereClause string, args []any, limit int) ([]candidate, error) {
 	q := fmt.Sprintf(`
 		SELECT m.ZMESSAGE,
 		       '%s' || m.ZMEDIALOCALPATH,
@@ -673,7 +873,7 @@ func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, upgradeSo
 		JOIN   ZWAMESSAGE   wm ON wm.Z_PK = m.ZMESSAGE
 		WHERE  %s
 		ORDER BY m.ZMESSAGE ASC`,
-		mediaManifestPrefix, where.String())
+		mediaManifestPrefix, whereClause)
 	if limit > 0 {
 		q += fmt.Sprintf("\n\t\tLIMIT %d", limit)
 	}
@@ -692,26 +892,31 @@ func selectMediaCandidates(db *sql.DB, retryMissing, retryErrors bool, upgradeSo
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
-// processOne runs the full decrypt → describe → commit pipeline for
-// one candidate and returns the outcome (status + per-row tallies).
-// Safe to run from multiple goroutines: the decrypt is serialised
-// behind decryptMu and DB writes go through a single-connection pool
-// (see MediaIndex). Per-row commit means a cancel mid-run is safe.
-func processOne(
+// downloadOne runs the decrypt → format-sniff → atomic-write pipeline
+// for one candidate and records the outcome in media_index
+// (downloaded / missing / error). It never describes. Safe to run from
+// multiple goroutines: the decrypt is serialised behind decryptMu and
+// DB writes go through a single-connection pool (see runMediaPipeline).
+// A row is marked 'downloaded' only after a clean write + commit, so a
+// crash mid-run simply re-queues it.
+func downloadOne(
 	ctx context.Context,
 	db *sql.DB,
 	bundle *backup.Bundle,
 	decryptMu *sync.Mutex,
 	manifestIdx map[string]*backup.Record,
-	describer Describer,
 	mediaDir string,
 	c candidate,
 	log func(string),
 ) oneResult {
 	now := nowUTC()
+
+	if ctx.Err() != nil {
+		return oneResult{status: statusCancelled}
+	}
 
 	// 1. Find the file in the manifest.
 	rec, ok := manifestIdx[c.manifestPath]
@@ -730,7 +935,7 @@ func processOne(
 	//    that's identical to "file not in manifest", so reclassify
 	//    as missing instead of error.
 	// The backup reader isn't known-concurrency-safe, so serialise the
-	// decrypt+read. It's milliseconds next to the describe call, so
+	// decrypt+read. It's milliseconds next to the disk write, so
 	// holding the lock here costs the worker pool almost nothing.
 	decryptMu.Lock()
 	rd, err := bundle.FileReader(*rec)
@@ -763,8 +968,8 @@ func processOne(
 	//    HEIC (Live Photos and modern iPhone cameras), and GIF.
 	//    Apple Vision handles all four natively. Anything else
 	//    (zero-byte files, truncated downloads, AES-padded garbage)
-	//    is recorded as STATUS_ERROR rather than handed to Vision,
-	//    which would otherwise emit a generic "unsupported format".
+	//    is recorded as STATUS_ERROR rather than written, since no
+	//    describer could read it later.
 	ext, ok := detectImageFormat(data)
 	if !ok {
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
@@ -773,10 +978,9 @@ func processOne(
 	}
 
 	// 4. Write to disk. Atomic via tmp+rename so an interrupted
-	//    write doesn't leave a half-image that Vision would barf
-	//    on a future retry. Use the detected extension so `file`
-	//    and `open` behave honestly — agents glob `<rowid>.*` per
-	//    AGENTS.md.
+	//    write doesn't leave a half-image a describer would barf on.
+	//    Use the detected extension so `file` and `open` behave
+	//    honestly — agents glob `<rowid>.*` per AGENTS.md.
 	out := filepath.Join(mediaDir, fmt.Sprintf("%d.%s", c.rowid, ext))
 	if err := writeFileAtomic(out, data); err != nil {
 		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
@@ -784,31 +988,66 @@ func processOne(
 		return oneResult{status: MediaStatusError}
 	}
 
-	// 5. Describe (Apple Vision subprocess or cloud HTTP).
-	dres, err := describer.Describe(ctx, c.rowid, out, data)
+	// 5. Mark downloaded (file on disk, awaiting describe). INSERT OR
+	//    REPLACE clears any prior error/describe_error for this row.
+	writeMediaIndex(db, c, MediaStatusDownloaded, int64(len(data)), "", now)
+	return oneResult{status: MediaStatusDownloaded}
+}
+
+// describeOne reads one already-downloaded image off disk and runs the
+// describer over it (Apple Vision subprocess or cloud HTTP), writing the
+// result into wa_image_text and transitioning the media_index row
+// downloaded→described. It never touches the backup. A per-image
+// describe failure keeps status='downloaded' and records the reason in
+// describe_error so the row is NOT re-downloaded and the retry path can
+// find it. The returned oneResult.status is for the in-memory tally only.
+func describeOne(
+	ctx context.Context,
+	db *sql.DB,
+	describer Describer,
+	mediaDir string,
+	c candidate,
+	log func(string),
+) oneResult {
+	now := nowUTC()
+
+	// Locate the on-disk image written by the download step.
+	path, ok := findMediaFile(mediaDir, c.rowid)
+	if !ok {
+		// File vanished (user cleared media/). Leave the row as
+		// 'downloaded' so a re-download re-queues it, but record why
+		// this describe attempt failed.
+		setDescribeError(db, c.rowid, "file missing on disk at describe time", now)
+		return oneResult{status: MediaStatusError}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		setDescribeError(db, c.rowid, fmt.Sprintf("read: %v", err), now)
+		return oneResult{status: MediaStatusError}
+	}
+
+	dres, err := describer.Describe(ctx, c.rowid, path, data)
 	if err != nil {
 		// A global failure (bad key, no credits) must abort the whole
-		// run — don't write an error row (so the image re-queues next
-		// time) and signal fatal to the collector.
+		// run — leave the row 'downloaded' (no describe_error, so it
+		// re-queues cleanly) and signal fatal to the collector.
 		var fatal *FatalError
 		if errors.As(err, &fatal) {
 			return oneResult{status: statusCancelled, fatal: err}
 		}
-		// Cancellation isn't a per-row error — report it as the
-		// internal sentinel so the row is left un-described and simply
-		// re-queued next run (no error row written).
+		// Cancellation isn't a per-row error — the row stays 'downloaded'
+		// and is simply re-queued next run.
 		if ctx.Err() != nil {
 			return oneResult{status: statusCancelled}
 		}
-		writeMediaIndex(db, c, MediaStatusError, int64(len(data)),
-			fmt.Sprintf("describe: %v", err), now)
+		setDescribeError(db, c.rowid, fmt.Sprintf("describe: %v", err), now)
 		return oneResult{status: MediaStatusError}
 	}
 
-	// 6. Persist results. One transaction so wa_image_text and
-	//    media_index are atomic. INSERT OR REPLACE so a re-run
-	//    (--retry-errors, or a cloud re-describe upgrade) overwrites
-	//    cleanly, including the source/model provenance.
+	// Persist results. One transaction so wa_image_text and the
+	// media_index status flip stay atomic. INSERT OR REPLACE on
+	// wa_image_text so a re-run (force, or a cloud upgrade) overwrites
+	// cleanly, including the source/model provenance.
 	tx, err := db.Begin()
 	if err != nil {
 		log(fmt.Sprintf("[rowid=%d] begin tx: %v", c.rowid, err))
@@ -827,13 +1066,11 @@ func processOne(
 		return oneResult{status: MediaStatusError}
 	}
 	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO media_index
-		 (rowid, manifest_path, msg_type, status, bytes, error, attempted_at)
-		 VALUES (?, ?, ?, ?, ?, NULL, ?)`,
-		c.rowid, c.manifestPath, c.msgType, MediaStatusDescribed, int64(len(data)), now,
+		`UPDATE media_index SET status = ?, describe_error = NULL, attempted_at = ? WHERE rowid = ?`,
+		MediaStatusDescribed, now, c.rowid,
 	); err != nil {
 		_ = tx.Rollback()
-		log(fmt.Sprintf("[rowid=%d] insert media_index: %v", c.rowid, err))
+		log(fmt.Sprintf("[rowid=%d] update media_index: %v", c.rowid, err))
 		return oneResult{status: MediaStatusError}
 	}
 	if err := tx.Commit(); err != nil {
@@ -848,10 +1085,34 @@ func processOne(
 	}
 }
 
+// findMediaFile returns the on-disk path of the downloaded image for a
+// rowid, probing each extension the download step may have written
+// (jpg / png / heic / gif). ok=false means no file is present.
+func findMediaFile(mediaDir string, rowid int64) (string, bool) {
+	for _, ext := range mediaImageExts {
+		p := filepath.Join(mediaDir, fmt.Sprintf("%d%s", rowid, ext))
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+// setDescribeError records a per-image describe failure on an existing
+// (downloaded) media_index row without changing its status, so the file
+// stays on disk and is not re-downloaded.
+func setDescribeError(db *sql.DB, rowid int64, msg, now string) {
+	_, _ = db.Exec(
+		`UPDATE media_index SET describe_error = ?, attempted_at = ? WHERE rowid = ?`,
+		msg, now, rowid,
+	)
+}
+
 // writeMediaIndex commits a single media_index row outside any
-// caller-managed transaction. Used for terminal-status writes
-// (missing / error) where there's no corresponding wa_image_text
-// row to keep atomic with.
+// caller-managed transaction. Used by the download phase for every
+// terminal outcome (downloaded / missing / error). INSERT OR REPLACE
+// resets describe_error to NULL — a freshly (re)downloaded row has no
+// describe failure.
 func writeMediaIndex(db *sql.DB, c candidate, status string, bytesLen int64, errMsg string, now string) {
 	var errVal any
 	if errMsg != "" {
@@ -859,8 +1120,8 @@ func writeMediaIndex(db *sql.DB, c candidate, status string, bytesLen int64, err
 	}
 	_, _ = db.Exec(
 		`INSERT OR REPLACE INTO media_index
-		 (rowid, manifest_path, msg_type, status, bytes, error, attempted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		 (rowid, manifest_path, msg_type, status, bytes, error, describe_error, attempted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
 		c.rowid, c.manifestPath, c.msgType, status, bytesLen, errVal, now,
 	)
 }
@@ -944,6 +1205,7 @@ func emitProgress(cb func(MediaIndexProgress), res *MediaIndexResult, total, alr
 		Total:      total,
 		Pending:    pending,
 		Baseline:   already,
+		Downloaded: res.Downloaded,
 		Described:  res.Described,
 		Missing:    res.Missing,
 		Errors:     res.Errors,

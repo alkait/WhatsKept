@@ -387,13 +387,14 @@ CREATE TABLE IF NOT EXISTS wa_image_text (
     generated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS media_index (
-    rowid         INTEGER PRIMARY KEY,
-    manifest_path TEXT    NOT NULL,
-    msg_type      INTEGER NOT NULL,
-    status        TEXT    NOT NULL,
-    bytes         INTEGER,
-    error         TEXT,
-    attempted_at  TEXT    NOT NULL
+    rowid          INTEGER PRIMARY KEY,
+    manifest_path  TEXT    NOT NULL,
+    msg_type       INTEGER NOT NULL,
+    status         TEXT    NOT NULL,
+    bytes          INTEGER,
+    error          TEXT,
+    describe_error TEXT,
+    attempted_at   TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS media_index_status_idx ON media_index(status);
 `
@@ -418,28 +419,42 @@ func ensureImageSidecarSchema(db dbExecQuerier) error {
 	return migrateImageSidecar(db)
 }
 
-// migrateImageSidecar ADD COLUMNs any wa_image_text field introduced
-// after the table was first created by an older whatskept. Each ALTER
-// carries a DEFAULT, so existing rows get a sane value with no
-// backfill — notably `source` defaults to 'apple', which is correct:
-// every pre-migration row was produced by Apple Vision.
+// migrateImageSidecar ADD COLUMNs any wa_image_text / media_index field
+// introduced after the table was first created by an older whatskept.
+// Each ALTER carries a DEFAULT (or is nullable), so existing rows get a
+// sane value with no backfill — notably wa_image_text.source defaults to
+// 'apple', which is correct: every pre-migration row was produced by
+// Apple Vision. media_index.describe_error is nullable: NULL means "no
+// describe failure recorded", which is the right default for every
+// pre-split row (download and describe were one step then).
 func migrateImageSidecar(db dbExecQuerier) error {
-	have, err := tableColumns(db, "main", "wa_image_text")
-	if err != nil {
-		return fmt.Errorf("inspect wa_image_text: %w", err)
+	// DDL keyed by (table, column); only post-v1 additions need ALTERs.
+	adds := []struct{ table, col, ddl string }{
+		{"wa_image_text", "description", `ALTER TABLE wa_image_text ADD COLUMN description TEXT NOT NULL DEFAULT ''`},
+		{"wa_image_text", "source", `ALTER TABLE wa_image_text ADD COLUMN source TEXT NOT NULL DEFAULT 'apple'`},
+		{"wa_image_text", "model", `ALTER TABLE wa_image_text ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
+		{"media_index", "describe_error", `ALTER TABLE media_index ADD COLUMN describe_error TEXT`},
 	}
-	// DDL keyed by column name; only the post-v1 additions need ALTERs.
-	adds := []struct{ col, ddl string }{
-		{"description", `ALTER TABLE wa_image_text ADD COLUMN description TEXT NOT NULL DEFAULT ''`},
-		{"source", `ALTER TABLE wa_image_text ADD COLUMN source TEXT NOT NULL DEFAULT 'apple'`},
-		{"model", `ALTER TABLE wa_image_text ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
-	}
+	cols := map[string]map[string]bool{}
 	for _, a := range adds {
-		if have[a.col] {
+		have, ok := cols[a.table]
+		if !ok {
+			var err error
+			have, err = tableColumns(db, "main", a.table)
+			if err != nil {
+				return fmt.Errorf("inspect %s: %w", a.table, err)
+			}
+			cols[a.table] = have
+		}
+		// An absent table reports zero columns. Skip it — the
+		// CREATE TABLE IF NOT EXISTS in ensureImageSidecarSchema is
+		// what creates it; migrate only ADD COLUMNs onto a table that
+		// already exists (callers may run migrate on a partial DB).
+		if len(have) == 0 || have[a.col] {
 			continue
 		}
 		if _, err := db.Exec(a.ddl); err != nil {
-			return fmt.Errorf("add column %s: %w", a.col, err)
+			return fmt.Errorf("add column %s.%s: %w", a.table, a.col, err)
 		}
 	}
 	return nil

@@ -15,18 +15,23 @@ import (
 	"whatskept/internal/secrets"
 )
 
-// `whatskept media-index` — port of the Python whatskept.media_indexer
-// CLI. Walks all WhatsApp image messages in the workspace's
-// ChatStorage.sqlite, decrypts each JPEG from the iOS backup, runs
-// Apple Vision (OCR + classification) via the bundled Swift helper,
-// and persists the results in wa_image_text + media_index.
+// `whatskept media-index` — download + OCR + classify WhatsApp images.
 //
-// Resumable per-row: the second `media-index` run picks up exactly
-// where the previous one left off. Ctrl+C between rows is safe;
-// every committed row is durable.
+// As a CLI convenience it runs BOTH phases in sequence so the one
+// command still does what it always did:
 //
-// The matching GUI entry point is the "Sync images" button on the
-// Database tab (see internal/app/server.go).
+//  1. DownloadMedia — decrypt every image from the iOS backup into
+//     <workspace>/media/ (needs the backup password).
+//  2. MediaIndex — run the describer (Apple Vision or cloud) over the
+//     downloaded images and persist wa_image_text + media_index.
+//
+// The GUI splits these into two buttons ("Download images" then "Scan
+// with Apple Vision") so only the download needs the password; use the
+// separate `whatskept media-download` command for the download phase
+// alone.
+//
+// Resumable per-row in both phases: Ctrl+C between rows is safe and a
+// re-run picks up where it left off.
 func newMediaIndexCmd() *cobra.Command {
 	var (
 		workspace    string
@@ -44,21 +49,25 @@ func newMediaIndexCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "media-index",
-		Short: "Decrypt + OCR + classify WhatsApp images, populate wa_image_text",
-		Long: `Per-row pipeline:
+		Short: "Download + OCR + classify WhatsApp images, populate wa_image_text",
+		Long: `Two-phase pipeline (download, then describe):
 
-  1. SELECT every ZWAMEDIAITEM.ZMEDIALOCALPATH ending in '.jpg' that
-     isn't already in media_index with status='described'.
-  2. Decrypt the JPEG from the iOS backup and write it to
-     <workspace>/media/<rowid>.jpg.
-  3. Run Apple Vision (OCR + classification) via the bundled
-     whatskept-vision helper.
-  4. UPSERT wa_image_text (results) and media_index (state) in one
-     transaction.
-  5. Rebuild messages_fts to include the new ocr_text + labels.
+  Phase 1 — download (needs the backup password):
+    a. SELECT every ZWAMEDIAITEM.ZMEDIALOCALPATH ending in '.jpg' that
+       isn't already on disk.
+    b. Decrypt the JPEG from the iOS backup and write it to
+       <workspace>/media/<rowid>.<ext>, marking the row 'downloaded'.
 
-Resumability is per-row: interrupt with Ctrl+C and re-run later.
-Use --retry-missing / --retry-errors to revisit terminal-status rows.
+  Phase 2 — describe (no backup access):
+    c. Run the describer (Apple Vision OCR + classification, or a cloud
+       vision model) over every 'downloaded' image.
+    d. UPSERT wa_image_text (results) and flip media_index to 'described'.
+    e. Rebuild messages_fts to include the new ocr_text + labels.
+
+Run 'whatskept media-download' to do phase 1 alone (e.g. on a machine
+without the Vision helper). Resumability is per-row in both phases:
+interrupt with Ctrl+C and re-run later. Use --retry-missing /
+--retry-errors to revisit terminal-status rows.
 
 Password is read from $BACKUP_PASSWORD or a .env in the workspace.
 
@@ -115,7 +124,15 @@ After a successful run, agent queries can MATCH on image content:
 				}
 			}
 
-			res, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
+			logLine := func(s string) {
+				if !emitJSON {
+					fmt.Fprintln(os.Stderr, s)
+				}
+			}
+
+			// Phase 1 — download. Decrypts the backup into media/; the
+			// only phase that needs the password.
+			if _, err := postprocess.DownloadMedia(postprocess.MediaIndexOptions{
 				Workspace:    absWS,
 				BackupPath:   backupPath,
 				BackupRoot:   backupRoot,
@@ -123,17 +140,36 @@ After a successful run, agent queries can MATCH on image content:
 				Limit:        limit,
 				RetryMissing: retryMissing,
 				RetryErrors:  retryErrors,
+				Ctx:          ctx,
+				Log:          logLine,
+				Progress: func(p postprocess.MediaIndexProgress) {
+					if !emitJSON {
+						fmt.Fprintf(os.Stderr,
+							"[download %d / %d]  %.1f/s  eta %s  dl=%d miss=%d err=%d\n",
+							p.Done, p.Pending, p.RatePerSec, fmtEta(p.ETASeconds),
+							p.Downloaded, p.Missing, p.Errors,
+						)
+					}
+				},
+			}); err != nil {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil // cancelled during download; re-run to resume
+			}
+
+			// Phase 2 — describe the downloaded images. No backup access.
+			res, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
+				Workspace:    absWS,
+				Limit:        limit,
+				RetryErrors:  retryErrors,
 				LabelTopN:    labelTopN,
 				LabelMinConf: float32(labelMinConf),
 				Engine:       engine,
 				APIKey:       apiKey,
 				Model:        model,
 				Ctx:          ctx,
-				Log: func(s string) {
-					if !emitJSON {
-						fmt.Fprintln(os.Stderr, s)
-					}
-				},
+				Log:          logLine,
 				Progress: func(p postprocess.MediaIndexProgress) {
 					if !emitJSON {
 						pct := 0.0
@@ -141,7 +177,7 @@ After a successful run, agent queries can MATCH on image content:
 							pct = float64(p.Done) * 100 / float64(p.Total)
 						}
 						fmt.Fprintf(os.Stderr,
-							"[%d / %d] %.1f%%  %.1f/s  eta %s  ocr=%d labels=%d miss=%d err=%d\n",
+							"[scan %d / %d] %.1f%%  %.1f/s  eta %s  ocr=%d labels=%d miss=%d err=%d\n",
 							p.Done, p.Pending, pct, p.RatePerSec, fmtEta(p.ETASeconds),
 							p.WithOCR, p.WithLabels, p.Missing, p.Errors,
 						)
@@ -172,6 +208,113 @@ After a successful run, agent queries can MATCH on image content:
 	cmd.Flags().BoolVar(&emitJSON, "json", false, "Emit final result as JSON on stdout (suppresses progress)")
 	cmd.Flags().StringVar(&engine, "engine", "apple", "Describer: 'apple' (on-device Vision) or 'cloud' (OpenRouter; needs OPENROUTER_API_KEY)")
 	cmd.Flags().StringVar(&model, "model", "", "Cloud model slug (default: "+postprocess.DefaultCloudModel+"; ignored for --engine apple)")
+
+	return cmd
+}
+
+// `whatskept media-download` — phase 1 alone: decrypt every WhatsApp
+// image from the iOS backup into <workspace>/media/. This is the only
+// image command that needs the backup password. Run `media-index`
+// afterwards (or the enrichment buttons in the GUI) to describe them.
+func newMediaDownloadCmd() *cobra.Command {
+	var (
+		workspace    string
+		backupPath   string
+		backupRoot   string
+		limit        int
+		retryMissing bool
+		retryErrors  bool
+		emitJSON     bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "media-download",
+		Short: "Decrypt WhatsApp images from the iOS backup into <workspace>/media/",
+		Long: `Decrypts every WhatsApp image referenced in ChatStorage.sqlite from
+the encrypted iOS backup and writes it to <workspace>/media/<rowid>.<ext>,
+marking each row 'downloaded'. This is the only image command that needs
+the backup password; the describers (media-index / cloud) and face
+clustering are pure consumers of the media/ folder.
+
+Resumable per-row: Ctrl+C between rows is safe and a re-run resumes.
+Use --retry-missing / --retry-errors to revisit terminal-status rows
+(e.g. after pulling a fresher backup).
+
+Password is read from $BACKUP_PASSWORD or a .env in the workspace.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if workspace == "" {
+				cwd, err := os.Getwd()
+				if err != nil {
+					return fmt.Errorf("getwd: %w", err)
+				}
+				workspace = cwd
+			}
+			absWS, err := filepath.Abs(workspace)
+			if err != nil {
+				return fmt.Errorf("abs workspace: %w", err)
+			}
+
+			password, err := secrets.GetBackupPassword(absWS)
+			if err != nil {
+				return err
+			}
+
+			ctx, cancel := context.WithCancel(cmd.Context())
+			sig := make(chan os.Signal, 1)
+			signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+			defer signal.Stop(sig)
+			go func() {
+				<-sig
+				fmt.Fprintln(os.Stderr, "Stopping after current image (Ctrl+C again to force-exit)…")
+				cancel()
+				<-sig
+				os.Exit(130)
+			}()
+
+			res, err := postprocess.DownloadMedia(postprocess.MediaIndexOptions{
+				Workspace:    absWS,
+				BackupPath:   backupPath,
+				BackupRoot:   backupRoot,
+				Password:     password,
+				Limit:        limit,
+				RetryMissing: retryMissing,
+				RetryErrors:  retryErrors,
+				Ctx:          ctx,
+				Log: func(s string) {
+					if !emitJSON {
+						fmt.Fprintln(os.Stderr, s)
+					}
+				},
+				Progress: func(p postprocess.MediaIndexProgress) {
+					if !emitJSON {
+						fmt.Fprintf(os.Stderr,
+							"[%d / %d]  %.1f/s  eta %s  dl=%d miss=%d err=%d\n",
+							p.Done, p.Pending, p.RatePerSec, fmtEta(p.ETASeconds),
+							p.Downloaded, p.Missing, p.Errors,
+						)
+					}
+				},
+			})
+			if err != nil {
+				return err
+			}
+
+			if emitJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(res)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&workspace, "workspace", "", "Workspace dir containing ChatStorage.sqlite (default: cwd)")
+	cmd.Flags().StringVar(&backupPath, "backup", "", "Path to a specific iOS backup directory (default: most-recent)")
+	cmd.Flags().StringVar(&backupRoot, "backup-root", "", "iOS backup root (default: ~/Library/Application Support/MobileSync/Backup)")
+	cmd.Flags().IntVar(&limit, "limit", 0, "Download at most N images this run (0 = no cap)")
+	cmd.Flags().BoolVar(&retryMissing, "retry-missing", false, "Re-attempt rows previously marked 'missing'")
+	cmd.Flags().BoolVar(&retryErrors, "retry-errors", false, "Re-attempt rows previously marked 'error'")
+	cmd.Flags().BoolVar(&emitJSON, "json", false, "Emit final result as JSON on stdout (suppresses progress)")
 
 	return cmd
 }

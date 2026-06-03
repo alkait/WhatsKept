@@ -116,6 +116,60 @@ func TestMigrateImageSidecar(t *testing.T) {
 	}
 }
 
+// TestMigrateMediaIndexDescribeError verifies an old media_index (created
+// before the download/describe split, so without describe_error) gains
+// the column idempotently, while leaving existing rows untouched.
+func TestMigrateMediaIndexDescribeError(t *testing.T) {
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Pre-split media_index (7 columns, no describe_error). wa_image_text
+	// must exist too since migrateImageSidecar inspects both.
+	if _, err := db.Exec(`
+		CREATE TABLE wa_image_text (rowid INTEGER PRIMARY KEY, ocr_text TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '', labels TEXT NOT NULL DEFAULT '', label_scores TEXT,
+			description TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'apple',
+			model TEXT NOT NULL DEFAULT '', generated_at TEXT NOT NULL);
+		CREATE TABLE media_index (rowid INTEGER PRIMARY KEY, manifest_path TEXT NOT NULL,
+			msg_type INTEGER NOT NULL, status TEXT NOT NULL, bytes INTEGER, error TEXT,
+			attempted_at TEXT NOT NULL);
+		INSERT INTO media_index (rowid, manifest_path, msg_type, status, attempted_at)
+			VALUES (1, 'Message/Media/1.jpg', 5, 'described', '2020-01-01T00:00:00Z');`,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 2; i++ { // idempotent
+		if err := migrateImageSidecar(db); err != nil {
+			t.Fatalf("migrate (pass %d): %v", i, err)
+		}
+	}
+
+	cols, err := tableColumns(db, "main", "media_index")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cols["describe_error"] {
+		t.Fatal("media_index missing describe_error column after migration")
+	}
+	// Existing row preserved, new column defaults to NULL.
+	var status string
+	var describeErr sql.NullString
+	if err := db.QueryRow(`SELECT status, describe_error FROM media_index WHERE rowid = 1`).
+		Scan(&status, &describeErr); err != nil {
+		t.Fatal(err)
+	}
+	if status != MediaStatusDescribed {
+		t.Errorf("status = %q, want %q", status, MediaStatusDescribed)
+	}
+	if describeErr.Valid {
+		t.Errorf("describe_error = %q, want NULL", describeErr.String)
+	}
+}
+
 // TestCloudDescribeLive exercises the real OpenRouter path end-to-end.
 // Skipped unless OPENROUTER_API_KEY and WHATSKEPT_TEST_IMAGE (a path to
 // a JPEG/PNG) are both set, so normal `go test` runs stay offline/free.

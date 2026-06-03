@@ -65,6 +65,7 @@ type SyncResult struct {
 	IgnoreFiles    []string           `json:"ignore_files"`
 	ProfileSync    *ProfileSyncStats  `json:"profile_sync,omitempty"`
 	ContactSync    *ContactSyncStats  `json:"contact_sync,omitempty"`
+	ImageDownload  *MediaIndexResult  `json:"image_download,omitempty"`
 	SidecarMerge   *SidecarMergeStats `json:"sidecar_merge,omitempty"`
 	OrphanPrune    *OrphanPruneStats  `json:"orphan_prune,omitempty"`
 }
@@ -416,6 +417,21 @@ func SyncMessages(
 		}
 	}
 
+	// Image download. Decryption is cheap (milliseconds/image), so the
+	// image FILES are pulled here as part of the sync — like avatars and
+	// contacts. Only the enrichment (Apple Vision / cloud) is optional and
+	// deferred to the Image-enrichment cards, which read media/ with no
+	// backup password. Non-fatal: a failure is logged and the sync still
+	// succeeds (the DB is already on disk).
+	log("Downloading WhatsApp images…")
+	imageStats, imageErr := downloadMediaDuringSync(bundle, workspace, livePath, log)
+	if imageErr != nil {
+		log(fmt.Sprintf("Image download failed: %v", imageErr))
+	} else if imageStats != nil {
+		log(fmt.Sprintf("Images: %d downloaded this sync (%d missing, %d errors).",
+			imageStats.Downloaded, imageStats.Missing, imageStats.Errors))
+	}
+
 	log("Writing AGENTS.md, CLAUDE.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err
@@ -440,6 +456,7 @@ func SyncMessages(
 		IgnoreFiles:    agentIgnoreFiles,
 		ProfileSync:    profileStats,
 		ContactSync:    contactStats,
+		ImageDownload:  imageStats,
 		SidecarMerge:   mergeStats,
 		OrphanPrune:    pruneStats,
 	}, nil

@@ -778,10 +778,16 @@ type databaseStatus struct {
 	// The first pair drives "X / Y indexed" copy on the Sync-images
 	// card. The second pair drives the "View N issues" link, which
 	// opens a modal listing the offending rows from media_index.
-	ImageDescribed *int `json:"image_described,omitempty"`
-	ImageTotal     *int `json:"image_total,omitempty"`
-	ImageErrors    *int `json:"image_errors,omitempty"`
-	ImageMissing   *int `json:"image_missing,omitempty"`
+	// ImageDownloaded: rows in media_index with status in
+	//                 ('downloaded','described') — i.e. files on disk in
+	//                 media/. Drives the Download-images card gauge AND
+	//                 the gate that reveals the enrichment cards (Apple
+	//                 Vision / People / cloud only show once > 0).
+	ImageDescribed  *int `json:"image_described,omitempty"`
+	ImageDownloaded *int `json:"image_downloaded,omitempty"`
+	ImageTotal      *int `json:"image_total,omitempty"`
+	ImageErrors     *int `json:"image_errors,omitempty"`
+	ImageMissing    *int `json:"image_missing,omitempty"`
 	// Voice-note counterparts (driven by voice_index / wa_voice_text):
 	//   VoiceTranscribed: voice_index where status='transcribed'
 	//   VoiceTotal:       all .opus messages in ZWAMEDIAITEM
@@ -898,6 +904,9 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	if cs.imageDescribed >= 0 {
 		out.ImageDescribed = &cs.imageDescribed
 	}
+	if cs.imageDownloaded >= 0 {
+		out.ImageDownloaded = &cs.imageDownloaded
+	}
 	if cs.imageTotal >= 0 {
 		out.ImageTotal = &cs.imageTotal
 	}
@@ -957,6 +966,7 @@ type dbCounts struct {
 	avatars             int // wa_profile_picture                      (after SyncProfiles)
 	contacts            int // wa_contact                              (after SyncContacts)
 	imageDescribed      int // media_index where status='described'    (after media-index)
+	imageDownloaded     int // media_index where status in ('downloaded','described') — files on disk in media/
 	imageTotal          int // ZWAMEDIAITEM where ZMEDIALOCALPATH ends '.jpg'
 	imageErrors         int // media_index where status='error'        (after media-index)
 	imageMissing        int // media_index where status='missing'      (after media-index)
@@ -981,7 +991,7 @@ type dbCounts struct {
 func readDBCounts(dbPath string) dbCounts {
 	cs := dbCounts{
 		msgs: -1, fts: -1, avatars: -1, contacts: -1,
-		imageDescribed: -1, imageTotal: -1, imageErrors: -1, imageMissing: -1,
+		imageDescribed: -1, imageDownloaded: -1, imageTotal: -1, imageErrors: -1, imageMissing: -1,
 		voiceTranscribed: -1, voiceTotal: -1, voiceErrors: -1, voiceMissing: -1,
 		documentExtracted: -1, documentEmpty: -1, documentTotal: -1, documentPDFTotal: -1,
 		documentErrors: -1, documentMissing: -1, documentUnsupported: -1,
@@ -1002,6 +1012,7 @@ func readDBCounts(dbPath string) dbCounts {
 		{&cs.avatars, `SELECT COUNT(*) FROM wa_profile_picture`},
 		{&cs.contacts, `SELECT COUNT(*) FROM wa_contact`},
 		{&cs.imageDescribed, `SELECT COUNT(*) FROM media_index WHERE status = 'described'`},
+		{&cs.imageDownloaded, `SELECT COUNT(*) FROM media_index WHERE status IN ('downloaded','described')`},
 		{&cs.imageTotal, `SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`},
 		{&cs.imageErrors, `SELECT COUNT(*) FROM media_index WHERE status = 'error'`},
 		{&cs.imageMissing, `SELECT COUNT(*) FROM media_index WHERE status = 'missing'`},
@@ -1082,24 +1093,23 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 }
 
 // mediaIndexRequest is the JSON body of POST /api/database/media-index.
-// Same shape as the sync request — only the password matters; everything
-// else (workspace, backup picking) is implicit in server state.
+// mediaIndexRequest is the body of POST /api/database/media-index. The
+// on-device Apple Vision scan reads images already on disk in <ws>/media/
+// (written by media-download), so it needs no backup password.
 type mediaIndexRequest struct {
-	Password string `json:"password"`
-	Force    bool   `json:"force"` // re-scan every image, overwriting existing rows (incl. cloud)
+	Force bool `json:"force"` // re-scan every downloaded image, overwriting existing rows
 }
 
-// handleMediaIndex starts a `postprocess.MediaIndex` run as an
-// in-process SSE job. The job emits two event types:
-//   - "line"     human-readable status (e.g. "Unlocking iOS backup…")
+// handleMediaIndex starts a `postprocess.MediaIndex` (Apple Vision) run
+// as an in-process SSE job over the already-downloaded images. The job
+// emits two event types:
+//   - "line"     human-readable status
 //   - "progress" JSON-encoded MediaIndexProgress every 25 rows; the UI
 //     renders a progress bar with rate / ETA / counts
 //
 // Cancellation: the UI hits DELETE /api/jobs/{id} (existing endpoint)
-// to abort. Our context.Context derived from the http.Request gets
-// torn down, the loop breaks between rows, and the current row's
-// commit either finishes or rolls back. Either way the DB stays
-// consistent.
+// to abort. The job's context is torn down, the loop breaks between
+// rows, and the current row's commit either finishes or rolls back.
 func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
@@ -1112,34 +1122,18 @@ func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	attempted := req.Password
-	if attempted == "" {
-		attempted = s.pw.get()
-	}
-	if attempted == "" {
-		httpError(w, http.StatusBadRequest, "backup password is required")
-		return
-	}
 
-	// The job's context outlives the HTTP request that started it;
-	// don't tie cancellation to r.Context() (which the http server
-	// will close as soon as we return from this handler). The job
-	// manager owns its own lifecycle.
-	jobID := s.jobs.startInProcessProgress("media-index",
-		func(log func(string), progress func(any)) error {
+	jobID := s.jobs.startInProcessProgressCtx("media-index",
+		func(ctx context.Context, log func(string), progress func(any)) error {
 			_, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
-				Workspace:  cur,
-				BackupRoot: backup.DefaultRoot(),
-				Password:   attempted,
-				Force:      req.Force,
-				Log:        log,
+				Workspace: cur,
+				Force:     req.Force,
+				Ctx:       ctx,
+				Log:       log,
 				Progress: func(p postprocess.MediaIndexProgress) {
 					progress(p)
 				},
 			})
-			if err == nil {
-				s.pw.set(attempted)
-			}
 			return err
 		})
 
@@ -1152,6 +1146,7 @@ func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
 type mediaDescribeStatusResponse struct {
 	HasKey       bool   `json:"has_key"`
 	TotalImages  int    `json:"total_images"`
+	Downloaded   int    `json:"downloaded"`  // images on disk in media/ (the describable set)
 	Described    int    `json:"described"`   // any source
 	CloudCount   int    `json:"cloud_count"` // wa_image_text.source = 'cloud'
 	AppleCount   int    `json:"apple_count"` // wa_image_text.source = 'apple'
@@ -1194,6 +1189,10 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 	defer db.Close()
 
 	_ = db.QueryRow(`SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.jpg'`).Scan(&resp.TotalImages)
+	// Downloaded = files on disk in media/ (the set the cloud describer
+	// can actually process): 'downloaded' awaiting describe + already
+	// 'described' (whose file is still on disk).
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status IN ('downloaded','described')`).Scan(&resp.Downloaded)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'described'`).Scan(&resp.Described)
 	// source counts depend on the migrated wa_image_text; ignore errors
 	// (old/absent table simply leaves these at 0).
@@ -1209,9 +1208,9 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 
 // mediaDescribeRequest is the body of POST /api/database/media-describe.
 // The OpenRouter key comes from the session store (never the body), so
-// it isn't logged or echoed.
+// it isn't logged or echoed. Cloud describe reads images already on disk
+// in <ws>/media/, so no backup password is needed.
 type mediaDescribeRequest struct {
-	Password    string `json:"password"`
 	Model       string `json:"model"`
 	Concurrency int    `json:"concurrency"` // 0 = server default
 	Force       bool   `json:"force"`       // re-describe everything, overwriting cloud rows
@@ -1219,7 +1218,7 @@ type mediaDescribeRequest struct {
 
 // handleMediaDescribe starts a cloud media-describe run as an SSE job,
 // mirroring handleMediaIndex but with Engine=cloud. The session API key
-// is required; the backup password is still needed to decrypt images.
+// is required; images are read from <ws>/media/ (no backup password).
 func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
@@ -1238,21 +1237,11 @@ func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "OpenRouter API key required — set it first")
 		return
 	}
-	pwd := req.Password
-	if pwd == "" {
-		pwd = s.pw.get()
-	}
-	if pwd == "" {
-		httpError(w, http.StatusBadRequest, "backup password is required")
-		return
-	}
 
 	jobID := s.jobs.startInProcessProgressCtx("media-describe",
 		func(ctx context.Context, log func(string), progress func(any)) error {
 			_, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
 				Workspace:   cur,
-				BackupRoot:  backup.DefaultRoot(),
-				Password:    pwd,
 				Engine:      postprocess.SourceCloud,
 				APIKey:      key,
 				Model:       req.Model,
@@ -1264,9 +1253,6 @@ func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 					progress(p)
 				},
 			})
-			if err == nil {
-				s.pw.set(pwd)
-			}
 			return err
 		})
 
