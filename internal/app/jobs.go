@@ -185,6 +185,42 @@ func (m *jobManager) activeJob() *activeJobInfo {
 	return nil
 }
 
+// backupRunning reports whether an idevicebackup2 backup is currently
+// in flight for the given device. Backups are the jobs with task=="";
+// in-process jobs (sync, media-index, …) carry a non-empty task and are
+// ignored.
+//
+// udid scopes the check: pass the bound workspace's UDID to ignore a
+// backup running for some other device (e.g. an iPad). A job with an
+// empty udid (a backup started without -u, i.e. the sole attached
+// device) matches any requested udid. Pass "" to match any backup.
+//
+// This exists so handleDatabaseStatus can suppress the "new messages
+// available" signal while a backup is still writing: idevicebackup2
+// stamps Info.plist's "Last Backup Date" to ~now when the backup
+// *starts*, so the staleness comparison would otherwise flip to true
+// the moment a backup begins — long before there is a complete,
+// decryptable snapshot to sync.
+func (m *jobManager) backupRunning(udid string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, j := range m.jobs {
+		if j.task != "" {
+			continue
+		}
+		j.mu.Lock()
+		fin := j.finished
+		j.mu.Unlock()
+		if fin {
+			continue
+		}
+		if udid == "" || j.udid == "" || j.udid == udid {
+			return true
+		}
+	}
+	return false
+}
+
 // startInProcess registers a new job whose work runs as a Go function
 // (no subprocess), streaming each `log` line as a "line" jobEvent.
 // `work` returns nil on success or an error whose .Error() string

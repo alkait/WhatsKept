@@ -837,6 +837,20 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 		bound, _ = binding.Load(cur)
 	}
 
+	// Is a backup for this device still being written? idevicebackup2
+	// stamps Info.plist's "Last Backup Date" to ~now when a backup
+	// *starts* (not when it finishes), so the staleness comparison
+	// below would flip to "new messages available" the instant a backup
+	// begins — prompting the user to sync an incomplete, not-yet-
+	// decryptable snapshot. While a matching backup is in flight we hold
+	// the stale flag down; it flips on correctly once the job finishes
+	// and the next poll sees the finalised backup.
+	boundUDID := ""
+	if bound != nil {
+		boundUDID = bound.UDID
+	}
+	backupInProgress := s.jobs.backupRunning(boundUDID)
+
 	if infos, err := backup.Discover(backup.DefaultRoot()); err == nil {
 		var latest time.Time
 		for _, b := range infos {
@@ -865,8 +879,8 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	st, err := os.Stat(dbPath)
 	if err != nil {
 		// Workspace exists but no DB yet. Stale = there's a backup we
-		// haven't ingested.
-		out.IsStale = out.HasBackups
+		// haven't ingested — unless that backup is still being written.
+		out.IsStale = out.HasBackups && !backupInProgress
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -878,7 +892,7 @@ func (s *server) handleDatabaseStatus(w http.ResponseWriter, _ *http.Request) {
 	// time.Time space to avoid string-comparison subtleties (RFC3339
 	// happens to be lexicographically comparable, but only for the
 	// same offset — relying on that is fragile).
-	if out.LatestBackupAt != "" {
+	if out.LatestBackupAt != "" && !backupInProgress {
 		if t, err := time.Parse(time.RFC3339, out.LatestBackupAt); err == nil {
 			if st.ModTime().Before(t) {
 				out.IsStale = true

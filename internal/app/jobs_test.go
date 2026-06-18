@@ -142,3 +142,51 @@ func firstOr(s []string, dflt string) string {
 	}
 	return s[0]
 }
+
+// finishedJob builds a job that backupRunning should treat as done.
+func finishedJob(udid string) *job {
+	j := &job{udid: udid}
+	j.finished = true
+	return j
+}
+
+// TestBackupRunning verifies the in-progress guard that keeps a freshly
+// started backup from being mis-reported as "new messages available".
+// idevicebackup2 stamps Info.plist's "Last Backup Date" at backup
+// *start*, so handleDatabaseStatus must hold the stale flag down while a
+// matching backup is still in flight.
+func TestBackupRunning(t *testing.T) {
+	const dev = "00008120-001C698E2E51A01E"
+	const other = "00001111-AAAA2222BBBB3333"
+
+	cases := []struct {
+		name  string
+		jobs  []*job
+		query string
+		want  bool
+	}{
+		{"no jobs", nil, dev, false},
+		{"running backup, matching udid", []*job{{udid: dev}}, dev, true},
+		{"running backup, other udid", []*job{{udid: other}}, dev, false},
+		{"running backup, empty job udid matches any", []*job{{udid: ""}}, dev, true},
+		{"running backup, empty query matches any", []*job{{udid: other}}, "", true},
+		{"finished backup ignored", []*job{finishedJob(dev)}, dev, false},
+		{"non-backup task ignored", []*job{{udid: dev, task: "messages-sync"}}, dev, false},
+		{"matching among several", []*job{finishedJob(other), {udid: other, task: "media-index"}, {udid: dev}}, dev, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newJobManager()
+			for i, j := range tc.jobs {
+				if j.id == "" {
+					j.id = string(rune('a' + i))
+				}
+				m.put(j)
+			}
+			if got := m.backupRunning(tc.query); got != tc.want {
+				t.Errorf("backupRunning(%q) = %v, want %v", tc.query, got, tc.want)
+			}
+		})
+	}
+}
