@@ -1,6 +1,10 @@
 package app
 
-import "sync"
+import (
+	"sync"
+
+	"whatskept/internal/secrets"
+)
 
 // passwordStore holds the iOS backup password in RAM for the lifetime
 // of a single app session. One slot for the whole process: a fresh
@@ -48,19 +52,31 @@ func (p *passwordStore) has() bool {
 	return p.v != ""
 }
 
-// apiKeyStore holds the OpenRouter API key in RAM for the lifetime of
-// a single app session, exactly like passwordStore holds the backup
-// password. Same lifecycle: set when the user enters it, used by the
-// cloud media describer, cleared on workspace switch / "use a different
-// key" / process exit. Deliberately not persisted to disk — the key
-// never lands in the workspace or any file (a durable Keychain variant
-// is separate future work, mirroring the password's option C).
+// apiKeyStore holds the OpenRouter API key for the cloud media describer.
+// Unlike the backup password, the key is a GLOBAL account credential (not
+// workspace-specific), so it is NOT cleared on workspace switches.
+//
+// It can optionally be persisted across restarts via the cross-platform
+// credentials file (internal/secrets): on construction the store loads any
+// persisted key into RAM; set(persist=true) writes it; clear() (the "forget
+// key" affordance) removes it from both RAM and disk. set(persist=false)
+// keeps the key session-only and removes any previously persisted copy.
 type apiKeyStore struct {
-	mu sync.RWMutex
-	v  string
+	mu        sync.RWMutex
+	v         string
+	persisted bool
 }
 
-func newAPIKeyStore() *apiKeyStore { return &apiKeyStore{} }
+// newAPIKeyStore loads any persisted key so the cloud describer works
+// immediately after a restart.
+func newAPIKeyStore() *apiKeyStore {
+	a := &apiKeyStore{}
+	if k, ok := secrets.LoadOpenRouterKey(); ok {
+		a.v = k
+		a.persisted = true
+	}
+	return a
+}
 
 func (a *apiKeyStore) get() string {
 	a.mu.RLock()
@@ -68,20 +84,45 @@ func (a *apiKeyStore) get() string {
 	return a.v
 }
 
-func (a *apiKeyStore) set(v string) {
+// set stores the key in RAM and, when persist is true, on disk. When
+// persist is false any previously persisted copy is removed (session-only).
+func (a *apiKeyStore) set(v string, persist bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.v = v
+	if persist {
+		if err := secrets.SaveOpenRouterKey(v); err != nil {
+			return err
+		}
+		a.persisted = true
+		return nil
+	}
+	if a.persisted {
+		if err := secrets.DeleteOpenRouterKey(); err != nil {
+			return err
+		}
+	}
+	a.persisted = false
+	return nil
 }
 
-func (a *apiKeyStore) clear() {
+// clear forgets the key from RAM and deletes any persisted copy.
+func (a *apiKeyStore) clear() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.v = ""
+	a.persisted = false
+	return secrets.DeleteOpenRouterKey()
 }
 
 func (a *apiKeyStore) has() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.v != ""
+}
+
+func (a *apiKeyStore) isPersisted() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.persisted
 }

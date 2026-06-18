@@ -322,7 +322,8 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
 	s.pw.clear()
-	s.apiKey.clear()
+	// The OpenRouter key is a global account credential, not
+	// workspace-specific, so it intentionally survives a workspace switch.
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -367,7 +368,8 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ws.set(abs)
 	s.pw.clear()
-	s.apiKey.clear()
+	// The OpenRouter key is a global account credential, not
+	// workspace-specific, so it intentionally survives a workspace switch.
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -427,7 +429,6 @@ func (s *server) handleDeleteWorkspace(w http.ResponseWriter, _ *http.Request) {
 	removeRecent(cur)
 	s.ws.set("")
 	s.pw.clear()
-	s.apiKey.clear()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1115,6 +1116,7 @@ type mediaDescribeStatusResponse struct {
 	Described    int    `json:"described"`   // any source
 	CloudCount   int    `json:"cloud_count"` // wa_image_text.source = 'cloud'
 	Missing      int    `json:"missing"`     // referenced but not in the backup — undescribable
+	Errors       int    `json:"errors"`      // download errors + per-image describe failures
 	DefaultModel string `json:"default_model"`
 }
 
@@ -1165,6 +1167,9 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 	// downloaded on device) can't be described — exclude them from
 	// "done" math so coverage can actually reach 100%.
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&resp.Missing)
+	// Failures the issues view surfaces: download errors + per-image
+	// describe failures (describe_error set, status still 'downloaded').
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error' OR describe_error IS NOT NULL`).Scan(&resp.Errors)
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1302,19 +1307,52 @@ func (s *server) handleMediaIndexIssues(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Unbounded totals first — these power the "Showing X of Y" copy.
-	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error'`).Scan(&out.ErrorsTotal)
+	// "Errors" spans both download failures (status='error') and
+	// per-image describe failures (describe_error set, status still
+	// 'downloaded') — the cloud describer records the latter.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error' OR describe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
 
 	// Bounded sample, newest first so the user sees the most recent
 	// run's failures (which is almost always what they're debugging).
 	if out.ErrorsTotal > 0 {
-		out.Errors = queryMediaIssues(db, "error", limit)
+		out.Errors = queryMediaErrors(db, limit)
 	}
 	if out.MissingTotal > 0 {
 		out.Missing = queryMediaIssues(db, "missing", limit)
 	}
 
 	writeJSON(w, http.StatusOK, out)
+}
+
+// queryMediaErrors pulls up to `limit` failed rows from media_index,
+// newest first — both download errors (status='error') and per-image
+// describe failures (describe_error set), with the message taken from
+// whichever column carries it. Best-effort, like queryMediaIssues.
+func queryMediaErrors(db *sql.DB, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path,
+		        COALESCE(NULLIF(error, ''), describe_error, ''),
+		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM media_index
+		 WHERE status = 'error' OR describe_error IS NOT NULL
+		 ORDER BY attempted_at DESC
+		 LIMIT ?`,
+		limit,
+	)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
 }
 
 // queryMediaIssues pulls up to `limit` rows of one status from
@@ -1379,22 +1417,28 @@ func (s *server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleSessionAPIKeyStatus reports whether an OpenRouter key is held
-// in this session (mirrors the password status endpoint). Never
-// returns the key itself.
+// handleSessionAPIKeyStatus reports whether an OpenRouter key is held,
+// and whether it's persisted across restarts (remembered on this
+// computer). Never returns the key itself.
 func (s *server) handleSessionAPIKeyStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"has": s.apiKey.has()})
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"has":       s.apiKey.has(),
+		"persisted": s.apiKey.isPersisted(),
+	})
 }
 
-// apiKeySetRequest carries a pasted OpenRouter key.
+// apiKeySetRequest carries a pasted OpenRouter key and whether to
+// remember it across restarts.
 type apiKeySetRequest struct {
-	Key string `json:"key"`
+	Key      string `json:"key"`
+	Remember bool   `json:"remember"`
 }
 
 // handleSessionAPIKeySet validates the key against OpenRouter (a cheap,
-// token-free auth check) and, on success, caches it for the session.
-// The key is held in RAM only — never written to the workspace, .env,
-// or any file.
+// token-free auth check) and, on success, caches it. When remember is
+// set, the key is also persisted to the cross-platform credentials file
+// so it survives restarts; otherwise it's session-only (RAM) and any
+// previously persisted copy is removed.
 func (s *server) handleSessionAPIKeySet(w http.ResponseWriter, r *http.Request) {
 	var req apiKeySetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1411,14 +1455,20 @@ func (s *server) handleSessionAPIKeySet(w http.ResponseWriter, r *http.Request) 
 		httpError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.apiKey.set(req.Key)
-	writeJSON(w, http.StatusOK, map[string]bool{"has": true})
+	if err := s.apiKey.set(req.Key, req.Remember); err != nil {
+		httpError(w, http.StatusInternalServerError, "save key: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"has": true, "persisted": s.apiKey.isPersisted()})
 }
 
-// handleSessionAPIKeyClear forgets the cached OpenRouter key (the "use
-// a different key" affordance).
+// handleSessionAPIKeyClear forgets the OpenRouter key from RAM and
+// deletes any persisted copy (the "forget key" affordance).
 func (s *server) handleSessionAPIKeyClear(w http.ResponseWriter, _ *http.Request) {
-	s.apiKey.clear()
+	if err := s.apiKey.clear(); err != nil {
+		httpError(w, http.StatusInternalServerError, "forget key: "+err.Error())
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

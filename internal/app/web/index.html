@@ -575,9 +575,10 @@ function MediaIssuesModal({ onClose }) {
             ) : (
               <>
                 <p className="text-[11px] text-gray-500 mb-3">
-                  An <strong>error</strong> means the indexer found the file in the backup manifest but
-                  couldn't OCR it. Reasons: corrupted/truncated JPEG, decrypt failed, Vision crashed on a
-                  specific image, etc. Showing {data.errors.length.toLocaleString()} of {errorsTotal.toLocaleString()}.
+                  An <strong>error</strong> means the file was present but couldn't be processed — either the
+                  download failed (corrupted/truncated JPEG, decrypt error) or the cloud describer rejected the
+                  image or hit a transient API failure. Describe errors are auto-retried on the next run.
+                  Showing {data.errors.length.toLocaleString()} of {errorsTotal.toLocaleString()}.
                 </p>
                 <div className="space-y-3">
                   {grouped.map(g => (
@@ -1718,11 +1719,12 @@ function PeopleGrid({ onClose }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // CloudDescribeCard — "Cloud descriptions" section under Image OCR
 // ═══════════════════════════════════════════════════════════════════════════
-// Opt-in cloud describer (OpenRouter). Needs only a session API key —
-// prompted via OpenRouterKeyModal, held in RAM by the server, never on
-// disk. It reads the already-downloaded images off disk, so no backup
-// password. Shows cloud coverage, a cost estimate, and a live cost
-// meter while running.
+// Opt-in cloud describer (OpenRouter). Needs an API key — prompted via
+// OpenRouterKeyModal and held by the server; optionally remembered across
+// restarts (a 0600 file under the OS config dir) or kept session-only. It
+// reads the already-downloaded images off disk, so no backup password.
+// Shows cloud coverage, a cost estimate, and a live cost meter while
+// running, plus key management (change / forget).
 const CLOUD_COST_PER_IMAGE = 0.0002; // measured ~$ / image, for estimates
 
 function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
@@ -1733,6 +1735,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const [showIssues, setShowIssues] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [pendingForce, setPendingForce] = useState(false);
+  // keyModalMode: "run" = opened to unblock a describe run (save → start);
+  // "manage" = opened from "Change key" (save → just refresh, no run).
+  const [keyModalMode, setKeyModalMode] = useState("run");
   const CONCURRENCY = 48; // fixed — empirically the fast, stable operating point
 
   const j = job || {};
@@ -1754,9 +1759,11 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const described  = (status && status.described) || 0;
   const cloudCount = (status && status.cloud_count) || 0;
   const hasKey     = !!(status && status.has_key);
+  const persisted  = !!(status && status.persisted);
   const model      = (status && status.default_model) || "";
 
   const missing = (status && status.missing) || 0;
+  const errorCount = (status && status.errors) || 0;
   // Cloud can only describe images already on disk, so coverage is
   // measured against the downloaded set — making the 100%/done state
   // actually reachable.
@@ -1773,9 +1780,11 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   // pendingForce.
   const proceed = (force) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, force });
   const beginRun = (force) => {
-    if (!hasKey) { setPendingForce(force); setShowKey(true); return; }
+    if (!hasKey) { setPendingForce(force); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(force);
   };
+  // Open the key modal just to change the stored key — no run is started.
+  const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
   // launch is the single button action. When everything's already
   // described, the only meaningful action is a full re-describe — which
   // costs money, so it goes through a confirmation first.
@@ -1827,9 +1836,13 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
 
     if (allDone) { buttonPrimary = false; }
     else         { buttonPrimary = true; }
-    // Only call it a *re*-run once something has actually been described
-    // in the cloud; otherwise the first-run call-to-action is "Describe".
-    buttonLabel = cloudCount > 0 ? "Re-describe images" : "Describe with cloud";
+    // Label by what the button actually does:
+    //   - allDone        → the only action is a full force re-run (confirmed)
+    //   - partially done → resume over the remaining images
+    //   - nothing yet    → first-run call-to-action
+    buttonLabel = allDone ? "Re-describe images"
+                : cloudCount > 0 ? "Resume"
+                : "Describe with cloud";
   }
 
   // While running, the status snapshot above is stale — show live
@@ -1869,12 +1882,26 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
                 <p className="text-[11px] text-gray-400">
                   Describes any remaining images and retries failures automatically.
                   {toProcess > 0 && <> {toProcess.toLocaleString()} image{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
-                  {missing > 0 && <>
+                  {(errorCount > 0 || missing > 0) && <>
                     <span className="mx-1.5">·</span>
-                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {missing.toLocaleString()} issue{missing === 1 ? "" : "s"}</button>
+                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {(errorCount + missing).toLocaleString()} issue{(errorCount + missing) === 1 ? "" : "s"}</button>
                   </>}
+                </p>
+              </div>
+            )}
+
+            {/* Key management — reachable whenever a key is set (incl. one
+                loaded from disk at startup), independent of image count. */}
+            {hasKey && !isRunning && (
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-400">
+                  {persisted
+                    ? <>OpenRouter key <span className="font-medium text-gray-600">remembered on this computer</span>.</>
+                    : <>OpenRouter key set for <span className="font-medium text-gray-600">this session only</span>.</>}
                   <span className="mx-1.5">·</span>
-                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">use a different key</button>
+                  <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change key</button>
+                  <span className="mx-1.5">·</span>
+                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget key</button>
                 </p>
               </div>
             )}
@@ -1937,6 +1964,14 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
                     <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
                   </div>
                 </div>
+                {progress.errors > 0 && (
+                  <div className="mt-2">
+                    <button onClick={() => setShowIssues(true)}
+                      className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
+                      View {progress.errors.toLocaleString()} error{progress.errors === 1 ? "" : "s"}
+                    </button>
+                  </div>
+                )}
               </>
               );
             })() : (
@@ -1957,7 +1992,13 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
       {showKey && (
         <OpenRouterKeyModal
           onClose={() => setShowKey(false)}
-          onSaved={() => { setShowKey(false); reloadStatus(); proceed(pendingForce); }}
+          onSaved={() => {
+            setShowKey(false);
+            reloadStatus();
+            // Only the run-gated open auto-starts a describe; "change key"
+            // (manage) just updates the stored key.
+            if (keyModalMode === "run") proceed(pendingForce);
+          }}
         />
       )}
 
@@ -2030,13 +2071,15 @@ function CloudTermsModal({ onClose }) {
 }
 
 // OpenRouterKeyModal — paste + validate an OpenRouter API key. On save
-// the server validates it (token-free auth check) and caches it for the
-// session; we never persist it client-side.
+// the server validates it (token-free auth check) and caches it. When
+// "remember" is checked the server also persists it (0600 file under the
+// OS config dir) so it survives restarts; otherwise it's session-only.
 function OpenRouterKeyModal({ onClose, onSaved }) {
   const [key, setKey]   = useState("");
   const [show, setShow] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr]   = useState("");
+  const [remember, setRemember] = useState(true);
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
 
@@ -2044,7 +2087,7 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
     if (!key.trim() || busy) return;
     setBusy(true); setErr("");
     try {
-      await api.post("/api/session/openrouter-key", { key: key.trim() });
+      await api.post("/api/session/openrouter-key", { key: key.trim(), remember });
       onSaved();
       onClose();
     } catch (ex) {
@@ -2083,6 +2126,13 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
           </button>
         </div>
         {err && <p className="text-xs text-red-500 mb-3">{err}</p>}
+        <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
+          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} className="mt-0.5" />
+          <span className="text-xs text-gray-600">
+            Remember on this computer
+            <span className="block text-[11px] text-gray-400">Stored in a private file in your user folder so it survives restarts. Leave unchecked to keep it for this session only.</span>
+          </span>
+        </label>
         <div className="flex gap-2">
           <button onClick={onClose}
             className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">

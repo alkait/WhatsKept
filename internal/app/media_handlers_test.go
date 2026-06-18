@@ -54,9 +54,9 @@ func waitForJob(t *testing.T, s *server, id string) {
 // TestMediaDescribeStartsWithoutPassword: with an API key present, cloud
 // describe reads images off disk and needs no backup password.
 func TestMediaDescribeStartsWithoutPassword(t *testing.T) {
-	s, mux := testServer()
+	s, mux := testServer(t)
 	s.ws.set(t.TempDir())
-	s.apiKey.set("sk-or-test")
+	s.apiKey.set("sk-or-test", false)
 	id := startedJobID(t, post(mux, "/api/database/media-describe", `{}`))
 	waitForJob(t, s, id)
 }

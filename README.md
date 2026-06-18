@@ -286,12 +286,16 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   transcription, the ~574 MB whisper model is downloaded from
   HuggingFace over HTTPS and SHA-256 verified. After that, that
   feature is fully offline.
-- **Cloud image descriptions use your own key, held in RAM only.** The
-  opt-in OpenRouter feature (below) uses an API key *you* supply. It is
-  validated against `openrouter.ai`, kept in process memory for the
-  session, and never written to disk by WhatsKept; it is cleared when
-  you switch workspaces or quit. WhatsKept sends no account or
-  identifier of its own — just your key and the image being described.
+- **Cloud image descriptions use your own key.** The opt-in OpenRouter
+  feature (below) uses an API key *you* supply, validated against
+  `openrouter.ai`. By default it's held in memory for the session only.
+  If you tick **"Remember on this computer"** it's saved to a private
+  `0600` file in your user config dir (`~/Library/Application Support/whatskept/`
+  on macOS, `%AppData%\whatskept\` on Windows) so it survives restarts —
+  stored in plaintext, like the backup-password `.env`, readable only by
+  your account. Either way you can **change or forget** the key from the
+  card at any time (forget deletes the file). WhatsKept sends no account
+  or identifier of its own — just your key and the image being described.
 - **Update check on launch.** When the app window opens it asks the
   GitHub Releases API whether a newer version exists, so it can show
   the **Update** button in the header. It's a single unauthenticated
