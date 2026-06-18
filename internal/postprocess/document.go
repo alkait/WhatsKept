@@ -656,13 +656,10 @@ func emitDocumentProgress(cb func(DocumentIndexProgress), res *DocumentIndexResu
 // -------------------------------------------------------------------
 
 // pdfWorker is the request-response client for the Swift Vision
-// helper's PDF mode. Structurally identical to visionWorker in
-// media.go — synchronous, one PDF in flight at a time — but kept
-// separate so the request/response types match the per-kind wire
-// contract without an awkward shared union. The two workers could
-// share a process in principle (the helper handles both kinds via
-// the `kind` discriminator), but in practice we want a clean
-// shutdown semantic per indexer run, so each starts its own.
+// helper's PDF mode. Synchronous, one PDF in flight at a time, with
+// request/response types matching the helper's `kind:"pdf"` wire
+// contract. document-index spawns its own helper process so it has a
+// clean shutdown semantic per run.
 type pdfWorker struct {
 	cmd      *exec.Cmd
 	stdin    io.WriteCloser

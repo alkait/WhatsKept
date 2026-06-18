@@ -52,18 +52,15 @@ agent-friendly workspace on disk.
   refresh the source without leaving the app.
 - **Decrypts** the WhatsApp `ChatStorage.sqlite` and the media/voice
   blobs from the encrypted iOS backup, using your backup password.
-- **Processes media locally**: OCR + image classification through
-  Apple's Vision framework, voice-note transcription through
+- **Processes media locally**: voice-note transcription through
   `whisper.cpp` with Metal, and PDF document text extraction through
   Apple PDFKit (with Vision OCR fallback for scanned pages).
-- **Optional cloud image descriptions** (opt-in): instead of the
-  on-device Vision OCR, you can describe images with a cloud vision
-  model through [OpenRouter](https://openrouter.ai), using your own
-  API key. This is the **one feature that sends your data off the
-  device** — each described image is uploaded to OpenRouter. It is off
-  by default, lives behind its own button, and is the only cloud
-  alternative to the otherwise fully on-device pipeline. See
-  [Privacy](#privacy).
+- **Cloud image descriptions** (opt-in): images are read and described
+  by a cloud vision model through [OpenRouter](https://openrouter.ai),
+  using your own API key — producing OCR text plus a short description.
+  This is the **one feature that sends your data off the device** —
+  each described image is uploaded to OpenRouter. It is off by default
+  and lives behind its own button. See [Privacy](#privacy).
 - **Normalizes** everything into a single SQLite database (with FTS5)
   alongside extracted `media/`, `voice/`, `documents/`, and
   `profiles/` folders, joined against your macOS Contacts so chats
@@ -117,7 +114,7 @@ Three tabs, in the order you walk through them:
 | 1. Backups | 2. Database | 3. Agents |
 | :---: | :---: | :---: |
 | [![Backups tab](docs/screenshots/backup_tab.png)](docs/screenshots/backup_tab.png) | [![Database tab](docs/screenshots/database_tab.png)](docs/screenshots/database_tab.png) | [![Agents tab](docs/screenshots/agent_tab.png)](docs/screenshots/agent_tab.png) |
-| Drive a fresh iOS backup over USB — no need to leave the app. | Decrypt `ChatStorage.sqlite`, OCR images, transcribe voice notes, extract PDFs. Each stage is opt-in and resumable. | Open the prepared workspace in Windsurf, VS Code, Cursor, Claude Code, or Terminal. |
+| Drive a fresh iOS backup over USB — no need to leave the app. | Decrypt `ChatStorage.sqlite`, describe images, transcribe voice notes, extract PDFs. Each stage is opt-in and resumable. | Open the prepared workspace in Windsurf, VS Code, Cursor, Claude Code, or Terminal. |
 
 ## Pipeline
 
@@ -125,12 +122,11 @@ End-to-end data flow, from the encrypted backup on disk to a
 workspace your agent can `MATCH` against. The four side-car
 indexers (avatars/contacts, images, voice, documents) are all
 **opt-in** — each one lives behind its own button in the Database
-tab and can be skipped, re-run, or resumed independently. The default
-pipeline runs **on-device**; the only outbound call is the one-time
-whisper-model download from HuggingFace if you enable voice
-transcription. The lone exception is the **opt-in cloud image
+tab and can be skipped, re-run, or resumed independently. Decryption,
+contacts/avatars, voice transcription, and PDF extraction all run
+**on-device**. The one exception is the **opt-in cloud image
 descriptions** path — if you enable it, images are uploaded to
-OpenRouter instead of being OCR'd locally by Apple Vision.
+OpenRouter to be read and described.
 
 ```mermaid
 %%{init: {'flowchart': {'subGraphTitleMargin': {'top': 32, 'bottom': 32}}}}%%
@@ -150,10 +146,10 @@ flowchart TD
     DB[("Chat database")]:::data
     SYNC --> DB
 
-    subgraph SIDE["Optional on-device processors"]
+    subgraph SIDE["Optional processors"]
         direction LR
         PS{{"Sync contacts &amp; avatars"}}:::proc
-        MI{{"Image OCR &amp; classification<br/>(on-device · or opt-in cloud)"}}:::proc
+        MI{{"Image descriptions<br/>(opt-in cloud)"}}:::proc
         VI{{"Voice-note transcription"}}:::proc
         XI{{"PDF text extraction"}}:::proc
     end
@@ -164,7 +160,7 @@ flowchart TD
     DB -.-> XI
 
     PS --> AV[("Contacts &amp; avatars")]:::data
-    MI --> IM[("Image text &amp; labels")]:::data
+    MI --> IM[("Image text &amp; descriptions")]:::data
     VI --> VC[("Voice transcripts")]:::data
     XI --> DC[("Document text")]:::data
 
@@ -273,12 +269,14 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   well-known host and carry none of your WhatsApp data. The GUI's HTTP
   server binds to `127.0.0.1` only — it is not reachable from other
   devices on your network.
-- **All processing is on-device.** Image OCR + classification runs
-  through Apple's Vision framework (`whatskept-vision`); voice
-  transcription runs through `whisper.cpp` with Metal acceleration;
-  **face detection + recognition** for the People feature run through
-  Apple Vision + a local CoreML model (`whatskept-faces`). None of them
-  talk to a cloud service — your photos and face data never leave the Mac.
+- **Local processing stays on-device.** Voice transcription runs
+  through `whisper.cpp` with Metal acceleration; PDF text extraction
+  runs through Apple PDFKit + Vision OCR (`whatskept-vision`); **face
+  detection + recognition** for the People feature run through Apple
+  Vision + a local CoreML model (`whatskept-faces`). None of them talk
+  to a cloud service — that data never leaves the Mac. (Image
+  *descriptions* are the exception: they're cloud-only and opt-in — see
+  below.)
 - **Backup password is never transmitted.** It's read from
   `$BACKUP_PASSWORD` or a `.env` file in the workspace, held in
   process memory for the lifetime of the app session, and cleared
@@ -314,8 +312,9 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   sent — never your text messages, voice notes, or contacts — and only
   for the images you choose to run. The feature is **off by default**;
   if you never enter an API key and never start a cloud run, nothing is
-  ever uploaded. Prefer the on-device Apple Vision OCR if you want zero
-  data to leave the machine.
+  ever uploaded. Image description is the only describer — there is no
+  on-device alternative — so skip it entirely if you want zero image
+  data to leave the machine (text search, voice, and PDFs still work).
 - **The workspace contains *decrypted* WhatsApp data.** `ChatStorage.sqlite`,
   `media/`, `voice/`, `documents/`, and `profiles/` are plaintext on
   disk, and the Messages sync also joins your macOS Contacts (names + phone
@@ -331,7 +330,7 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   and `profiles/` folders — the actual photos, audio files, PDFs, and
   profile pictures are off-limits. What the agent *does* see is everything
   in the SQLite database: every message, every image's OCR'd text
-  and classification labels, every voice-note transcript, and the
+  and description, every voice-note transcript, and the
   contact names and numbers joined in. So when you ask a question,
   chunks of that chat history can be sent to the agent's LLM
   provider. **Trust the agent's privacy story before pointing it at

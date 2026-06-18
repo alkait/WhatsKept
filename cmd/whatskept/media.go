@@ -15,18 +15,18 @@ import (
 	"whatskept/internal/secrets"
 )
 
-// `whatskept media-index` — download + OCR + classify WhatsApp images.
+// `whatskept media-index` — download + describe WhatsApp images.
 //
 // As a CLI convenience it runs BOTH phases in sequence so the one
 // command still does what it always did:
 //
 //  1. DownloadMedia — decrypt every image from the iOS backup into
 //     <workspace>/media/ (needs the backup password).
-//  2. MediaIndex — run the describer (Apple Vision or cloud) over the
-//     downloaded images and persist wa_image_text + media_index.
+//  2. MediaIndex — run the cloud describer over the downloaded images
+//     and persist wa_image_text + media_index.
 //
-// The GUI splits these into two buttons ("Download images" then "Scan
-// with Apple Vision") so only the download needs the password; use the
+// The GUI splits these into two buttons ("Download images" then "AI
+// image descriptions") so only the download needs the password; use the
 // separate `whatskept media-download` command for the download phase
 // alone.
 //
@@ -40,16 +40,13 @@ func newMediaIndexCmd() *cobra.Command {
 		limit        int
 		retryMissing bool
 		retryErrors  bool
-		labelTopN    int
-		labelMinConf float64
 		emitJSON     bool
-		engine       string
 		model        string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "media-index",
-		Short: "Download + OCR + classify WhatsApp images, populate wa_image_text",
+		Short: "Download + describe WhatsApp images, populate wa_image_text",
 		Long: `Two-phase pipeline (download, then describe):
 
   Phase 1 — download (needs the backup password):
@@ -59,21 +56,22 @@ func newMediaIndexCmd() *cobra.Command {
        <workspace>/media/<rowid>.<ext>, marking the row 'downloaded'.
 
   Phase 2 — describe (no backup access):
-    c. Run the describer (Apple Vision OCR + classification, or a cloud
-       vision model) over every 'downloaded' image.
+    c. Run the cloud vision model over every 'downloaded' image to get
+       OCR text + a description.
     d. UPSERT wa_image_text (results) and flip media_index to 'described'.
-    e. Rebuild messages_fts to include the new ocr_text + labels.
+    e. Rebuild messages_fts to include the new ocr_text + description.
 
-Run 'whatskept media-download' to do phase 1 alone (e.g. on a machine
-without the Vision helper). Resumability is per-row in both phases:
-interrupt with Ctrl+C and re-run later. Use --retry-missing /
---retry-errors to revisit terminal-status rows.
+Run 'whatskept media-download' to do phase 1 alone. Resumability is
+per-row in both phases: interrupt with Ctrl+C and re-run later. Use
+--retry-missing / --retry-errors to revisit terminal-status rows.
 
-Password is read from $BACKUP_PASSWORD or a .env in the workspace.
+The describe phase requires OPENROUTER_API_KEY (exported, or in the
+workspace .env). The backup password is read from $BACKUP_PASSWORD or a
+.env in the workspace.
 
 After a successful run, agent queries can MATCH on image content:
 
-  SELECT v.rowid, v.author, v.sent_at, t.ocr_text, t.labels
+  SELECT v.rowid, v.author, v.sent_at, t.ocr_text, t.description
     FROM messages_fts
     JOIN v_messages    v ON v.rowid = messages_fts.rowid
     JOIN wa_image_text t ON t.rowid = v.rowid
@@ -112,16 +110,13 @@ After a successful run, agent queries can MATCH on image content:
 				os.Exit(130)
 			}()
 
-			// Cloud engine reads its key from the environment so it
-			// never lands on argv. The GUI sets it per-session; the CLI
-			// honours an exported OPENROUTER_API_KEY (or one in the
+			// The cloud describer reads its key from the environment so
+			// it never lands on argv. The GUI sets it per-session; the
+			// CLI honours an exported OPENROUTER_API_KEY (or one in the
 			// workspace .env, already loaded into the process by now).
-			apiKey := ""
-			if engine == postprocess.SourceCloud {
-				apiKey = os.Getenv("OPENROUTER_API_KEY")
-				if apiKey == "" {
-					return fmt.Errorf("--engine cloud requires OPENROUTER_API_KEY to be set")
-				}
+			apiKey := os.Getenv("OPENROUTER_API_KEY")
+			if apiKey == "" {
+				return fmt.Errorf("media-index requires OPENROUTER_API_KEY to be set")
 			}
 
 			logLine := func(s string) {
@@ -160,16 +155,14 @@ After a successful run, agent queries can MATCH on image content:
 
 			// Phase 2 — describe the downloaded images. No backup access.
 			res, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
-				Workspace:    absWS,
-				Limit:        limit,
-				RetryErrors:  retryErrors,
-				LabelTopN:    labelTopN,
-				LabelMinConf: float32(labelMinConf),
-				Engine:       engine,
-				APIKey:       apiKey,
-				Model:        model,
-				Ctx:          ctx,
-				Log:          logLine,
+				Workspace:   absWS,
+				Limit:       limit,
+				RetryErrors: retryErrors,
+				Engine:      postprocess.SourceCloud,
+				APIKey:      apiKey,
+				Model:       model,
+				Ctx:         ctx,
+				Log:         logLine,
 				Progress: func(p postprocess.MediaIndexProgress) {
 					if !emitJSON {
 						pct := 0.0
@@ -177,9 +170,9 @@ After a successful run, agent queries can MATCH on image content:
 							pct = float64(p.Done) * 100 / float64(p.Total)
 						}
 						fmt.Fprintf(os.Stderr,
-							"[scan %d / %d] %.1f%%  %.1f/s  eta %s  ocr=%d labels=%d miss=%d err=%d\n",
+							"[scan %d / %d] %.1f%%  %.1f/s  eta %s  ocr=%d desc=%d miss=%d err=%d\n",
 							p.Done, p.Pending, pct, p.RatePerSec, fmtEta(p.ETASeconds),
-							p.WithOCR, p.WithLabels, p.Missing, p.Errors,
+							p.WithOCR, p.WithDesc, p.Missing, p.Errors,
 						)
 					}
 				},
@@ -203,11 +196,8 @@ After a successful run, agent queries can MATCH on image content:
 	cmd.Flags().IntVar(&limit, "limit", 0, "Process at most N rows this run (0 = no cap)")
 	cmd.Flags().BoolVar(&retryMissing, "retry-missing", false, "Re-attempt rows previously marked 'missing'")
 	cmd.Flags().BoolVar(&retryErrors, "retry-errors", false, "Re-attempt rows previously marked 'error'")
-	cmd.Flags().IntVar(&labelTopN, "label-top-n", 5, "Keep at most this many classification labels per image")
-	cmd.Flags().Float64Var(&labelMinConf, "label-min-conf", 0.50, "Drop classification labels below this confidence")
 	cmd.Flags().BoolVar(&emitJSON, "json", false, "Emit final result as JSON on stdout (suppresses progress)")
-	cmd.Flags().StringVar(&engine, "engine", "apple", "Describer: 'apple' (on-device Vision) or 'cloud' (OpenRouter; needs OPENROUTER_API_KEY)")
-	cmd.Flags().StringVar(&model, "model", "", "Cloud model slug (default: "+postprocess.DefaultCloudModel+"; ignored for --engine apple)")
+	cmd.Flags().StringVar(&model, "model", "", "Cloud model slug (default: "+postprocess.DefaultCloudModel+")")
 
 	return cmd
 }

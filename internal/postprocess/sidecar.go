@@ -364,23 +364,19 @@ CREATE INDEX IF NOT EXISTS wa_person_face_person_idx ON wa_person_face(person_id
 // no-op against an existing, narrower table).
 //
 // Schema notes (departures from the Python original, see DESIGN.md):
-//   - `source` / `model` record provenance now that there's more than
-//     one describer: `source` ∈ {'apple','cloud'}, `model` is the
-//     cloud model slug (empty for on-device Apple Vision). The old
-//     "one engine, drop the column (YAGNI)" assumption no longer holds.
+//   - `source` / `model` record provenance: `source` is 'cloud' for
+//     rows produced by the cloud describer; legacy rows from prior
+//     on-device runs carry a non-'cloud' value (e.g. 'apple') and are
+//     treated as upgradeable. `model` is the cloud model slug.
 //   - `description` is a short natural-language summary produced by the
-//     cloud describer (empty for Apple rows, which emit `labels`).
-//   - `language` added (Vision returns recognizedLanguages per request;
-//     useful for "find Arabic-text receipts" queries).
-//   - `labels` kept as CSV alongside `label_scores` JSON, so FTS
-//     rebuild can splice in label words with a single REPLACE.
+//     cloud describer.
+//   - `language` added (the describer returns a best-effort dominant
+//     script; useful for "find Arabic-text receipts" queries).
 const createImageSidecarsSQL = `
 CREATE TABLE IF NOT EXISTS wa_image_text (
     rowid         INTEGER PRIMARY KEY,
     ocr_text      TEXT NOT NULL DEFAULT '',
     language      TEXT NOT NULL DEFAULT '',
-    labels        TEXT NOT NULL DEFAULT '',
-    label_scores  TEXT,
     description   TEXT NOT NULL DEFAULT '',
     source        TEXT NOT NULL DEFAULT 'apple',
     model         TEXT NOT NULL DEFAULT '',
@@ -404,7 +400,7 @@ CREATE INDEX IF NOT EXISTS media_index_status_idx ON media_index(status);
 // must exist) and by the merge-forward copy (to compute the old↔new
 // column intersection so `SELECT *` schema drift can't bite us).
 var imageSidecarColumns = []string{
-	"rowid", "ocr_text", "language", "labels", "label_scores",
+	"rowid", "ocr_text", "language",
 	"description", "source", "model", "generated_at",
 }
 
@@ -423,10 +419,11 @@ func ensureImageSidecarSchema(db dbExecQuerier) error {
 // introduced after the table was first created by an older whatskept.
 // Each ALTER carries a DEFAULT (or is nullable), so existing rows get a
 // sane value with no backfill — notably wa_image_text.source defaults to
-// 'apple', which is correct: every pre-migration row was produced by
-// Apple Vision. media_index.describe_error is nullable: NULL means "no
-// describe failure recorded", which is the right default for every
-// pre-split row (download and describe were one step then).
+// 'apple', tagging every pre-migration row as a legacy on-device
+// description so the cloud describer treats it as upgradeable.
+// media_index.describe_error is nullable: NULL means "no describe
+// failure recorded", which is the right default for every pre-split row
+// (download and describe were one step then).
 func migrateImageSidecar(db dbExecQuerier) error {
 	// DDL keyed by (table, column); only post-v1 additions need ALTERs.
 	adds := []struct{ table, col, ddl string }{
@@ -749,7 +746,7 @@ func pruneOrphanFiles(dir, suffix string, alive map[int64]struct{}, deleted, fai
 // DB state. The indexed string per message is the concatenation of:
 //
 //   - ZWAMESSAGE.ZTEXT                            (always)
-//   - wa_image_text.ocr_text + labels             (when wa_image_text exists)
+//   - wa_image_text.ocr_text + description        (when wa_image_text exists)
 //   - wa_voice_text.transcript                    (when wa_voice_text exists)
 //   - wa_document.filename                        (when wa_document exists)
 //   - ZWAMEDIAITEM.ZTITLE for link-preview msgs   (always — ZWAMEDIAITEM
@@ -801,13 +798,9 @@ func rebuildFTS(db *sql.DB) (int, error) {
 	if hasOCR {
 		selectParts = append(selectParts,
 			"COALESCE(t.ocr_text, '')",
-			// description (cloud describer) is empty for Apple rows;
-			// indexing it lets MATCH hit summary words like "necklace"
-			// that aren't in the literal OCR.
+			// description (cloud describer) lets MATCH hit summary words
+			// like "necklace" that aren't in the literal OCR.
 			"COALESCE(t.description, '')",
-			// labels is a CSV; replace ',' with ' ' so FTS
-			// tokenizes each label as its own term.
-			"COALESCE(REPLACE(t.labels, ',', ' '), '')",
 		)
 		joinParts = append(joinParts, "LEFT JOIN wa_image_text t ON t.rowid = m.Z_PK")
 		whereParts = append(whereParts, "t.rowid IS NOT NULL")

@@ -43,7 +43,7 @@ join key you need across `media/`, `voice/`, `documents/`, `wa_image_text`,
 | surface              | source                                       | requires                      |
 |----------------------|----------------------------------------------|-------------------------------|
 | typed text           | `ZWAMESSAGE.ZTEXT`                           | always                        |
-| screenshots / photos | `wa_image_text.ocr_text` + `labels`          | `whatskept media-index` ran   |
+| screenshots / photos | `wa_image_text.ocr_text` + `description`     | `whatskept media-index` ran   |
 | voice notes          | `wa_voice_text.transcript`                   | `whatskept voice-index` ran   |
 | document filenames   | `wa_document.filename`                       | always                        |
 | document body text   | `wa_document_text.text` (PDFs only)          | `whatskept document-index` ran|
@@ -62,14 +62,13 @@ SELECT m.rowid, m.ts, m.chat_title, m.sender_name, m.message_type_name,
        COALESCE(
            NULLIF(m.text, ''),
            NULLIF(t.description, ''),   -- compact image summary; full verbatim is t.ocr_text by rowid
-           NULLIF(t.ocr_text, ''),      -- fallback for Apple-described images (no description)
+           NULLIF(t.ocr_text, ''),      -- fallback when an image has no description
            NULLIF(v.transcript, ''),
            NULLIF(dt.text, ''),
            d.filename,
            m.link_title
        )                                                AS hit_text,
        snippet(messages_fts, 0, '[[', ']]', '…', 12)    AS hit_snippet,
-       t.labels                                         AS image_labels,
        d.filename                                       AS document_filename,
        m.link_url, m.link_title
 FROM   messages_fts f
@@ -123,8 +122,8 @@ rowid 12345"*. Your job is to turn the description into a rowid, then hand
 the file to macOS.
 
 1. **Resolve to a rowid.** Use `v_messages` + `messages_fts MATCH` against
-   OCR text, labels, transcripts; filter by sender / chat / date. Project
-   `rowid`, `ts`, `sender_name`, and a short preview.
+   OCR text, descriptions, transcripts; filter by sender / chat / date.
+   Project `rowid`, `ts`, `sender_name`, and a short preview.
 2. **Disambiguate.** If multiple rows match, list candidates and ask which
    one. **Never** `open` several files in a row — one Preview/QuickTime
    window per file is rude.
@@ -308,24 +307,18 @@ the user, `open <path>`; don't read it.
 
 ### `wa_image_text` — image description + OCR
 
-Optional. Populated by `whatskept media-index`, using one of two describers:
-on-device **Apple Vision** (the bundled `whatskept-vision` helper) or a **cloud**
-vision model. The `source` column says which produced each row.
+Optional. Populated by `whatskept media-index`, which runs a **cloud** vision
+model over the downloaded images.
 
 | column         | meaning                                                            |
 |----------------|--------------------------------------------------------------------|
 | `rowid`        | Joins to `v_messages.rowid`.                                       |
 | `ocr_text`     | **Verbatim** recognized text — original language/script, may be long. Survey with `description`; pull this by `rowid` only when drilling into one image. |
-| `description`  | 1–2 sentence summary (cloud describer). Empty for Apple rows. **Use this for browse/survey queries** — it's compact. |
-| `language`     | Dominant language/script code (Apple Vision; may be empty).        |
-| `labels`       | Comma-separated classification labels, e.g. `document,screenshot` (Apple Vision). Empty for cloud rows. |
-| `label_scores` | JSON `{label: confidence}` (Apple Vision).                         |
-| `source`       | Who produced the row: `apple` (on-device) or `cloud`.              |
-| `model`        | Cloud model slug (e.g. `qwen/qwen3-vl-8b-instruct`); empty for Apple. |
+| `description`  | 1–2 sentence summary. **Use this for browse/survey queries** — it's compact. |
+| `language`     | Dominant language/script code (may be empty).                      |
+| `source`       | Who produced the row: `cloud`, or a legacy non-`cloud` value (e.g. `apple`) for rows from older on-device runs. |
+| `model`        | Cloud model slug (e.g. `qwen/qwen3-vl-8b-instruct`).               |
 | `generated_at` | UTC ISO timestamp.                                                 |
-
-An empty `labels` on a `source='cloud'` row is normal (cloud emits `description`,
-not labels); likewise an empty `description` on a `source='apple'` row.
 
 Companion `media_index(rowid, status)` tracks resume state; `status` ∈
 `described | missing | error`. Used for existence checks (see "Showing an
@@ -541,7 +534,7 @@ SELECT m.ts, m.sender_name, m.message_type_name,
        COALESCE(
            NULLIF(m.text, ''),
            NULLIF(t.description, ''),   -- cloud image summary
-           NULLIF(t.ocr_text, ''),      -- Apple Vision OCR / fallback
+           NULLIF(t.ocr_text, ''),      -- verbatim OCR / fallback
            NULLIF(v.transcript, ''),    -- voice note transcript
            '<' || m.message_type_name || '>'
        ) AS content
@@ -556,24 +549,21 @@ LIMIT  500;
 
 Drop the `LEFT JOIN` lines for tables that don't exist yet (optional indexers never ran).
 
-**Find images by classification label.** `wa_image_text.labels` is a
-comma-separated list; wrap both sides with commas for exact-token matching:
+**Find images by content.** Match the cloud `description` + `ocr_text`
+through `messages_fts` (which indexes both), then join back for the image:
 
 ```sql
-SELECT m.ts, m.chat_title, m.sender_name, t.labels,
+SELECT m.ts, m.chat_title, m.sender_name,
        COALESCE(NULLIF(t.description, ''), SUBSTR(t.ocr_text, 1, 120)) AS summary,
        './media/' || m.rowid || '.jpg' AS image_path
-FROM   v_messages   m
+FROM   messages_fts  f
+JOIN   v_messages    m ON m.rowid = f.rowid
 JOIN   wa_image_text t ON t.rowid = m.rowid
-WHERE  ',' || t.labels || ',' LIKE '%,receipt,%'
+WHERE  messages_fts MATCH 'receipt'
   AND  m.ts >= datetime('now', '-180 days')
 ORDER  BY m.ts DESC
 LIMIT  20;
 ```
-
-Apple Vision labels include `document`, `screenshot`, `handwriting`,
-`receipt`, `map`, `qr_code`, `text`, `photo`, `selfie`, `food`, `landscape`,
-`outdoor` — not exhaustive.
 
 ## Workflow
 

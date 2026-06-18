@@ -51,25 +51,8 @@ func waitForJob(t *testing.T, s *server, id string) {
 	t.Fatal("job did not finish within 5s")
 }
 
-// TestMediaIndexStartsWithoutPassword: the Apple Vision scan reads images
-// off disk, so it must NOT require the backup password — a workspace
-// alone is enough to start the job.
-func TestMediaIndexStartsWithoutPassword(t *testing.T) {
-	// No workspace → 400.
-	_, mux := testServer()
-	if rec := post(mux, "/api/database/media-index", `{}`); rec.Code != http.StatusBadRequest {
-		t.Fatalf("no workspace: code = %d", rec.Code)
-	}
-
-	// Workspace open, no password supplied or cached → should still start.
-	s, mux2 := testServer()
-	s.ws.set(t.TempDir())
-	id := startedJobID(t, post(mux2, "/api/database/media-index", `{}`))
-	waitForJob(t, s, id)
-}
-
 // TestMediaDescribeStartsWithoutPassword: with an API key present, cloud
-// describe also reads off disk and needs no backup password.
+// describe reads images off disk and needs no backup password.
 func TestMediaDescribeStartsWithoutPassword(t *testing.T) {
 	s, mux := testServer()
 	s.ws.set(t.TempDir())

@@ -14,7 +14,7 @@ import (
 //
 //	1 — no media_index row              (never attempted)
 //	2 — downloaded, describe_error NULL  (ready to describe)
-//	3 — described, source='apple'        (apple base layer)
+//	3 — described, source='apple'        (legacy non-cloud base layer)
 //	4 — described, source='cloud'        (already cloud)
 //	5 — missing                          (not in backup)
 //	6 — error                            (download failed, no file)
@@ -101,27 +101,21 @@ func TestSelectDescribeCandidates(t *testing.T) {
 	db := seedCandidateDB(t)
 	cases := []struct {
 		name        string
-		engine      string
 		retryErrors bool
 		force       bool
 		want        []int64
 	}{
-		// Apple, normal: only the clean downloaded row 2. Row 7 carries a
-		// describe_error (skipped) and row 3 is already apple-described.
-		{"apple_default", SourceApple, false, false, []int64{2}},
-		{"apple_retry_errors", SourceApple, true, false, []int64{2, 7}},
-		// Force re-runs apple over downloaded rows + apple-described rows.
-		{"apple_force", SourceApple, false, true, []int64{2, 3, 7}},
 		// Cloud upgrades: downloaded rows + any non-cloud described row
-		// (row 3 apple), never the already-cloud row 4.
-		{"cloud_default", SourceCloud, false, false, []int64{2, 3}},
-		{"cloud_retry_errors", SourceCloud, true, false, []int64{2, 3, 7}},
+		// (row 3, legacy 'apple'), never the already-cloud row 4. Row 7
+		// carries a describe_error and is skipped unless retryErrors.
+		{"default", false, false, []int64{2, 3}},
+		{"retry_errors", true, false, []int64{2, 3, 7}},
 		// Force re-describes every on-disk row regardless of source.
-		{"cloud_force", SourceCloud, false, true, []int64{2, 3, 4, 7}},
+		{"force", false, true, []int64{2, 3, 4, 7}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := selectDescribeCandidates(db, c.engine, c.retryErrors, c.force, 0)
+			got, err := selectDescribeCandidates(db, c.retryErrors, c.force, 0)
 			if err != nil {
 				t.Fatal(err)
 			}

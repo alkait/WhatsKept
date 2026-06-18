@@ -1,15 +1,12 @@
 package postprocess
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -30,10 +27,9 @@ import (
 //      write it to <workspace>/media/<rowid>.<ext>, marking the row
 //      'downloaded'. The ONLY image step that touches the backup.
 //
-//   2. MediaIndex — `whatskept media-index` (CLI) / "Scan with Apple
-//      Vision" (GUI): for every 'downloaded' row, read the file back
-//      off disk, run the describer (Apple Vision via the bundled Swift
-//      helper, or a cloud vision model) to get OCR text + labels /
+//   2. MediaIndex — `whatskept media-index` (CLI) / "AI image
+//      descriptions" (GUI): for every 'downloaded' row, read the file
+//      back off disk, run the cloud vision model to get an OCR text +
 //      description, persist them in wa_image_text, and flip the row to
 //      'described'. A pure consumer of media/ — no password.
 //
@@ -42,14 +38,9 @@ import (
 //
 // Design notes (departures from the Python original):
 //
-//   - One Swift subprocess for the whole run, talking line-delimited
-//     JSON over stdin/stdout. ~30 ms startup cost amortised over
-//     thousands of images, ~1 ms protocol overhead per request.
-//   - `engine` column dropped (YAGNI — only one engine).
-//   - `language` column added to wa_image_text (Apple Vision returns
-//     dominant script; useful for "find Arabic-text receipts").
-//   - label_min_conf defaults to 0.50 (Python: 0.30); below that
-//     Apple Vision labels are mostly "indoor"/"outdoor" noise.
+//   - `language` column added to wa_image_text (the describer returns
+//     a best-effort dominant script; useful for "find Arabic-text
+//     receipts").
 //   - Decrypted JPEGs are kept on disk by default at
 //     <workspace>/media/<rowid>.<ext> (jpg / png / heic / gif —
 //     whatever the bytes actually are) so the agent can `open`
@@ -68,10 +59,10 @@ const (
 	// MediaStatusDownloaded means the decrypted image is on disk at
 	// <Workspace>/media/<rowid>.<ext> but has not yet been described.
 	// It is the resting state between the (password-gated) download
-	// step and the enrichment steps (Apple Vision / cloud), which are
-	// pure consumers of the media/ folder. A per-image describe failure
-	// keeps this status and records the reason in describe_error, so the
-	// download step never re-downloads a file that's already on disk.
+	// step and the cloud-describe step, which is a pure consumer of the
+	// media/ folder. A per-image describe failure keeps this status and
+	// records the reason in describe_error, so the download step never
+	// re-downloads a file that's already on disk.
 	MediaStatusDownloaded = "downloaded"
 
 	// statusCancelled is an internal, never-persisted sentinel: an
@@ -97,12 +88,6 @@ const (
 	// app-group container. Manifest entries carry the full path
 	// directly, so we prefix DB-side ZMEDIALOCALPATH with this.
 	mediaManifestPrefix = "Message/"
-
-	// Defaults for Vision tunables. Mirror the env-var defaults
-	// in build/vision-helper/main.swift so a user running media-
-	// index without overrides gets identical behaviour.
-	defaultLabelTopN    = 5
-	defaultLabelMinConf = 0.50
 )
 
 // mediaImageExts lists every on-disk extension downloadOne is allowed
@@ -113,10 +98,10 @@ var mediaImageExts = []string{".jpg", ".png", ".heic", ".gif"}
 
 // detectImageFormat sniffs the first few bytes of `data` and returns
 // a bare extension ("jpg", "png", "heic", "gif") for the four
-// formats Apple Vision accepts in WhatsApp content. ok=false means
-// nothing matched — the blob is corrupt, encrypted, or some format
-// Vision can't handle (TIFF/WebP do exist but we haven't seen them
-// in WhatsApp media so far).
+// formats we handle in WhatsApp content. ok=false means nothing
+// matched — the blob is corrupt, encrypted, or some format we don't
+// handle (TIFF/WebP do exist but we haven't seen them in WhatsApp
+// media so far).
 //
 // Magic-byte references:
 //   - JPEG:  FF D8 FF
@@ -179,30 +164,24 @@ type MediaIndexOptions struct {
 	RetryMissing bool
 
 	// RetryErrors re-attempts rows previously marked 'error'
-	// (decrypt failed, Vision failed, etc.).
+	// (decrypt failed, describe failed, etc.).
 	RetryErrors bool
 
-	// LabelTopN / LabelMinConf override the Vision defaults.
-	// Passed through to the Swift helper via env vars.
-	LabelTopN    int
-	LabelMinConf float32
-
-	// Engine selects the describer: SourceApple (default, on-device
-	// Apple Vision) or SourceCloud (an OpenRouter vision model). Cloud
+	// Engine selects the describer. Only SourceCloud (an OpenRouter
+	// vision model) is supported; an empty value defaults to it. Cloud
 	// requires APIKey; Model defaults to DefaultCloudModel.
 	Engine string
 	APIKey string
 	Model  string
 
 	// Concurrency caps in-flight Describe calls. 0 = sensible default
-	// per engine (cloud parallelises HTTP; Apple is forced to 1 since
-	// the Swift helper is a single-stdin subprocess). The decrypt step
-	// and DB writes are serialised internally regardless.
+	// (defaultCloudConcurrency). The decrypt step and DB writes are
+	// serialised internally regardless.
 	Concurrency int
 
 	// Force re-describes every describable image, overwriting rows
-	// already done by this engine (e.g. to apply an improved prompt or
-	// switch models). Without it, cloud runs skip already-cloud rows.
+	// already done (e.g. to apply an improved prompt or switch models).
+	// Without it, runs skip rows already described by the cloud.
 	Force bool
 
 	// Ctx is checked between rows for graceful cancellation.
@@ -233,12 +212,11 @@ type MediaIndexProgress struct {
 	Missing    int     `json:"missing"`      // file absent in backup this run
 	Errors     int     `json:"errors"`       // failures this run
 	WithOCR    int     `json:"with_ocr"`     // rows with non-empty ocr_text
-	WithLabels int     `json:"with_labels"`  // rows with at least one label (Apple)
-	WithDesc   int     `json:"with_desc"`    // rows with a description (cloud)
+	WithDesc   int     `json:"with_desc"`    // rows with a description
 	RatePerSec float64 `json:"rate_per_sec"` // images/sec over the run so far
 	ETASeconds float64 `json:"eta_seconds"`  // estimated remaining seconds
 	ElapsedSec float64 `json:"elapsed_sec"`
-	CostUSD    float64 `json:"cost_usd"` // running OpenRouter spend (cloud; 0 for Apple)
+	CostUSD    float64 `json:"cost_usd"` // running OpenRouter spend
 }
 
 // MediaIndexResult is the final stats summary.
@@ -253,7 +231,6 @@ type MediaIndexResult struct {
 	Missing          int     `json:"missing"`
 	Errors           int     `json:"errors"`
 	WithOCR          int     `json:"with_ocr"`
-	WithLabels       int     `json:"with_labels"`
 	WithDesc         int     `json:"with_desc"`
 	DurationSec      float64 `json:"duration_sec"`
 	FTSCountAfter    int     `json:"fts_count_after"`
@@ -394,7 +371,7 @@ func downloadMediaWithBundle(opts MediaIndexOptions, db *sql.DB, bundle *backup.
 	process := func(ctx context.Context, c candidate) oneResult {
 		return downloadOne(ctx, db, bundle, &decryptMu, manifestIdx, mediaDir, c, opts.Log)
 	}
-	// Download never changes ocr_text/labels, so no FTS rebuild.
+	// Download never changes ocr_text/description, so no FTS rebuild.
 	_ = runMediaPipeline(opts, res, db, candidates, total, alreadyDownloaded, concurrency, nil, false, process)
 
 	opts.Log(fmt.Sprintf(
@@ -405,10 +382,10 @@ func downloadMediaWithBundle(opts MediaIndexOptions, db *sql.DB, bundle *backup.
 }
 
 // MediaIndex describes images that are already on disk in
-// <Workspace>/media/ (written by DownloadMedia). It runs the selected
-// describer (Apple Vision on-device, or a cloud vision model) over every
-// 'downloaded' row, writes the OCR/labels/description into wa_image_text,
-// and transitions the row to 'described'. It needs NO backup password —
+// <Workspace>/media/ (written by DownloadMedia). It runs the cloud
+// describer over every 'downloaded' row, writes the OCR + description
+// into wa_image_text, and transitions the row to 'described'. It needs
+// NO backup password —
 // it never touches the encrypted backup. Resumable per-row.
 func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if opts.Workspace == "" {
@@ -419,12 +396,6 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	}
 	if opts.Log == nil {
 		opts.Log = func(string) {}
-	}
-	if opts.LabelTopN <= 0 {
-		opts.LabelTopN = defaultLabelTopN
-	}
-	if opts.LabelMinConf <= 0 {
-		opts.LabelMinConf = defaultLabelMinConf
 	}
 	if opts.ProgressEvery <= 0 {
 		opts.ProgressEvery = 25
@@ -450,7 +421,7 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	candidates, err := selectDescribeCandidates(db, opts.Engine, opts.RetryErrors, opts.Force, opts.Limit)
+	candidates, err := selectDescribeCandidates(db, opts.RetryErrors, opts.Force, opts.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -470,23 +441,21 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	opts.Log(fmt.Sprintf("Already described:  %d", alreadyDescribed))
 	opts.Log(fmt.Sprintf("Queued this run:    %d", len(candidates)))
 
-	// --- Build the describer (Apple Vision or cloud) -----------
+	// --- Build the cloud describer -----------------------------
 	describer, err := buildDescriber(opts)
 	if err != nil {
 		return nil, err
 	}
 	defer describer.Close()
-	concurrency := resolveConcurrency(opts.Engine, opts.Concurrency)
+	concurrency := resolveConcurrency(opts.Concurrency)
 	opts.Log(fmt.Sprintf("Describer: %s%s (concurrency %d)",
 		describer.Source(), modelSuffix(describer.Model()), concurrency))
 
-	// baseline = images already done by THIS engine at run start, so the
-	// UI can show cumulative coverage (baseline + described-this-run)
+	// baseline = images already described by the cloud at run start, so
+	// the UI can show cumulative coverage (baseline + described-this-run)
 	// rather than a per-run count that looks tiny next to prior progress.
 	baseline := alreadyDescribed
-	if opts.Engine == SourceCloud {
-		_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = ?`, SourceCloud).Scan(&baseline)
-	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = ?`, SourceCloud).Scan(&baseline)
 
 	process := func(ctx context.Context, c candidate) oneResult {
 		return describeOne(ctx, db, describer, mediaDir, c, opts.Log)
@@ -601,9 +570,6 @@ func runMediaPipeline(
 			if r.withOCR {
 				res.WithOCR++
 			}
-			if r.withLabels {
-				res.WithLabels++
-			}
 			if r.withDescription {
 				res.WithDesc++
 			}
@@ -631,7 +597,7 @@ func runMediaPipeline(
 	}
 
 	if rebuildFTSAfter {
-		// Rebuild FTS so the new ocr_text + labels are searchable.
+		// Rebuild FTS so the new ocr_text + description are searchable.
 		opts.Log("Rebuilding messages_fts…")
 		ftsN, err := rebuildFTS(db)
 		if err != nil {
@@ -644,25 +610,15 @@ func runMediaPipeline(
 	return fatalErr
 }
 
-// buildDescriber constructs the Describer selected by opts.Engine.
-// Apple is the default; cloud requires an API key. The caller owns
-// Close().
+// buildDescriber constructs the cloud Describer. opts.Engine must be
+// empty (defaults to cloud) or SourceCloud; cloud requires an API key.
+// The caller owns Close().
 func buildDescriber(opts MediaIndexOptions) (Describer, error) {
 	switch opts.Engine {
-	case SourceCloud:
+	case "", SourceCloud:
 		return newCloudDescriber(opts.APIKey, opts.Model)
-	case "", SourceApple:
-		helperPath, err := resolveVisionHelper()
-		if err != nil {
-			return nil, fmt.Errorf("locate vision helper: %w", err)
-		}
-		worker, err := startVisionWorker(opts.Ctx, helperPath, opts.LabelTopN, opts.LabelMinConf)
-		if err != nil {
-			return nil, fmt.Errorf("start vision helper: %w", err)
-		}
-		return &appleDescriber{w: worker}, nil
 	default:
-		return nil, fmt.Errorf("media-index: unknown engine %q (want %q or %q)", opts.Engine, SourceApple, SourceCloud)
+		return nil, fmt.Errorf("media-index: unknown engine %q (only %q is supported)", opts.Engine, SourceCloud)
 	}
 }
 
@@ -673,13 +629,9 @@ func modelSuffix(m string) string {
 	return " (" + m + ")"
 }
 
-// resolveConcurrency picks the in-flight Describe cap. Apple is pinned
-// to 1 (the Swift helper is a single-stdin subprocess); cloud honours
-// an explicit value or falls back to defaultCloudConcurrency.
-func resolveConcurrency(engine string, requested int) int {
-	if engine != SourceCloud {
-		return 1
-	}
+// resolveConcurrency picks the in-flight Describe cap: the caller's
+// explicit value, or defaultCloudConcurrency.
+func resolveConcurrency(requested int) int {
 	if requested > 0 {
 		return requested
 	}
@@ -687,7 +639,7 @@ func resolveConcurrency(engine string, requested int) int {
 }
 
 // costReporter is optionally implemented by a Describer that can
-// report cumulative spend (cloudDescriber does; Apple doesn't).
+// report cumulative spend (cloudDescriber does).
 type costReporter interface{ CostUSD() float64 }
 
 func describerCost(d Describer) float64 {
@@ -702,7 +654,6 @@ func describerCost(d Describer) float64 {
 type oneResult struct {
 	status          string
 	withOCR         bool
-	withLabels      bool
 	withDescription bool
 	fatal           error // non-nil → a global failure; abort the whole run
 }
@@ -820,42 +771,28 @@ func selectDownloadCandidates(db *sql.DB, retryMissing, retryErrors bool, limit 
 	return queryCandidates(db, where, skip, limit)
 }
 
-// selectDescribeCandidates is the resume query for the describe phase.
-// It only ever queues rows whose file is already on disk.
-//
-//   - Apple (default): every 'downloaded' row not yet described. A prior
-//     per-image describe failure (describe_error set) is skipped unless
-//     retryErrors. With force, also re-describes apple-sourced rows.
-//   - Cloud: upgrades — every 'downloaded' row plus any 'described' row
-//     NOT produced by cloud, never re-doing a cloud row. With force,
-//     re-describes every on-disk row regardless of source.
-func selectDescribeCandidates(db *sql.DB, engine string, retryErrors, force bool, limit int) ([]candidate, error) {
+// selectDescribeCandidates is the resume query for the cloud-describe
+// phase. It only ever queues rows whose file is already on disk:
+// every 'downloaded' row, plus any 'described' row NOT produced by the
+// cloud (legacy on-device descriptions, upgraded to cloud), never
+// re-doing a cloud row. A prior per-image describe failure
+// (describe_error set) is skipped unless retryErrors. With force,
+// re-describes every on-disk row regardless of source.
+func selectDescribeCandidates(db *sql.DB, retryErrors, force bool, limit int) ([]candidate, error) {
 	downloadedReady := "status = '" + MediaStatusDownloaded + "'"
 	if !retryErrors {
 		downloadedReady += " AND describe_error IS NULL"
 	}
 
 	var sub string
-	switch engine {
-	case SourceCloud:
-		if force {
-			sub = "SELECT rowid FROM media_index WHERE status IN ('" +
-				MediaStatusDownloaded + "','" + MediaStatusDescribed + "')"
-		} else {
-			sub = "SELECT rowid FROM media_index WHERE " + downloadedReady +
-				" UNION SELECT mi.rowid FROM media_index mi" +
-				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
-				" WHERE mi.status = '" + MediaStatusDescribed + "' AND t.source <> '" + SourceCloud + "'"
-		}
-	default: // apple
-		if force {
-			sub = "SELECT rowid FROM media_index WHERE status = '" + MediaStatusDownloaded + "'" +
-				" UNION SELECT mi.rowid FROM media_index mi" +
-				" JOIN wa_image_text t ON t.rowid = mi.rowid" +
-				" WHERE mi.status = '" + MediaStatusDescribed + "' AND t.source = '" + SourceApple + "'"
-		} else {
-			sub = "SELECT rowid FROM media_index WHERE " + downloadedReady
-		}
+	if force {
+		sub = "SELECT rowid FROM media_index WHERE status IN ('" +
+			MediaStatusDownloaded + "','" + MediaStatusDescribed + "')"
+	} else {
+		sub = "SELECT rowid FROM media_index WHERE " + downloadedReady +
+			" UNION SELECT mi.rowid FROM media_index mi" +
+			" JOIN wa_image_text t ON t.rowid = mi.rowid" +
+			" WHERE mi.status = '" + MediaStatusDescribed + "' AND t.source <> '" + SourceCloud + "'"
 	}
 	where := "m.ZMEDIALOCALPATH LIKE '%.jpg'\n\t\t  AND m.ZMESSAGE IN (" + sub + ")"
 	return queryCandidates(db, where, nil, limit)
@@ -1053,12 +990,11 @@ func describeOne(
 		log(fmt.Sprintf("[rowid=%d] begin tx: %v", c.rowid, err))
 		return oneResult{status: MediaStatusError}
 	}
-	labelsCSV, labelsJSON := encodeLabels(dres.Labels)
 	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO wa_image_text
-		 (rowid, ocr_text, language, labels, label_scores, description, source, model, generated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.rowid, dres.OCRText, dres.Language, labelsCSV, labelsJSON,
+		 (rowid, ocr_text, language, description, source, model, generated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		c.rowid, dres.OCRText, dres.Language,
 		dres.Description, describer.Source(), describer.Model(), now,
 	); err != nil {
 		_ = tx.Rollback()
@@ -1080,7 +1016,6 @@ func describeOne(
 	return oneResult{
 		status:          MediaStatusDescribed,
 		withOCR:         dres.OCRText != "",
-		withLabels:      len(dres.Labels) > 0,
 		withDescription: dres.Description != "",
 	}
 }
@@ -1126,47 +1061,6 @@ func writeMediaIndex(db *sql.DB, c candidate, status string, bytesLen int64, err
 	)
 }
 
-// encodeLabels converts the worker's [[name, score], …] response
-// into the two columns wa_image_text expects:
-//   - labels       : "dog,cat,pet"          (CSV, FTS-friendly)
-//   - label_scores : {"dog":0.94,...}       (JSON, exact scores)
-func encodeLabels(ls []visionLabel) (csv, scores string) {
-	if len(ls) == 0 {
-		return "", "{}"
-	}
-	names := make([]string, len(ls))
-	scoreMap := make(map[string]float32, len(ls))
-	for i, l := range ls {
-		names[i] = l.Name
-		scoreMap[l.Name] = l.Score
-	}
-	csv = joinCSV(names)
-	b, _ := json.Marshal(scoreMap)
-	scores = string(b)
-	return
-}
-
-// joinCSV joins string labels with ',' separator. Labels contain
-// only ASCII letters/digits/hyphens (Apple's classifier identifiers),
-// so we don't need to escape.
-func joinCSV(parts []string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	n := 0
-	for _, p := range parts {
-		n += len(p) + 1
-	}
-	out := make([]byte, 0, n)
-	for i, p := range parts {
-		if i > 0 {
-			out = append(out, ',')
-		}
-		out = append(out, p...)
-	}
-	return string(out)
-}
-
 // writeFileAtomic writes data to path via a sibling tmp file then
 // renames. Same-filesystem rename is atomic on macOS, so a crashed
 // process never leaves a torn JPEG behind.
@@ -1210,7 +1104,6 @@ func emitProgress(cb func(MediaIndexProgress), res *MediaIndexResult, total, alr
 		Missing:    res.Missing,
 		Errors:     res.Errors,
 		WithOCR:    res.WithOCR,
-		WithLabels: res.WithLabels,
 		WithDesc:   res.WithDesc,
 		RatePerSec: rate,
 		ETASeconds: eta,
@@ -1232,156 +1125,4 @@ func resolveVisionHelper() (string, error) {
 		return "", fmt.Errorf("helper not found at %s: %w", p, err)
 	}
 	return p, nil
-}
-
-// -------------------------------------------------------------------
-// Vision worker subprocess client
-// -------------------------------------------------------------------
-
-// visionWorker is a request-response client for the Swift Vision
-// helper. Synchronous from the caller's perspective: each describe()
-// call writes one JSON line and blocks until the matching response
-// arrives. We don't pipeline requests because Vision is the
-// dominant cost (~100-300 ms each) and overlapping two Swift calls
-// against one process buys little — the Swift binary uses one
-// VNImageRequestHandler at a time. If we ever want more
-// concurrency, spawning a second worker is the simplest path.
-type visionWorker struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
-	stderr   io.ReadCloser
-	closeErr error
-}
-
-type visionRequest struct {
-	ID   int64  `json:"id"`
-	Path string `json:"path"`
-}
-
-type visionLabel struct {
-	Name  string
-	Score float32
-}
-
-// visionResponse is the parsed Swift-side reply. Labels arrive as
-// [["name", score], ...] which JSON-decodes into a tuple-shaped
-// slice via custom UnmarshalJSON below.
-type visionResponse struct {
-	ID       int64
-	OK       bool
-	OCRText  string
-	Language string
-	Labels   []visionLabel
-	Error    string
-}
-
-func (vr *visionResponse) UnmarshalJSON(data []byte) error {
-	// Decode into a flexible shape first so we can pick at the
-	// labels array which is [[name, score], ...] not [{name,score}].
-	var raw struct {
-		ID       int64               `json:"id"`
-		OK       bool                `json:"ok"`
-		OCRText  string              `json:"ocr_text"`
-		Language string              `json:"language"`
-		Labels   [][]json.RawMessage `json:"labels"`
-		Error    string              `json:"error"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	vr.ID = raw.ID
-	vr.OK = raw.OK
-	vr.OCRText = raw.OCRText
-	vr.Language = raw.Language
-	vr.Error = raw.Error
-	vr.Labels = make([]visionLabel, 0, len(raw.Labels))
-	for _, pair := range raw.Labels {
-		if len(pair) != 2 {
-			continue
-		}
-		var name string
-		var score float32
-		if err := json.Unmarshal(pair[0], &name); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(pair[1], &score); err != nil {
-			continue
-		}
-		vr.Labels = append(vr.Labels, visionLabel{Name: name, Score: score})
-	}
-	return nil
-}
-
-func startVisionWorker(ctx context.Context, path string, labelTopN int, labelMinConf float32) (*visionWorker, error) {
-	cmd := exec.CommandContext(ctx, path)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("WHATSKEPT_VISION_LABEL_TOP_N=%d", labelTopN),
-		fmt.Sprintf("WHATSKEPT_VISION_LABEL_MIN_CONF=%.2f", labelMinConf),
-	)
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start helper: %w", err)
-	}
-	return &visionWorker{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReaderSize(stdout, 64*1024),
-		stderr: stderr,
-	}, nil
-}
-
-func (w *visionWorker) describe(rowid int64, path string) (*visionResponse, error) {
-	req := visionRequest{ID: rowid, Path: path}
-	enc, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-	enc = append(enc, '\n')
-	if _, err := w.stdin.Write(enc); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
-	}
-	line, err := w.stdout.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-	var resp visionResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, fmt.Errorf("decode response: %w (line=%q)", err, string(line))
-	}
-	if resp.ID != rowid {
-		// Out-of-order shouldn't happen with our synchronous
-		// protocol, but if it does the safest thing is to fail
-		// the call so the caller marks the row as error and
-		// can retry.
-		return nil, fmt.Errorf("response id mismatch: want=%d got=%d", rowid, resp.ID)
-	}
-	return &resp, nil
-}
-
-// Close shuts the worker down cleanly. Closing stdin → Swift
-// loop exits with status 0 → cmd.Wait returns. Called via defer
-// from MediaIndex; safe to call twice.
-func (w *visionWorker) Close() error {
-	if w.cmd == nil {
-		return w.closeErr
-	}
-	if w.stdin != nil {
-		_ = w.stdin.Close()
-		w.stdin = nil
-	}
-	w.closeErr = w.cmd.Wait()
-	w.cmd = nil
-	return w.closeErr
 }

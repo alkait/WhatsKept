@@ -131,7 +131,6 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// the same SSE machinery as backups.
 	mux.HandleFunc("GET /api/database/status", s.handleDatabaseStatus)
 	mux.HandleFunc("POST /api/database/sync", s.handleSyncDatabase)
-	mux.HandleFunc("POST /api/database/media-index", s.handleMediaIndex)
 	mux.HandleFunc("GET /api/database/media-index/issues", s.handleMediaIndexIssues)
 	mux.HandleFunc("GET /api/database/media-describe/status", s.handleMediaDescribeStatus)
 	mux.HandleFunc("POST /api/database/media-describe", s.handleMediaDescribe)
@@ -1106,64 +1105,15 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }
 
-// mediaIndexRequest is the JSON body of POST /api/database/media-index.
-// mediaIndexRequest is the body of POST /api/database/media-index. The
-// on-device Apple Vision scan reads images already on disk in <ws>/media/
-// (written by media-download), so it needs no backup password.
-type mediaIndexRequest struct {
-	Force bool `json:"force"` // re-scan every downloaded image, overwriting existing rows
-}
-
-// handleMediaIndex starts a `postprocess.MediaIndex` (Apple Vision) run
-// as an in-process SSE job over the already-downloaded images. The job
-// emits two event types:
-//   - "line"     human-readable status
-//   - "progress" JSON-encoded MediaIndexProgress every 25 rows; the UI
-//     renders a progress bar with rate / ETA / counts
-//
-// Cancellation: the UI hits DELETE /api/jobs/{id} (existing endpoint)
-// to abort. The job's context is torn down, the loop breaks between
-// rows, and the current row's commit either finishes or rolls back.
-func (s *server) handleMediaIndex(w http.ResponseWriter, r *http.Request) {
-	cur := s.ws.get()
-	if cur == "" {
-		httpError(w, http.StatusBadRequest, "no workspace open")
-		return
-	}
-
-	var req mediaIndexRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-		httpError(w, http.StatusBadRequest, "invalid JSON body")
-		return
-	}
-
-	jobID := s.jobs.startInProcessProgressCtx("media-index",
-		func(ctx context.Context, log func(string), progress func(any)) error {
-			_, err := postprocess.MediaIndex(postprocess.MediaIndexOptions{
-				Workspace: cur,
-				Force:     req.Force,
-				Ctx:       ctx,
-				Log:       log,
-				Progress: func(p postprocess.MediaIndexProgress) {
-					progress(p)
-				},
-			})
-			return err
-		})
-
-	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
-}
-
 // mediaDescribeStatusResponse drives the Cloud descriptions card:
 // whether a key is held this session, how many images exist, and how
-// many are described on-device (Apple) vs in the cloud.
+// many are described in the cloud.
 type mediaDescribeStatusResponse struct {
 	HasKey       bool   `json:"has_key"`
 	TotalImages  int    `json:"total_images"`
 	Downloaded   int    `json:"downloaded"`  // images on disk in media/ (the describable set)
 	Described    int    `json:"described"`   // any source
 	CloudCount   int    `json:"cloud_count"` // wa_image_text.source = 'cloud'
-	AppleCount   int    `json:"apple_count"` // wa_image_text.source = 'apple'
 	Missing      int    `json:"missing"`     // referenced but not in the backup — undescribable
 	DefaultModel string `json:"default_model"`
 }
@@ -1208,10 +1158,9 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 	// 'described' (whose file is still on disk).
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status IN ('downloaded','described')`).Scan(&resp.Downloaded)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'described'`).Scan(&resp.Described)
-	// source counts depend on the migrated wa_image_text; ignore errors
-	// (old/absent table simply leaves these at 0).
+	// source count depends on the migrated wa_image_text; ignore errors
+	// (old/absent table simply leaves this at 0).
 	_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = 'cloud'`).Scan(&resp.CloudCount)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM wa_image_text WHERE source = 'apple'`).Scan(&resp.AppleCount)
 	// Images referenced by a message but absent from the backup (never
 	// downloaded on device) can't be described — exclude them from
 	// "done" math so coverage can actually reach 100%.
@@ -1230,9 +1179,9 @@ type mediaDescribeRequest struct {
 	Force       bool   `json:"force"`       // re-describe everything, overwriting cloud rows
 }
 
-// handleMediaDescribe starts a cloud media-describe run as an SSE job,
-// mirroring handleMediaIndex but with Engine=cloud. The session API key
-// is required; images are read from <ws>/media/ (no backup password).
+// handleMediaDescribe starts a cloud media-describe run as an SSE job
+// with Engine=cloud. The session API key is required; images are read
+// from <ws>/media/ (no backup password).
 func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
@@ -1591,7 +1540,7 @@ func (s *server) handleVoiceModelDownload(w http.ResponseWriter, _ *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }
 
-// voiceIndexRequest mirrors mediaIndexRequest — the JSON body may
+// voiceIndexRequest — the JSON body may
 // optionally carry a password override; otherwise the session cache
 // is consulted.
 type voiceIndexRequest struct {
@@ -1671,7 +1620,7 @@ type documentIndexRequest struct {
 }
 
 // handleDocumentIndex starts a `postprocess.DocumentIndex` run as
-// an in-process SSE job. Same shape as handleMediaIndex / handleVoiceIndex:
+// an in-process SSE job. Same shape as handleVoiceIndex:
 // emits "line" + "progress" events through the existing SSE
 // machinery, and DELETE /api/jobs/{id} would cancel via context
 // teardown between rows.

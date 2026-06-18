@@ -996,7 +996,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJob, modelJob, documentJob, faceJob, faceModelJob, onSync, onMediaIndex, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, onFaceIndex, onFaceModelDownload, hasSessionPassword, onForgetPassword, binding, onForgetBinding, onOpenAgents }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, modelJob, documentJob, faceJob, faceModelJob, onSync, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, onFaceIndex, onFaceModelDownload, hasSessionPassword, onForgetPassword, binding, onForgetBinding, onOpenAgents }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -1161,12 +1161,6 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
             avatars/contacts), so these enrichment cards — all password-free
             consumers of media/ — appear once images are on disk. */}
         {(dbStatus?.image_downloaded ?? 0) > 0 ? (<>
-          <MediaIndexCard
-            dbStatus={dbStatus}
-            job={mediaJob}
-            onMediaIndex={onMediaIndex}
-            reloadDbStatus={reloadDbStatus}
-          />
           {FEATURES.people && (
           <FindPeopleCard
             job={faceJob}
@@ -1722,207 +1716,13 @@ function PeopleGrid({ onClose }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MediaIndexCard — "Scan with Apple Vision" section under the Database tab
-// ═══════════════════════════════════════════════════════════════════════════
-// Lifecycle parallels DatabaseTab's messages card: read counts from
-// dbStatus, decide a state ("idle / partial / done / no-db / running"),
-// render the button accordingly, and (when running) show a structured
-// progress card driven by the "progress" events the media-index job
-// emits over SSE.
-function MediaIndexCard({ dbStatus, job, onMediaIndex, reloadDbStatus }) {
-  const [showIssues, setShowIssues] = useState(false);
-  const [showInfo, setShowInfo] = useState(false);
-  const [showConfirm, setShowConfirm] = useState(false);
-  const j = job || {};
-  const isRunning = !!j.running;
-  const hasDone   = j.done !== undefined && j.done !== null;
-  const progress  = j.progress || null;
-
-  // Reload counts on every successful finish so the header gauge
-  // updates from "5,210 / 31,608" → "5,260 / 31,608" without a
-  // manual refresh.
-  useEffect(() => {
-    if (hasDone && j.done === true) reloadDbStatus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasDone, j.done]);
-
-  if (!dbStatus) return null;
-  const hasDB    = !!dbStatus.db_exists;
-  const indexed  = dbStatus.image_described ?? 0;
-  // Apple Vision can only scan images that are already on disk, so the
-  // denominator is the downloaded set — not every image on the device.
-  // (The card is only rendered once image_downloaded > 0.)
-  const downloaded = dbStatus.image_downloaded ?? 0;
-  const remaining  = Math.max(downloaded - indexed, 0);
-  const allDone    = downloaded > 0 && indexed >= downloaded;
-
-  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
-  if (allDone) {
-    title         = "All downloaded images scanned";
-    subtitle      = (
-      <span>
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} scanned</button>
-      </span>
-    );
-    buttonLabel   = "Re-scan images";
-    buttonPrimary = false;
-    statusDot     = "#25D366";
-  } else if (indexed === 0) {
-    title         = "Images not yet scanned";
-    subtitle      = `${downloaded.toLocaleString()} downloaded images. Scanning will OCR + classify each one via Apple Vision (~0.2 s / image).`;
-    buttonLabel   = "Scan with Apple Vision";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
-  } else {
-    title         = "Resume scanning";
-    subtitle      = (
-      <span>
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{indexed.toLocaleString()} scanned</button>
-        {" · "}
-        <button onClick={() => setShowInfo(true)} className="underline decoration-dotted hover:text-gray-700">{remaining.toLocaleString()} remaining</button>.
-      </span>
-    );
-    buttonLabel   = "Resume";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
-  }
-
-  const pct = downloaded > 0
-    ? Math.min(100, Math.round((indexed / downloaded) * 100))
-    : 0;
-
-  // run flow: no password — Apple Vision reads images already on disk.
-  // `force` re-scans everything, overwriting existing rows.
-  const run = (force) => onMediaIndex({ force });
-  // The button: when everything's already enriched, the only action is
-  // a full Apple re-scan — which overwrites other enrichment (incl.
-  // paid cloud descriptions), so confirm first. Otherwise just run.
-  const launch = () => {
-    if (allDone) { setShowConfirm(true); return; }
-    run(false);
-  };
-
-  const buttonDisabled = isRunning || downloaded === 0;
-
-  return (
-    <div className="p-5">
-      <h3 className="text-sm font-semibold text-gray-900">Apple Vision · local</h3>
-      <p className="text-[11px] text-gray-400 mb-3">Reads any text and tags what's in each photo, right on your Mac — free and private.</p>
-
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <span className="flex h-2 w-2 rounded-full shrink-0" style={{background: statusDot}}></span>
-              <p className="font-medium text-gray-700 text-sm">{title}</p>
-            </div>
-            <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
-
-            {/* Static (non-running) progress bar, against the downloaded set. */}
-            {!isRunning && downloaded > 0 && (
-              <div className="mt-3">
-                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
-                </div>
-                <p className="text-[10px] text-gray-400 mt-1">{pct}% scanned</p>
-              </div>
-            )}
-          </div>
-
-          <button onClick={launch} disabled={buttonDisabled}
-            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
-            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
-            <RefreshIcon />
-            {isRunning ? "Scanning…" : buttonLabel}
-          </button>
-        </div>
-
-        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
-
-        {/* Live progress card while running — driven by the structured
-            "progress" SSE event the media-index job emits every ~25 rows. */}
-        {isRunning && (
-          <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
-            {progress ? (
-              <>
-                <div className="flex items-baseline justify-between text-xs mb-2">
-                  <span className="font-semibold text-gray-900">
-                    {progress.done.toLocaleString()} / {(progress.pending || 0).toLocaleString()} images
-                  </span>
-                  <span className="text-gray-500">
-                    {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)}/s` : ""}
-                    {progress.eta_seconds > 0 ? ` · ETA ${fmtEta(progress.eta_seconds)}` : ""}
-                  </span>
-                </div>
-                <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
-                  <div className="h-full rounded-full transition-all duration-500" style={{
-                    width: `${Math.min(100, Math.round((progress.done / Math.max(progress.pending, 1)) * 100))}%`,
-                    background:'#25D366',
-                  }}></div>
-                </div>
-                <div className="grid grid-cols-4 gap-2 mt-3 text-[11px] text-gray-600">
-                  <div title="Images where Vision found readable text (OCR returned a non-empty string).">
-                    <span className="font-semibold text-gray-900">{progress.with_ocr.toLocaleString()}</span> with OCR
-                  </div>
-                  <div title="Images where Vision returned at least one classification label above the confidence floor.">
-                    <span className="font-semibold text-gray-900">{progress.with_labels.toLocaleString()}</span> labelled
-                  </div>
-                  <div title="Chat references an image whose file isn't in the backup — typically never downloaded on device. Not an error.">
-                    <span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing
-                  </div>
-                  <div title="Indexer found the file but couldn't OCR it (corrupted/truncated JPEG, decrypt failed, Vision crashed, etc).">
-                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
-                  </div>
-                </div>
-                {(progress.errors > 0 || progress.missing > 0) && (
-                  <div className="mt-2">
-                    <button onClick={() => setShowIssues(true)}
-                      className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
-                      View {(progress.errors + progress.missing).toLocaleString()} issue
-                      {(progress.errors + progress.missing) === 1 ? "" : "s"}
-                    </button>
-                  </div>
-                )}
-              </>
-            ) : (
-              <p className="text-xs text-gray-500">Preparing…</p>
-            )}
-            {/* Tail of the log lines for transparency. */}
-            {j.lines && j.lines.length > 0 && (
-              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
-                {j.lines[j.lines.length - 1]}
-              </p>
-            )}
-          </div>
-        )}
-
-        {hasDone && j.done === true && !isRunning && (
-          <p className="text-xs text-gray-500 mt-3">✓ Done. Your images are now searchable by their text and contents.</p>
-        )}
-
-      {showConfirm && (
-        <ConfirmModal
-          title="Re-scan with Apple Vision?"
-          body={`This re-runs on-device Apple Vision over all ${downloaded.toLocaleString()} downloaded images and OVERWRITES their current enrichment — including any AI (cloud) descriptions you've already paid for. Apple Vision is free and private but more basic. Only do this if you want to revert to on-device results.`}
-          confirmLabel="Re-scan & overwrite"
-          onConfirm={() => { setShowConfirm(false); run(true); }}
-          onCancel={() => setShowConfirm(false)}
-        />
-      )}
-
-      {showIssues && <MediaIssuesModal onClose={() => setShowIssues(false)} />}
-      {showInfo && <ImageOcrTermsModal onClose={() => setShowInfo(false)} />}
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 // CloudDescribeCard — "Cloud descriptions" section under Image OCR
 // ═══════════════════════════════════════════════════════════════════════════
 // Opt-in cloud describer (OpenRouter). Needs only a session API key —
 // prompted via OpenRouterKeyModal, held in RAM by the server, never on
 // disk. It reads the already-downloaded images off disk, so no backup
-// password. Shows coverage (cloud vs on-device), a cost estimate, and a
-// live cost meter while running.
+// password. Shows cloud coverage, a cost estimate, and a live cost
+// meter while running.
 const CLOUD_COST_PER_IMAGE = 0.0002; // measured ~$ / image, for estimates
 
 function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
@@ -1930,6 +1730,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const [showKey, setShowKey]     = useState(false);
   const [stopping, setStopping] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
+  const [showIssues, setShowIssues] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [pendingForce, setPendingForce] = useState(false);
   const CONCURRENCY = 48; // fixed — empirically the fast, stable operating point
@@ -1952,7 +1753,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const total      = (status && status.total_images) || 0;
   const described  = (status && status.described) || 0;
   const cloudCount = (status && status.cloud_count) || 0;
-  const appleCount = (status && status.apple_count) || 0;
   const hasKey     = !!(status && status.has_key);
   const model      = (status && status.default_model) || "";
 
@@ -2067,8 +1867,12 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
             {hasKey && hasDB && total > 0 && !isRunning && (
               <div className="mt-3">
                 <p className="text-[11px] text-gray-400">
-                  Upgrades all on-device images to cloud and retries any failures automatically.
+                  Describes any remaining images and retries failures automatically.
                   {toProcess > 0 && <> {toProcess.toLocaleString()} image{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
+                  {missing > 0 && <>
+                    <span className="mx-1.5">·</span>
+                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {missing.toLocaleString()} issue{missing === 1 ? "" : "s"}</button>
+                  </>}
                   <span className="mx-1.5">·</span>
                   <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">use a different key</button>
                 </p>
@@ -2168,6 +1972,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
       )}
 
       {showInfo && <CloudTermsModal onClose={() => setShowInfo(false)} />}
+      {showIssues && <MediaIssuesModal onClose={() => setShowIssues(false)} />}
     </div>
   );
 }
@@ -2195,35 +2000,6 @@ function ConfirmModal({ title, body, confirmLabel = "Confirm", onConfirm, onCanc
   );
 }
 
-// ImageOcrTermsModal — explains the coverage terms on the Image OCR card.
-function ImageOcrTermsModal({ onClose }) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm" onClick={onClose}>
-      <div className="w-[440px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}} onClick={e => e.stopPropagation()}>
-        <h2 className="text-base font-semibold text-gray-900 mb-3">What these mean</h2>
-        <dl className="space-y-3 text-sm">
-          <div>
-            <dt className="font-semibold text-gray-900">indexed</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images Apple Vision has processed on-device — OCR text + classification labels stored in <code>wa_image_text</code> and searchable. Free and private (nothing leaves your Mac).</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-gray-900">remaining</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images not yet indexed. Click Resume to process them; it picks up where it left off.</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-gray-900">not in backup</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images referenced in chats whose file was never downloaded to this phone, so there's nothing to index. They can't be processed and are excluded from "done" (see "View issues").</dd>
-          </div>
-        </dl>
-        <button onClick={onClose}
-          className="mt-5 w-full rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{background:'#128C7E'}}>
-          Got it
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // CloudTermsModal — explains the three coverage terms shown on the card.
 function CloudTermsModal({ onClose }) {
   return (
@@ -2237,7 +2013,7 @@ function CloudTermsModal({ onClose }) {
           </div>
           <div>
             <dt className="font-semibold text-gray-900">remaining</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images not yet described in the cloud. They may already have a basic on-device (Apple Vision) description; the cloud run upgrades them and re-tries any that previously failed.</dd>
+            <dd className="text-gray-600 text-xs mt-0.5">Images not yet described in the cloud. The cloud run describes them and re-tries any that previously failed.</dd>
           </div>
           <div>
             <dt className="font-semibold text-gray-900">not in backup</dt>
@@ -2341,7 +2117,7 @@ function fmtMB(bytes) {
 // ═══════════════════════════════════════════════════════════════════════════
 // VoiceIndexCard — "Sync voice notes" section under the Database tab
 // ═══════════════════════════════════════════════════════════════════════════
-// Mirrors MediaIndexCard exactly except:
+// Mirrors CloudDescribeCard's lifecycle except:
 //   - Reads dbStatus.voice_total / voice_transcribed counts.
 //   - Pre-flights /api/database/voice-index/model-status on mount;
 //     if the speech model isn't installed yet, the button opens the
@@ -2382,7 +2158,7 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mj.done]);
 
-  // Same DB-counts refresh dance as MediaIndexCard.
+  // Same DB-counts refresh dance as CloudDescribeCard.
   useEffect(() => {
     if (hasDone && j.done === true) reloadDbStatus();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2574,7 +2350,7 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
 // ═══════════════════════════════════════════════════════════════════════════
 // DocumentIndexCard — "Sync documents" section under the Database tab
 // ═══════════════════════════════════════════════════════════════════════════
-// Mirrors VoiceIndexCard / MediaIndexCard but without a model-download
+// Mirrors VoiceIndexCard / CloudDescribeCard but without a model-download
 // step — Apple PDFKit + Vision are first-party macOS frameworks always
 // available on supported OS versions.
 //
@@ -3638,27 +3414,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     }
   };
 
-  // ── start image-OCR (media-index) ─────────────────────────────────────
-  // Apple Vision over the already-downloaded images — no password. Uses
-  // key "db:media-index" so it matches what the server reports as the
-  // active job's task on /api/jobs/active — that way a page reload mid-run
-  // reconnects to the same in-memory job state.
-  const startMediaIndex = async (opts) => {
-    const key = "db:media-index";
-    patchJob(key, {
-      running: true, done: null,
-      lines: [], progress: null,
-      adopted: false, pid: null,
-      startedAt: new Date().toISOString(), error: "",
-    });
-    try {
-      const { job_id } = await api.post("/api/database/media-index", { force: !!(opts && opts.force) });
-      streamJob(job_id, key, true);
-    } catch(ex) {
-      patchJob(key, { running: false, done: false, error: ex.message });
-    }
-  };
-
   // ── start cloud media descriptions (media-describe) ───────────────────
   // Key "db:media-describe" matches the server task so a mid-run reload
   // reconnects. opts = { model, concurrency, force }. Cloud describe reads
@@ -3686,7 +3441,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── start voice transcription (voice-index) ───────────────────────────
-  // Same shape as startMediaIndex. The server returns 412 with
+  // Same shape as startMediaDescribe. The server returns 412 with
   // {error: "model_required"} if the speech model isn't installed —
   // we surface that as an error string so the card can render a
   // distinguishable "Download model first" affordance.
@@ -3734,7 +3489,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── start document extraction (document-index) ────────────────────────
-  // Same shape as startVoiceIndex / startMediaIndex but with no
+  // Same shape as startVoiceIndex / startMediaDescribe but with no
   // model-required precondition (PDFKit + Vision are first-party).
   const startDocumentIndex = async (password) => {
     const key = "db:document-index";
@@ -3957,7 +3712,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             dbStatus={dbStatus}
             reloadDbStatus={reloadDbStatus}
             job={jobs["db:sync"]}
-            mediaJob={jobs["db:media-index"]}
             cloudJob={jobs["db:media-describe"]}
             voiceJob={jobs["db:voice-index"]}
             modelJob={jobs["db:voice-model-download"]}
@@ -3965,7 +3719,6 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             faceJob={jobs["db:face-index"]}
             faceModelJob={jobs["db:face-model-download"]}
             onSync={startSync}
-            onMediaIndex={startMediaIndex}
             onMediaDescribe={startMediaDescribe}
             onVoiceIndex={startVoiceIndex}
             onVoiceModelDownload={startVoiceModelDownload}

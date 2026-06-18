@@ -1,4 +1,5 @@
 /dist/
+/whatskept
 *.test
 *.out
 build/.whisper-build-cache/

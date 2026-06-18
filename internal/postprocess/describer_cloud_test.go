@@ -108,8 +108,8 @@ func TestMigrateImageSidecar(t *testing.T) {
 	).Scan(&src, &desc, &model); err != nil {
 		t.Fatal(err)
 	}
-	if src != SourceApple {
-		t.Errorf("existing row source = %q, want %q", src, SourceApple)
+	if src != "apple" {
+		t.Errorf("existing row source = %q, want %q", src, "apple")
 	}
 	if desc != "" || model != "" {
 		t.Errorf("existing row description/model = %q/%q, want empty", desc, model)
