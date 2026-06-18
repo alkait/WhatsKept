@@ -3164,14 +3164,16 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
       .finally(() => setPrefsLoaded(true));
   }, []);
 
-  // Default the dropdown to the first installed agent (falling back to Terminal)
-  // when there's no stored choice, or when the stored agent no longer exists.
+  // Default the dropdown to the first installed agent when there's no
+  // stored choice, or when the stored agent no longer exists. Terminal
+  // is no longer a dropdown entry (it's its own always-visible button),
+  // so fall back to the first known agent rather than "__terminal__".
   useEffect(() => {
     if (!agents || !prefsLoaded) return;
-    const valid = selectedId === "__terminal__" || agents.some(a => a.id === selectedId);
+    const valid = agents.some(a => a.id === selectedId);
     if (!valid) {
       const firstInstalled = agents.find(a => a.installed);
-      setSelectedId(firstInstalled ? firstInstalled.id : "__terminal__");
+      setSelectedId(firstInstalled ? firstInstalled.id : (agents[0] ? agents[0].id : ""));
     }
   }, [agents, selectedId, prefsLoaded]);
 
@@ -3226,18 +3228,13 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
       ) : (
         <>
           {(() => {
-            const isTerminal    = selectedId === "__terminal__";
-            const selectedAgent = isTerminal ? null : (agents.find(a => a.id === selectedId) || null);
-            const opening       = openingId === selectedId;
-            const canOpen       = isTerminal || (selectedAgent && selectedAgent.installed);
-            const description    = isTerminal
-              ? "Open the workspace in macOS Terminal — handy for any CLI agent we don't yet detect natively (Codex CLI, Gemini CLI, …)."
-              : (selectedAgent ? selectedAgent.description : "");
-            const openSelected = () => {
-              if (isTerminal) openTerminal();
-              else if (selectedAgent) launch(selectedAgent);
-            };
-            const buttonLabel = opening ? "Opening…" : (isTerminal ? "Open in Terminal" : `Open in ${selectedAgent ? selectedAgent.name : "agent"}`);
+            const selectedAgent  = agents.find(a => a.id === selectedId) || null;
+            const agentOpening   = openingId === selectedId;
+            const terminalOpening = openingId === "__terminal__";
+            const canOpen        = selectedAgent && selectedAgent.installed;
+            const description    = selectedAgent ? selectedAgent.description : "";
+            const openSelected   = () => { if (selectedAgent) launch(selectedAgent); };
+            const agentLabel     = agentOpening ? "Opening…" : `Open in ${selectedAgent ? selectedAgent.name : "agent"}`;
             return (
               <div>
                 <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Open in agent</h2>
@@ -3245,21 +3242,31 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
                   <div className="flex items-center gap-3">
                     <NiceSelect value={selectedId} onChange={chooseAgent} className="flex-1 min-w-0"
                       ariaLabel="Choose agent"
-                      options={[
-                        ...agents.map(a => ({ value: a.id, label: a.name, tag: a.installed ? null : "not installed" })),
-                        { value: "__terminal__", label: "Terminal", tag: "built-in" },
-                      ]} />
-                    <button onClick={openSelected} disabled={!canOpen || opening}
-                      className="shrink-0 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold"
-                      style={{background:'#075E54'}}
+                      options={agents.map(a => ({ value: a.id, label: a.name, tag: a.installed ? null : "not installed" }))} />
+                    <button onClick={openSelected} disabled={!canOpen || agentOpening}
+                      className="shrink-0 rounded-lg border disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold hover:bg-gray-50 transition-colors"
+                      style={{borderColor:'#075E54', color:'#075E54', background:'white'}}
                       title={canOpen ? "Open this workspace" : `${selectedAgent ? selectedAgent.name : "This agent"} is not installed in /Applications`}>
-                      {buttonLabel}
+                      {agentLabel}
                     </button>
                   </div>
                   {description && <p className="text-xs text-gray-500 mt-3">{description}</p>}
                   {selectedAgent && selectedAgent.installed && selectedAgent.app_path && (
                     <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{selectedAgent.app_path}</p>
                   )}
+
+                  {/* Terminal is always available — its own button so the
+                      user can open the workspace and run any CLI agent we
+                      don't detect natively (Codex CLI, Gemini CLI, …). */}
+                  <div className="mt-3 pt-3 border-t flex items-center gap-3" style={{borderColor:'#ECF3EC'}}>
+                    <button onClick={openTerminal} disabled={terminalOpening}
+                      className="shrink-0 rounded-lg text-white px-4 py-2 text-sm font-semibold disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-90 transition-opacity"
+                      style={{background:'#075E54'}}
+                      title="Open this workspace in macOS Terminal">
+                      {terminalOpening ? "Opening…" : "Open in Terminal"}
+                    </button>
+                    <p className="text-xs text-gray-500">…or open in Terminal and use your favorite agent.</p>
+                  </div>
                 </div>
               </div>
             );
