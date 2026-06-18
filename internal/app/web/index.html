@@ -118,6 +118,17 @@ const api = {
     .then(r => { if (!r.ok) return r.json().then(e => { throw httpErr(r, e); }); }),
 };
 
+// ── Feature flags ───────────────────────────────────────────────────────────
+// Simple compile-in constants the UI checks to show/hide features. Baked into
+// the embedded index.html, so flipping one and rebuilding (`make build`, dev or
+// release) takes effect on every launch — no env var, build tag, or server
+// endpoint involved. Flip to false and rebuild to hide that feature.
+const FEATURES = {
+  // people: the People (face recognition) panel in the Database tab's
+  // Image-enrichment section.
+  people: false,
+};
+
 // ── ElapsedTimer ──────────────────────────────────────────────────────────
 function ElapsedTimer({ isRunning, startedAt }) {
   const calcSecs = () => startedAt
@@ -1156,12 +1167,14 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, mediaJob, cloudJob, voiceJ
             onMediaIndex={onMediaIndex}
             reloadDbStatus={reloadDbStatus}
           />
+          {FEATURES.people && (
           <FindPeopleCard
             job={faceJob}
             modelJob={faceModelJob}
             onFaceIndex={onFaceIndex}
             onFaceModelDownload={onFaceModelDownload}
           />
+          )}
           <CloudDescribeCard
             dbStatus={dbStatus}
             job={cloudJob}
