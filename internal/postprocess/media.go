@@ -751,6 +751,44 @@ func countDownloaded(db *sql.DB) (int, error) {
 	return n, nil
 }
 
+// CountDescribePending returns how many on-disk images a normal cloud
+// describe run (no force, no retry) would actually queue: fresh
+// 'downloaded' rows with no prior describe_error, plus legacy non-cloud
+// 'described' rows to upgrade. It mirrors selectDescribeCandidates'
+// non-force predicate EXACTLY so the UI can gate "Resume" on real work —
+// unlike downloaded−described, which also counts permanently-failed rows
+// the queue skips (the cause of the phantom "Resume" → "Nothing to
+// describe" loop).
+func CountDescribePending(db *sql.DB) (int, error) {
+	var n int
+	q := `SELECT COUNT(*) FROM (
+		SELECT rowid FROM media_index
+		  WHERE status = ? AND describe_error IS NULL
+		UNION
+		SELECT mi.rowid FROM media_index mi
+		  JOIN wa_image_text t ON t.rowid = mi.rowid
+		  WHERE mi.status = ? AND t.source <> ?
+	)`
+	if err := db.QueryRow(q, MediaStatusDownloaded, MediaStatusDescribed, SourceCloud).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count describe pending: %w", err)
+	}
+	return n, nil
+}
+
+// CountDescribeFailed returns on-disk images that failed a previous
+// describe attempt (describe_error set, row still 'downloaded'). A normal
+// run skips these; only "Retry failures" (retryErrors) re-attempts them.
+func CountDescribeFailed(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM media_index WHERE status = ? AND describe_error IS NOT NULL`,
+		MediaStatusDownloaded,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count describe failed: %w", err)
+	}
+	return n, nil
+}
+
 // selectDownloadCandidates is the resume query for the download phase:
 // every WhatsApp image whose file is NOT already on disk. Rows already
 // 'downloaded' or 'described' are skipped (file present); 'missing' and

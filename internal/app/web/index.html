@@ -1732,7 +1732,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const [showInfo, setShowInfo] = useState(false);
   const [showIssues, setShowIssues] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [pendingForce, setPendingForce] = useState(false);
+  // Run opts ({ force, retryErrors }) stashed while the key modal is open,
+  // replayed once a key is saved.
+  const [pendingRun, setPendingRun] = useState(null);
   // keyModalMode: "run" = opened to unblock a describe run (save → start);
   // "manage" = opened from "Change key" (save → just refresh, no run).
   const [keyModalMode, setKeyModalMode] = useState("run");
@@ -1762,33 +1764,44 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
 
   const missing = (status && status.missing) || 0;
   const errorCount = (status && status.errors) || 0;
-  // Cloud can only describe images already on disk, so coverage is
-  // measured against the downloaded set — making the 100%/done state
-  // actually reachable.
+  // pending = images a normal run would actually describe; describeFailed
+  // = on-disk images that failed a prior attempt (only "Retry failures"
+  // re-attempts them). The backend computes both with the SAME predicate
+  // as the resume queue, so the card never implies work the queue skips —
+  // the old "downloaded − cloudCount" lumped failures in, producing a
+  // phantom "Resume" that dead-ended at "Nothing to describe".
   const describable = (status && status.downloaded) || 0;
-  const toProcess = Math.max(describable - cloudCount, 0); // still need cloud
-  const estCost = toProcess * CLOUD_COST_PER_IMAGE;
+  const pending = (status && status.pending) || 0;
+  const describeFailed = (status && status.describe_failed) || 0;
+  const issueCount = errorCount + missing; // failed describes + not-in-backup
   const coveragePct = describable > 0 ? Math.min(100, Math.round((cloudCount / describable) * 100)) : 0;
-  const allDone = cloudCount >= describable && describable > 0;
+  // "Done" = nothing fresh left to describe. Failures don't block done;
+  // they get an explicit, separate "Retry failures" action.
+  const allDone = pending === 0 && describable > 0;
+  // What the single button will actually process this click, and its cost.
+  const actionCount = pending > 0 ? pending : (describeFailed > 0 ? describeFailed : describable);
+  const estCost = actionCount * CLOUD_COST_PER_IMAGE;
 
   // The run flow chains through up-to-two just-in-time gates:
   // confirm (force only) → API key (if none) → start. No backup password
-  // — cloud reads the downloaded images off disk. `force` re-describes
-  // everything (overwriting cloud rows); it's carried through via
-  // pendingForce.
-  const proceed = (force) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, force });
-  const beginRun = (force) => {
-    if (!hasKey) { setPendingForce(force); setKeyModalMode("run"); setShowKey(true); return; }
-    proceed(force);
+  // — cloud reads the downloaded images off disk.
+  // A run is parameterised by { force, retryErrors }. proceed sends it;
+  // beginRun gates on the key first (stashing the opts for after save).
+  const proceed = (opts) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, ...opts });
+  const beginRun = (opts) => {
+    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+    proceed(opts);
   };
   // Open the key modal just to change the stored key — no run is started.
   const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
-  // launch is the single button action. When everything's already
-  // described, the only meaningful action is a full re-describe — which
-  // costs money, so it goes through a confirmation first.
+  // launch is the single button action, by precedence:
+  //   fresh work pending → Resume (or first-run describe)
+  //   else failures exist → Retry failures (re-attempts describe_error rows)
+  //   else fully done     → confirmed force re-describe (overwrites, costs)
   const launch = () => {
-    if (allDone) { setShowConfirm(true); return; }
-    beginRun(false);
+    if (pending > 0)        { beginRun({ force: false }); return; }
+    if (describeFailed > 0) { beginRun({ retryErrors: true }); return; }
+    setShowConfirm(true);
   };
 
   const stop = async () => {
@@ -1821,26 +1834,29 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
       <button onClick={() => setShowInfo(true)}
         className="underline decoration-dotted hover:text-gray-700">{n.toLocaleString()} {label}</button>
     );
+    // One stat line, each fact once: coverage, fresh work, issues. Model +
+    // key live in the footer; cost rides with the button. "issues" folds
+    // failed describes + not-in-backup into one link (the modal itemises).
     subtitle = (
       <span>
-        {term(cloudCount, "described")} · {term(toProcess, "remaining")}
-        {missing > 0 && <> · {term(missing, "not in backup")}</>}
-        {" · "}Model: {model}.
+        {term(cloudCount, "described")}
+        {pending > 0 && <> · {term(pending, "to describe")}</>}
+        {issueCount > 0 && <> · <button onClick={() => setShowIssues(true)}
+          className="underline decoration-dotted hover:text-gray-700">view {issueCount.toLocaleString()} issue{issueCount === 1 ? "" : "s"}</button></>}
       </span>
     );
-    if (allDone)          { statusDot = "#25D366"; title = "All available images described in the cloud"; }
-    else if (cloudCount)  { statusDot = "#25D366"; title = "Cloud descriptions partially done"; }
-    else                  { statusDot = "#f59e0b"; title = "Not yet described with cloud"; }
+    if (allDone && cloudCount) { statusDot = "#25D366"; title = "All available images described"; }
+    else if (cloudCount)       { statusDot = "#25D366"; title = "Cloud descriptions partially done"; }
+    else                       { statusDot = "#f59e0b"; title = "Not yet described with cloud"; }
 
-    if (allDone) { buttonPrimary = false; }
-    else         { buttonPrimary = true; }
-    // Label by what the button actually does:
-    //   - allDone        → the only action is a full force re-run (confirmed)
-    //   - partially done → resume over the remaining images
-    //   - nothing yet    → first-run call-to-action
-    buttonLabel = allDone ? "Re-describe images"
-                : cloudCount > 0 ? "Resume"
-                : "Describe with cloud";
+    // Primary (green) only when there's fresh forward work; retry and
+    // re-describe are secondary (grey). Label says exactly what a click does.
+    buttonPrimary = pending > 0;
+    buttonLabel = pending > 0
+                    ? (cloudCount > 0 ? "Resume" : "Describe with cloud")
+                : describeFailed > 0
+                    ? `Retry ${describeFailed.toLocaleString()} failure${describeFailed === 1 ? "" : "s"}`
+                : "Re-describe images";
   }
 
   // While running, the status snapshot above is stale — show live
@@ -1865,41 +1881,33 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
             {/* Static cloud-coverage bar — always shown (independent of
-                key) so opening the app reflects real progress. */}
+                key) so opening the app reflects real progress. The textual
+                caption is dropped: the "N described" stat already states
+                coverage, and the bar now agrees with the title (done
+                ignores permanently-failed rows). */}
             {hasDB && total > 0 && !isRunning && (
-              <div className="mt-3">
-                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
-                </div>
-                <p className="text-[10px] text-gray-400 mt-1">{coveragePct}% described in cloud</p>
+              <div className="mt-3 h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
               </div>
             )}
 
-            {hasKey && hasDB && total > 0 && !isRunning && (
+            {/* Footer: model + key management on one muted line. Model
+                shows whenever known; key controls show when a key is set
+                (incl. one loaded from disk at startup). */}
+            {hasDB && total > 0 && !isRunning && (model || hasKey) && (
               <div className="mt-3">
                 <p className="text-[11px] text-gray-400">
-                  Describes any remaining images and retries failures automatically.
-                  {toProcess > 0 && <> {toProcess.toLocaleString()} image{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
-                  {(errorCount > 0 || missing > 0) && <>
+                  {model && <>Model: {model}</>}
+                  {model && hasKey && <span className="mx-1.5">·</span>}
+                  {hasKey && <>
+                    {persisted
+                      ? <>key <span className="font-medium text-gray-600">remembered</span></>
+                      : <>key <span className="font-medium text-gray-600">this session</span></>}
                     <span className="mx-1.5">·</span>
-                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {(errorCount + missing).toLocaleString()} issue{(errorCount + missing) === 1 ? "" : "s"}</button>
+                    <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change</button>
+                    <span className="mx-1.5">·</span>
+                    <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget</button>
                   </>}
-                </p>
-              </div>
-            )}
-
-            {/* Key management — reachable whenever a key is set (incl. one
-                loaded from disk at startup), independent of image count. */}
-            {hasKey && !isRunning && (
-              <div className="mt-3">
-                <p className="text-[11px] text-gray-400">
-                  {persisted
-                    ? <>OpenRouter key <span className="font-medium text-gray-600">remembered on this computer</span>.</>
-                    : <>OpenRouter key set for <span className="font-medium text-gray-600">this session only</span>.</>}
-                  <span className="mx-1.5">·</span>
-                  <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change key</button>
-                  <span className="mx-1.5">·</span>
-                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget key</button>
                 </p>
               </div>
             )}
@@ -1912,12 +1920,17 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
               {stopping ? "Stopping…" : "Stop"}
             </button>
           ) : (
-            <button onClick={launch} disabled={buttonDisabled}
-              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
-              style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
-              <RefreshIcon />
-              {buttonLabel}
-            </button>
+            <div className="shrink-0 flex flex-col items-end gap-1">
+              <button onClick={launch} disabled={buttonDisabled}
+                className="flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+                style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
+                <RefreshIcon />
+                {buttonLabel}
+              </button>
+              {hasKey && actionCount > 0 && (
+                <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
+              )}
+            </div>
           )}
         </div>
 
@@ -1995,7 +2008,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
             reloadStatus();
             // Only the run-gated open auto-starts a describe; "change key"
             // (manage) just updates the stored key.
-            if (keyModalMode === "run") proceed(pendingForce);
+            if (keyModalMode === "run") proceed(pendingRun || {});
           }}
         />
       )}
@@ -2005,7 +2018,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
           title="Re-describe all images?"
           body={`This re-runs the model on all ${describable.toLocaleString()} describable images, overwriting the existing cloud descriptions — useful after improving the prompt or switching models. Estimated cost ≈ $${(describable * CLOUD_COST_PER_IMAGE).toFixed(2)}.`}
           confirmLabel="Re-describe all"
-          onConfirm={() => { setShowConfirm(false); beginRun(true); }}
+          onConfirm={() => { setShowConfirm(false); beginRun({ force: true }); }}
           onCancel={() => setShowConfirm(false)}
         />
       )}
@@ -2051,8 +2064,12 @@ function CloudTermsModal({ onClose }) {
             <dd className="text-gray-600 text-xs mt-0.5">Images a cloud vision model has processed — each gets a short summary plus a verbatim transcription of any text, stored in <code>wa_image_text</code> and searchable.</dd>
           </div>
           <div>
-            <dt className="font-semibold text-gray-900">remaining</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images not yet described in the cloud. The cloud run describes them and re-tries any that previously failed.</dd>
+            <dt className="font-semibold text-gray-900">to describe</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images on disk not yet described in the cloud. Resume processes these — the count is the real work left to do.</dd>
+          </div>
+          <div>
+            <dt className="font-semibold text-gray-900">failed</dt>
+            <dd className="text-gray-600 text-xs mt-0.5">Images that errored on a previous attempt. A normal run skips them; use “Retry failures” to re-attempt. Some are permanent (corrupt, or rejected by the model) and will keep failing.</dd>
           </div>
           <div>
             <dt className="font-semibold text-gray-900">not in backup</dt>
@@ -3378,6 +3395,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         model: (opts && opts.model) || "",
         concurrency: (opts && opts.concurrency) || 0,
         force: !!(opts && opts.force),
+        retry_errors: !!(opts && opts.retryErrors),
       });
       patchJob(key, { jobId: job_id });
       streamJob(job_id, key, true);

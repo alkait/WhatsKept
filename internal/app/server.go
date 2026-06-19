@@ -1110,14 +1110,16 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 // whether a key is held this session, how many images exist, and how
 // many are described in the cloud.
 type mediaDescribeStatusResponse struct {
-	HasKey       bool   `json:"has_key"`
-	TotalImages  int    `json:"total_images"`
-	Downloaded   int    `json:"downloaded"`  // images on disk in media/ (the describable set)
-	Described    int    `json:"described"`   // any source
-	CloudCount   int    `json:"cloud_count"` // wa_image_text.source = 'cloud'
-	Missing      int    `json:"missing"`     // referenced but not in the backup — undescribable
-	Errors       int    `json:"errors"`      // download errors + per-image describe failures
-	DefaultModel string `json:"default_model"`
+	HasKey         bool   `json:"has_key"`
+	TotalImages    int    `json:"total_images"`
+	Downloaded     int    `json:"downloaded"`      // images on disk in media/ (the describable set)
+	Described      int    `json:"described"`       // any source
+	CloudCount     int    `json:"cloud_count"`     // wa_image_text.source = 'cloud'
+	Missing        int    `json:"missing"`         // referenced but not in the backup — undescribable
+	Errors         int    `json:"errors"`          // download errors + per-image describe failures
+	Pending        int    `json:"pending"`         // fresh on-disk rows a normal run would describe
+	DescribeFailed int    `json:"describe_failed"` // on-disk rows that failed before — retryable
+	DefaultModel   string `json:"default_model"`
 }
 
 // handleMediaDescribeStatus reports cloud-describe readiness + coverage
@@ -1170,6 +1172,12 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 	// Failures the issues view surfaces: download errors + per-image
 	// describe failures (describe_error set, status still 'downloaded').
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error' OR describe_error IS NOT NULL`).Scan(&resp.Errors)
+	// pending / describe_failed are computed by the same predicates as the
+	// resume queue (selectDescribeCandidates), so the card never implies
+	// work the queue would skip. pending drives "Resume"; describe_failed
+	// drives the explicit "Retry failures" action.
+	resp.Pending, _ = postprocess.CountDescribePending(db)
+	resp.DescribeFailed, _ = postprocess.CountDescribeFailed(db)
 
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1180,8 +1188,9 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 // in <ws>/media/, so no backup password is needed.
 type mediaDescribeRequest struct {
 	Model       string `json:"model"`
-	Concurrency int    `json:"concurrency"` // 0 = server default
-	Force       bool   `json:"force"`       // re-describe everything, overwriting cloud rows
+	Concurrency int    `json:"concurrency"`  // 0 = server default
+	Force       bool   `json:"force"`        // re-describe everything, overwriting cloud rows
+	RetryErrors bool   `json:"retry_errors"` // re-attempt rows that failed a prior describe
 }
 
 // handleMediaDescribe starts a cloud media-describe run as an SSE job
@@ -1215,6 +1224,7 @@ func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 				Model:       req.Model,
 				Concurrency: req.Concurrency,
 				Force:       req.Force,
+				RetryErrors: req.RetryErrors,
 				Ctx:         ctx,
 				Log:         log,
 				Progress: func(p postprocess.MediaIndexProgress) {
