@@ -259,12 +259,11 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 
 - **No telemetry, no analytics, no accounts.** By default WhatsKept
   sends none of your data anywhere. Its always-on outbound call is a
-  version check to GitHub when the window opens; the whisper-model
-  download and the cloud image-description feature are both opt-in
-  (all three below). The version check and model download contact a
-  well-known host and carry none of your WhatsApp data. The GUI's HTTP
-  server binds to `127.0.0.1` only — it is not reachable from other
-  devices on your network.
+  version check to GitHub when the window opens; the cloud
+  image-description and voice-transcription features are opt-in (below).
+  The version check contacts a well-known host and carries none of your
+  WhatsApp data. The GUI's HTTP server binds to `127.0.0.1` only — it is
+  not reachable from other devices on your network.
 - **Local processing stays on-device.** PDF text extraction runs
   through Apple PDFKit + Vision OCR (`whatskept-vision`); **face
   detection + recognition** for the People feature run through Apple

@@ -30,7 +30,7 @@ import (
 // Content-Length alone, since CDNs occasionally serve truncated
 // files when their backend storage is in trouble.
 type ModelSpec struct {
-	Name    string // basename used on disk and in UI ("ggml-large-v3-turbo-q5_0.bin")
+	Name    string // basename used on disk and in UI ("AdaFace_IR101.mlpackage.zip")
 	Display string // human-readable name shown to the user
 	URL     string // HTTPS source
 	SHA256  string // lower-hex; used to verify post-download

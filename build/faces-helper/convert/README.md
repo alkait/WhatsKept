@@ -2,7 +2,7 @@
 
 The "Find people" feature clusters faces with a face-recognition embedding
 model. WhatsKept does **not** bundle the model in the binary; it is fetched
-on first use (Whisper-style) and verified by SHA-256 — see
+on first use and verified by SHA-256 — see
 `internal/helpers/model.go` (`AdaFaceModel`).
 
 This folder documents exactly how that CoreML model was produced, so it's
