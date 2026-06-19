@@ -180,6 +180,37 @@ func countVoiceDownloaded(db *sql.DB) (int, error) {
 	return n, nil
 }
 
+// CountVoiceTranscribePending returns how many on-disk clips a normal
+// transcribe run (no force, no retry) would actually queue: fresh
+// 'downloaded' rows with no prior transcribe_error. It mirrors
+// selectVoiceTranscribeCandidates' non-force predicate EXACTLY so the UI
+// can gate "Resume" on real work — unlike downloaded−transcribed, which
+// also counts permanently-failed rows the queue skips.
+func CountVoiceTranscribePending(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM voice_index WHERE status = ? AND transcribe_error IS NULL`,
+		VoiceStatusDownloaded,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count voice transcribe pending: %w", err)
+	}
+	return n, nil
+}
+
+// CountVoiceTranscribeFailed returns on-disk clips that failed a previous
+// transcribe attempt (transcribe_error set, row still 'downloaded'). A
+// normal run skips these; only "Retry failures" (retryErrors) re-attempts.
+func CountVoiceTranscribeFailed(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM voice_index WHERE status = ? AND transcribe_error IS NOT NULL`,
+		VoiceStatusDownloaded,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count voice transcribe failed: %w", err)
+	}
+	return n, nil
+}
+
 // selectVoiceDownloadCandidates: every .opus whose file is NOT already on
 // disk. 'downloaded'/'transcribed' skipped; 'missing'/'error' skipped
 // unless the matching retry flag is set.

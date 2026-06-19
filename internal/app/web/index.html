@@ -1801,7 +1801,8 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const launch = () => {
     if (pending > 0)        { beginRun({ force: false }); return; }
     if (describeFailed > 0) { beginRun({ retryErrors: true }); return; }
-    setShowConfirm(true);
+    if (cloudCount > 0)     { setShowConfirm(true); return; } // all done → force re-run
+    beginRun({ force: false }); // nothing on disk yet — run (reports status)
   };
 
   const stop = async () => {
@@ -1856,7 +1857,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
                     ? (cloudCount > 0 ? "Resume" : "Describe with cloud")
                 : describeFailed > 0
                     ? `Retry ${describeFailed.toLocaleString()} failure${describeFailed === 1 ? "" : "s"}`
-                : "Re-describe images";
+                : cloudCount > 0
+                    ? "Re-describe images"  // genuinely all done → re-run
+                    : "Describe with cloud"; // nothing on disk yet → first-run CTA
   }
 
   // While running, the status snapshot above is stale — show live
@@ -2187,7 +2190,8 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const [stopping, setStopping]   = useState(false);
   const [showIssues, setShowIssues] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
-  const [pendingForce, setPendingForce] = useState(false);
+  // Run opts ({ force, retryErrors }) stashed while the key modal is open.
+  const [pendingRun, setPendingRun] = useState(null);
   const [keyModalMode, setKeyModalMode] = useState("run");
   const CONCURRENCY = 48;
 
@@ -2214,21 +2218,36 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const model       = (status && status.default_model) || "";
   const missing     = (status && status.missing) || 0;
   const errorCount  = (status && status.errors) || 0;
+  // pending = clips a normal run would actually transcribe; transcribeFailed
+  // = on-disk clips that failed a prior attempt (only "Retry failures"
+  // re-attempts them). Both are computed by the backend with the SAME
+  // predicate as the resume queue, so the card never implies work the
+  // queue skips — the old "downloaded − transcribed" lumped failures in,
+  // producing a phantom "Resume" that dead-ended at "Nothing to transcribe".
   const describable = (status && status.downloaded) || 0; // .opus on disk
-  const toProcess   = Math.max(describable - transcribed, 0);
-  const estCost     = toProcess * VOICE_COST_PER_CLIP;
+  const pending     = (status && status.pending) || 0;
+  const transcribeFailed = (status && status.transcribe_failed) || 0;
+  const issueCount  = errorCount + missing; // failed transcribes + not-in-backup
   const coveragePct = describable > 0 ? Math.min(100, Math.round((transcribed / describable) * 100)) : 0;
-  const allDone     = transcribed >= describable && describable > 0;
+  const allDone     = pending === 0 && describable > 0;
+  const actionCount = pending > 0 ? pending : (transcribeFailed > 0 ? transcribeFailed : describable);
+  const estCost     = actionCount * VOICE_COST_PER_CLIP;
 
-  const proceed = (force) => onVoiceIndex({ model: "", concurrency: CONCURRENCY, force });
-  const beginRun = (force) => {
-    if (!hasKey) { setPendingForce(force); setKeyModalMode("run"); setShowKey(true); return; }
-    proceed(force);
+  // A run is parameterised by { force, retryErrors }. proceed sends it;
+  // beginRun gates on the key first (stashing opts for after save).
+  const proceed = (opts) => onVoiceIndex({ model: "", concurrency: CONCURRENCY, ...opts });
+  const beginRun = (opts) => {
+    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+    proceed(opts);
   };
   const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
+  // launch precedence: fresh work → Resume; else failures → Retry failures
+  // (retryErrors); else fully done → confirmed force re-transcribe.
   const launch = () => {
-    if (allDone) { setShowConfirm(true); return; }
-    beginRun(false);
+    if (pending > 0)          { beginRun({ force: false }); return; }
+    if (transcribeFailed > 0) { beginRun({ retryErrors: true }); return; }
+    if (transcribed > 0)      { setShowConfirm(true); return; } // all done → force re-run
+    beginRun({ force: false }); // nothing on disk yet — run (reports status)
   };
   const stop = async () => {
     if (!j.jobId) return;
@@ -2250,22 +2269,31 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
     subtitle = "There's nothing to transcribe."; buttonLabel = "Transcribe with cloud";
     buttonPrimary = false; buttonDisabled = true;
   } else {
-    const term = (n, label) => (
-      <button onClick={() => setShowIssues(true)}
-        className="underline decoration-dotted hover:text-gray-700">{n.toLocaleString()} {label}</button>
-    );
+    // One stat line, each fact once: coverage, fresh work, issues. Model +
+    // key live in the footer; cost rides with the button. "issues" folds
+    // failed transcribes + not-in-backup into one link (the modal itemises).
     subtitle = (
       <span>
-        {transcribed.toLocaleString()} transcribed · {toProcess.toLocaleString()} remaining
-        {missing > 0 && <> · {term(missing, "not in backup")}</>}
-        {" · "}Model: {model}.
+        {transcribed.toLocaleString()} transcribed
+        {pending > 0 && <> · {pending.toLocaleString()} to transcribe</>}
+        {issueCount > 0 && <> · <button onClick={() => setShowIssues(true)}
+          className="underline decoration-dotted hover:text-gray-700">view {issueCount.toLocaleString()} issue{issueCount === 1 ? "" : "s"}</button></>}
       </span>
     );
-    if (allDone)         { statusDot = "#25D366"; title = "All available voice notes transcribed"; }
-    else if (transcribed){ statusDot = "#25D366"; title = "Voice transcription partially done"; }
-    else                 { statusDot = "#f59e0b"; title = "Not yet transcribed"; }
-    buttonPrimary = !allDone;
-    buttonLabel = allDone ? "Re-transcribe" : transcribed > 0 ? "Resume" : "Transcribe with cloud";
+    if (allDone && transcribed) { statusDot = "#25D366"; title = "All available voice notes transcribed"; }
+    else if (transcribed)       { statusDot = "#25D366"; title = "Voice transcription partially done"; }
+    else                        { statusDot = "#f59e0b"; title = "Not yet transcribed"; }
+
+    // Primary (green) only when there's fresh forward work; retry and
+    // re-transcribe are secondary (grey). Label says what a click does.
+    buttonPrimary = pending > 0;
+    buttonLabel = pending > 0
+                    ? (transcribed > 0 ? "Resume" : "Transcribe with cloud")
+                : transcribeFailed > 0
+                    ? `Retry ${transcribeFailed.toLocaleString()} failure${transcribeFailed === 1 ? "" : "s"}`
+                : transcribed > 0
+                    ? "Re-transcribe"        // genuinely all done → re-run
+                    : "Transcribe with cloud"; // nothing on disk yet → first-run CTA
   }
 
   if (isRunning && progress) {
@@ -2294,38 +2322,30 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
+            {/* Static cloud-coverage bar; caption dropped — the "N
+                transcribed" stat already states coverage, and the bar now
+                agrees with the title (done ignores permanently-failed rows). */}
             {hasDB && total > 0 && !isRunning && (
-              <div className="mt-3">
-                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
-                </div>
-                <p className="text-[10px] text-gray-400 mt-1">{coveragePct}% transcribed in cloud</p>
+              <div className="mt-3 h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
               </div>
             )}
 
-            {hasKey && hasDB && total > 0 && !isRunning && (
+            {/* Footer: model + key management on one muted line. */}
+            {hasDB && total > 0 && !isRunning && (model || hasKey) && (
               <div className="mt-3">
                 <p className="text-[11px] text-gray-400">
-                  Transcribes any remaining clips and retries failures automatically.
-                  {toProcess > 0 && <> {toProcess.toLocaleString()} clip{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
-                  {(errorCount > 0 || missing > 0) && <>
+                  {model && <>Model: {model}</>}
+                  {model && hasKey && <span className="mx-1.5">·</span>}
+                  {hasKey && <>
+                    {persisted
+                      ? <>key <span className="font-medium text-gray-600">remembered</span></>
+                      : <>key <span className="font-medium text-gray-600">this session</span></>}
                     <span className="mx-1.5">·</span>
-                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {(errorCount + missing).toLocaleString()} issue{(errorCount + missing) === 1 ? "" : "s"}</button>
+                    <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change</button>
+                    <span className="mx-1.5">·</span>
+                    <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget</button>
                   </>}
-                </p>
-              </div>
-            )}
-
-            {hasKey && !isRunning && (
-              <div className="mt-3">
-                <p className="text-[11px] text-gray-400">
-                  {persisted
-                    ? <>OpenRouter key <span className="font-medium text-gray-600">remembered on this computer</span>.</>
-                    : <>OpenRouter key set for <span className="font-medium text-gray-600">this session only</span>.</>}
-                  <span className="mx-1.5">·</span>
-                  <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change key</button>
-                  <span className="mx-1.5">·</span>
-                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget key</button>
                 </p>
               </div>
             )}
@@ -2338,12 +2358,17 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
               {stopping ? "Stopping…" : "Stop"}
             </button>
           ) : (
-            <button onClick={launch} disabled={buttonDisabled}
-              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
-              style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
-              <RefreshIcon />
-              {buttonLabel}
-            </button>
+            <div className="shrink-0 flex flex-col items-end gap-1">
+              <button onClick={launch} disabled={buttonDisabled}
+                className="flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+                style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
+                <RefreshIcon />
+                {buttonLabel}
+              </button>
+              {hasKey && actionCount > 0 && (
+                <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
+              )}
+            </div>
           )}
         </div>
 
@@ -2404,7 +2429,7 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
           onSaved={() => {
             setShowKey(false);
             reloadStatus();
-            if (keyModalMode === "run") proceed(pendingForce);
+            if (keyModalMode === "run") proceed(pendingRun || {});
           }}
         />
       )}
@@ -2414,7 +2439,7 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
           title="Re-transcribe all voice notes?"
           body={`This re-runs the model on all ${describable.toLocaleString()} voice notes on disk, overwriting existing transcripts. Estimated cost ≈ $${(describable * VOICE_COST_PER_CLIP).toFixed(2)}.`}
           confirmLabel="Re-transcribe all"
-          onConfirm={() => { setShowConfirm(false); beginRun(true); }}
+          onConfirm={() => { setShowConfirm(false); beginRun({ force: true }); }}
           onCancel={() => setShowConfirm(false)}
         />
       )}
@@ -3421,6 +3446,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         model: (opts && opts.model) || "",
         concurrency: (opts && opts.concurrency) || 0,
         force: !!(opts && opts.force),
+        retry_errors: !!(opts && opts.retryErrors),
       });
       patchJob(key, { jobId: job_id });
       streamJob(job_id, key, true);

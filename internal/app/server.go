@@ -1533,13 +1533,15 @@ func (s *server) handleForgetBinding(w http.ResponseWriter, _ *http.Request) {
 // voiceStatusResponse drives the cloud voice card: whether a key is held,
 // how many voice notes exist, and how many are downloaded / transcribed.
 type voiceStatusResponse struct {
-	HasKey       bool   `json:"has_key"`
-	TotalVoice   int    `json:"total_voice"`
-	Downloaded   int    `json:"downloaded"`  // .opus on disk (downloaded + transcribed)
-	Transcribed  int    `json:"transcribed"` // voice_index status='transcribed'
-	Missing      int    `json:"missing"`     // referenced but not in the backup
-	Errors       int    `json:"errors"`      // download errors + per-clip transcribe failures
-	DefaultModel string `json:"default_model"`
+	HasKey           bool   `json:"has_key"`
+	TotalVoice       int    `json:"total_voice"`
+	Downloaded       int    `json:"downloaded"`        // .opus on disk (downloaded + transcribed)
+	Transcribed      int    `json:"transcribed"`       // voice_index status='transcribed'
+	Missing          int    `json:"missing"`           // referenced but not in the backup
+	Errors           int    `json:"errors"`            // download errors + per-clip transcribe failures
+	Pending          int    `json:"pending"`           // fresh on-disk clips a normal run would transcribe
+	TranscribeFailed int    `json:"transcribe_failed"` // on-disk clips that failed before — retryable
+	DefaultModel     string `json:"default_model"`
 }
 
 // handleVoiceStatus reports cloud-transcribe readiness + coverage. Read-only.
@@ -1569,6 +1571,12 @@ func (s *server) handleVoiceStatus(w http.ResponseWriter, _ *http.Request) {
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'transcribed'`).Scan(&resp.Transcribed)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`).Scan(&resp.Missing)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'error' OR transcribe_error IS NOT NULL`).Scan(&resp.Errors)
+	// pending / transcribe_failed use the same predicates as the resume
+	// queue (selectVoiceTranscribeCandidates) so the card never implies
+	// work the queue skips. pending drives "Resume"; transcribe_failed
+	// drives the explicit "Retry failures" action.
+	resp.Pending, _ = postprocess.CountVoiceTranscribePending(db)
+	resp.TranscribeFailed, _ = postprocess.CountVoiceTranscribeFailed(db)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1661,8 +1669,9 @@ func queryVoiceIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
 // transcribe reads voice/ off disk — no backup password.
 type voiceIndexRequest struct {
 	Model       string `json:"model"`
-	Concurrency int    `json:"concurrency"` // 0 = server default
-	Force       bool   `json:"force"`       // re-transcribe everything
+	Concurrency int    `json:"concurrency"`  // 0 = server default
+	Force       bool   `json:"force"`        // re-transcribe everything
+	RetryErrors bool   `json:"retry_errors"` // re-attempt clips that failed a prior transcribe
 }
 
 // handleVoiceIndex starts a cloud voice-transcribe run as a cancellable
@@ -1692,6 +1701,7 @@ func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
 				Model:       req.Model,
 				Concurrency: req.Concurrency,
 				Force:       req.Force,
+				RetryErrors: req.RetryErrors,
 				Ctx:         ctx,
 				Log:         log,
 				Progress: func(p postprocess.VoiceIndexProgress) {
