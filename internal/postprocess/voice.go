@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -471,6 +473,18 @@ func VoiceIndex(opts VoiceIndexOptions) (*VoiceIndexResult, error) {
 	}
 	defer db.Close()
 
+	// The .opus files live on the filesystem, but the voice_index rows that
+	// make them visible to the transcribe queue live inside ChatStorage.sqlite
+	// — which a messages re-sync rebuilds from scratch. If the carry-forward
+	// drops those rows, the clips are orphaned (on disk, invisible to the
+	// queue) and a run no-ops with "Nothing to transcribe". Re-adopt them so
+	// the filesystem, not the index, is the source of truth for "downloaded".
+	if n, rErr := reconcileVoiceIndexFromDisk(db, voiceDir); rErr != nil {
+		return nil, rErr
+	} else if n > 0 {
+		opts.Log(fmt.Sprintf("Re-adopted %d on-disk voice note(s) missing from the index (recovered after a re-sync).", n))
+	}
+
 	total, alreadyTranscribed, err := countVoiceCandidates(db)
 	if err != nil {
 		return nil, err
@@ -683,6 +697,81 @@ func openVoiceDB(workspace string) (*sql.DB, string, error) {
 		return nil, "", err
 	}
 	return db, voiceDir, nil
+}
+
+// reconcileVoiceIndexFromDisk adopts orphaned voice/<rowid>.opus files into
+// voice_index as 'downloaded' rows. A messages re-sync rebuilds
+// ChatStorage.sqlite — and with it voice_index — from the backup, but leaves
+// the on-disk voice/ directory untouched. If the sidecar carry-forward fails
+// to preserve voice_index (e.g. message Z_PKs were re-keyed), every clip is
+// left present on disk yet missing from the index, so selectVoiceTranscribe-
+// Candidates finds nothing and the run reports "Nothing to transcribe" while
+// thousands of clips sit unread. This re-creates a 'downloaded' row for each
+// on-disk clip that maps to a real .opus media item but has no live index
+// entry. Files with no matching media item are ignored as stale. Returns the
+// number of rows adopted.
+func reconcileVoiceIndexFromDisk(db *sql.DB, voiceDir string) (int, error) {
+	entries, err := os.ReadDir(voiceDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read voice dir: %w", err)
+	}
+
+	// Rows the index already tracks — adopt only what it doesn't know about.
+	known := map[int64]bool{}
+	rows, err := db.Query(`SELECT rowid FROM voice_index`)
+	if err != nil {
+		return 0, fmt.Errorf("load voice_index rowids: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan voice_index rowid: %w", err)
+		}
+		known[id] = true
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate voice_index rowids: %w", err)
+	}
+
+	now := nowUTC()
+	adopted := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".opus") {
+			continue
+		}
+		rowid, err := strconv.ParseInt(strings.TrimSuffix(e.Name(), ".opus"), 10, 64)
+		if err != nil || known[rowid] {
+			continue
+		}
+		// Confirm the rowid is a real .opus voice message and pull the manifest
+		// path + duration so the adopted row matches a fresh download exactly.
+		var c voiceCandidate
+		err = db.QueryRow(
+			`SELECT m.ZMESSAGE, ? || m.ZMEDIALOCALPATH, COALESCE(m.ZMOVIEDURATION, 0)
+			   FROM ZWAMEDIAITEM m
+			   JOIN ZWAMESSAGE  wm ON wm.Z_PK = m.ZMESSAGE
+			  WHERE m.ZMESSAGE = ? AND m.ZMEDIALOCALPATH LIKE '%.opus'`,
+			voiceManifestPrefix, rowid,
+		).Scan(&c.rowid, &c.manifestPath, &c.durationSec)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return adopted, fmt.Errorf("look up voice media item %d: %w", rowid, err)
+		}
+		var bytesLen int64
+		if info, statErr := e.Info(); statErr == nil {
+			bytesLen = info.Size()
+		}
+		writeVoiceIndex(db, c, VoiceStatusDownloaded, bytesLen, "", now)
+		adopted++
+	}
+	return adopted, nil
 }
 
 // writeVoiceIndex commits a single voice_index row (terminal download

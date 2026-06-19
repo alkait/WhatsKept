@@ -2503,7 +2503,9 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
         )}
 
         {hasDone && j.done === true && !isRunning && (
-          <p className="text-xs text-gray-500 mt-3">✓ Done. Voice notes are now searchable by their transcripts.</p>
+          transcribed > 0
+            ? <p className="text-xs text-gray-500 mt-3">✓ Done. Voice notes are now searchable by their transcripts.</p>
+            : <p className="text-xs text-gray-500 mt-3">Nothing to transcribe — no downloaded voice notes were found. Run a messages sync to download voice notes first.</p>
         )}
       </div>
 
