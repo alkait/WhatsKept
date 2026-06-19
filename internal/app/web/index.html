@@ -1759,7 +1759,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const described  = (status && status.described) || 0;
   const cloudCount = (status && status.cloud_count) || 0;
   const hasKey     = !!(status && status.has_key);
-  const persisted  = !!(status && status.persisted);
   const model      = (status && status.default_model) || "";
 
   const missing = (status && status.missing) || 0;
@@ -1792,8 +1791,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
     if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(opts);
   };
-  // Open the key modal just to change the stored key — no run is started.
-  const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
   // launch is the single button action, by precedence:
   //   fresh work pending → Resume (or first-run describe)
   //   else failures exist → Retry failures (re-attempts describe_error rows)
@@ -1809,11 +1806,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
     if (!j.jobId) return;
     setStopping(true);
     try { await api.del(`/api/jobs/${j.jobId}`); } catch {}
-  };
-
-  const forgetKey = async () => {
-    try { await api.del("/api/session/openrouter-key"); } catch {}
-    reloadStatus();
   };
 
   // Reset the optimistic "stopping" flag once the run actually ends.
@@ -1894,24 +1886,11 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
               </div>
             )}
 
-            {/* Footer: model + key management on one muted line. Model
-                shows whenever known; key controls show when a key is set
-                (incl. one loaded from disk at startup). */}
-            {hasDB && total > 0 && !isRunning && (model || hasKey) && (
+            {/* Footer: model only. API-key management lives in the
+                Settings tab (not repeated per card). */}
+            {hasDB && total > 0 && !isRunning && model && (
               <div className="mt-3">
-                <p className="text-[11px] text-gray-400">
-                  {model && <>Model: {model}</>}
-                  {model && hasKey && <span className="mx-1.5">·</span>}
-                  {hasKey && <>
-                    {persisted
-                      ? <>key <span className="font-medium text-gray-600">remembered</span></>
-                      : <>key <span className="font-medium text-gray-600">this session</span></>}
-                    <span className="mx-1.5">·</span>
-                    <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change</button>
-                    <span className="mx-1.5">·</span>
-                    <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget</button>
-                  </>}
-                </p>
+                <p className="text-[11px] text-gray-400">Model: {model}</p>
               </div>
             )}
           </div>
@@ -2167,6 +2146,74 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
   );
 }
 
+// SettingsPanel — app-wide settings. Currently the OpenRouter API key
+// (shared by cloud image descriptions and voice transcription): status
+// plus set / change / forget. Key entry reuses OpenRouterKeyModal. This is
+// the single place the key is managed; the feature cards no longer repeat
+// it. Switching tabs remounts the cards, so they pick up a key change here
+// on return.
+function SettingsPanel() {
+  const [keyStatus, setKeyStatus] = useState(null); // { has, persisted }
+  const [showKey, setShowKey]     = useState(false);
+
+  const reload = () =>
+    api.get("/api/session/openrouter-key").then(setKeyStatus).catch(() => {});
+  useEffect(() => { reload(); }, []);
+
+  const hasKey    = !!(keyStatus && keyStatus.has);
+  const persisted = !!(keyStatus && keyStatus.persisted);
+
+  const forgetKey = async () => {
+    try { await api.del("/api/session/openrouter-key"); } catch {}
+    reload();
+  };
+
+  return (
+    <section>
+      <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Settings</h2>
+      <div className="rounded-xl border p-5" style={{borderColor:'#128C7E',background:'#fff'}}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="font-medium text-gray-700 text-sm">OpenRouter API key</p>
+            <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+              Used for cloud image descriptions and voice transcription.{" "}
+              <a href="#" onClick={e => { e.preventDefault(); api.post("/api/open-url", { url: "https://openrouter.ai/keys" }).catch(() => {}); }}
+                className="font-medium text-gray-700 underline">Get a key</a>.
+            </p>
+            <p className="text-[11px] text-gray-400 mt-2">
+              {hasKey
+                ? (persisted
+                    ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
+                    : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
+                : <>Status: <span className="font-medium text-gray-600">not set</span></>}
+            </p>
+          </div>
+          <div className="shrink-0 flex flex-col items-end gap-2">
+            <button onClick={() => setShowKey(true)}
+              className="rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background:'#075E54'}}>
+              {hasKey ? "Change key" : "Set key"}
+            </button>
+            {hasKey && (
+              <button onClick={forgetKey}
+                className="text-[11px] text-gray-400 underline decoration-dotted hover:text-gray-700">
+                forget
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {showKey && (
+        <OpenRouterKeyModal
+          onClose={() => setShowKey(false)}
+          onSaved={() => { setShowKey(false); reload(); }}
+        />
+      )}
+    </section>
+  );
+}
+
 // fmtEta formats a duration in seconds for the live progress card.
 function fmtEta(secs) {
   if (!secs || secs < 0) return "—";
@@ -2214,7 +2261,6 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const total       = (status && status.total_voice) || 0;
   const transcribed = (status && status.transcribed) || 0;
   const hasKey      = !!(status && status.has_key);
-  const persisted   = !!(status && status.persisted);
   const model       = (status && status.default_model) || "";
   const missing     = (status && status.missing) || 0;
   const errorCount  = (status && status.errors) || 0;
@@ -2240,7 +2286,6 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
     if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(opts);
   };
-  const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
   // launch precedence: fresh work → Resume; else failures → Retry failures
   // (retryErrors); else fully done → confirmed force re-transcribe.
   const launch = () => {
@@ -2254,11 +2299,6 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
     setStopping(true);
     try { await api.del(`/api/jobs/${j.jobId}`); } catch {}
   };
-  const forgetKey = async () => {
-    try { await api.del("/api/session/openrouter-key"); } catch {}
-    reloadStatus();
-  };
-
   let statusDot = "#9ca3af", title, subtitle, buttonLabel, buttonPrimary = true, buttonDisabled = isRunning;
   if (!hasDB) {
     title = "Run a messages sync first";
@@ -2331,22 +2371,11 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
               </div>
             )}
 
-            {/* Footer: model + key management on one muted line. */}
-            {hasDB && total > 0 && !isRunning && (model || hasKey) && (
+            {/* Footer: model only. API-key management lives in the
+                Settings tab (not repeated per card). */}
+            {hasDB && total > 0 && !isRunning && model && (
               <div className="mt-3">
-                <p className="text-[11px] text-gray-400">
-                  {model && <>Model: {model}</>}
-                  {model && hasKey && <span className="mx-1.5">·</span>}
-                  {hasKey && <>
-                    {persisted
-                      ? <>key <span className="font-medium text-gray-600">remembered</span></>
-                      : <>key <span className="font-medium text-gray-600">this session</span></>}
-                    <span className="mx-1.5">·</span>
-                    <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change</button>
-                    <span className="mx-1.5">·</span>
-                    <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget</button>
-                  </>}
-                </p>
+                <p className="text-[11px] text-gray-400">Model: {model}</p>
               </div>
             )}
           </div>
@@ -3519,6 +3548,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     { id: "backups",  label: "Backups"  },
     { id: "database", label: "Database" },
     { id: "agents",   label: "Agents"   },
+    { id: "settings", label: "Settings" },
   ];
 
   return (
@@ -3697,6 +3727,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             onOpenAgents={() => setTab("agents")}
           />
         )}
+
+        {/* ══ SETTINGS TAB ══ */}
+        {tab === "settings" && <SettingsPanel />}
 
       </main>
 
