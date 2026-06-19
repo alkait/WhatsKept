@@ -1,19 +1,15 @@
 package postprocess
 
-// Cloud voice transcription via an OpenRouter audio model. A pure
-// in-process HTTP client (no subprocess, no cgo) so it works identically
-// on macOS, Windows, and Linux. WhatsApp voice notes are Ogg/Opus and are
-// sent verbatim — no local transcoding step.
+// Cloud voice transcription via an OpenRouter audio model. A thin wrapper
+// over the shared cloudClient base (cloud.go): the base owns the HTTP
+// transport, retries, cost accounting, and model bookkeeping; this file
+// only supplies the prompt and the audio content part. WhatsApp voice
+// notes are Ogg/Opus and are sent verbatim — no local transcoding step.
 
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
-	"errors"
-	"fmt"
-	"net/http"
 	"strings"
-	"sync"
 )
 
 const (
@@ -34,75 +30,42 @@ const (
 		"translation, no commentary, and no quotation marks. If there is no speech, output nothing."
 )
 
-// voiceTranscriber transcribes one Ogg/Opus clip per call.
+// voiceTranscriber transcribes one Ogg/Opus clip per call over the shared
+// cloud base. Model and CostUSD are promoted from the embedded *cloudClient.
 type voiceTranscriber struct {
-	client *http.Client
-	apiKey string
-	model  string
+	*cloudClient
+}
 
-	mu      sync.Mutex // guards costUSD (Transcribe runs from a worker pool)
-	costUSD float64
+// voiceTranscribers is the registry of supported voice-index engines.
+// Adding a new audio backend is one entry here (see cloudRegistry). Cloud
+// is the only engine today and the default.
+var voiceTranscribers = cloudRegistry[*voiceTranscriber]{
+	kind:      "voice-index",
+	def:       SourceCloud,
+	factories: map[string]func(apiKey, model string) (*voiceTranscriber, error){SourceCloud: newVoiceTranscriber},
 }
 
 // newVoiceTranscriber builds a transcriber. Empty model → DefaultVoiceModel;
 // empty apiKey is an error.
 func newVoiceTranscriber(apiKey, model string) (*voiceTranscriber, error) {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, errors.New("cloud transcriber: OpenRouter API key required")
+	cc, err := newCloudClient(apiKey, model, DefaultVoiceModel)
+	if err != nil {
+		return nil, err
 	}
-	if model == "" {
-		model = DefaultVoiceModel
-	}
-	return &voiceTranscriber{
-		client: &http.Client{Timeout: cloudHTTPTimeout},
-		apiKey: apiKey,
-		model:  model,
-	}, nil
-}
-
-func (t *voiceTranscriber) Model() string { return t.model }
-
-// CostUSD returns the running total of per-request cost OpenRouter has
-// reported so far.
-func (t *voiceTranscriber) CostUSD() float64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.costUSD
-}
-
-func (t *voiceTranscriber) addCost(usd float64) {
-	t.mu.Lock()
-	t.costUSD += usd
-	t.mu.Unlock()
+	return &voiceTranscriber{cc}, nil
 }
 
 // Transcribe sends the raw Ogg/Opus bytes and returns the transcript. A
 // per-clip failure is a normal error; a global auth/billing failure is a
-// *FatalError (from openRouterCall) that aborts the whole run.
+// *FatalError (from the shared base) that aborts the whole run.
 func (t *voiceTranscriber) Transcribe(ctx context.Context, opus []byte) (string, error) {
 	b64 := base64.StdEncoding.EncodeToString(opus)
-	body, err := json.Marshal(chatRequest{
-		Model: t.model,
-		Messages: []chatMessage{{
-			Role: "user",
-			Content: []contentPart{
-				{Type: "text", Text: voiceTranscribePrompt},
-				{Type: "input_audio", InputAudio: &inputAudioPart{Data: b64, Format: "ogg"}},
-			},
-		}},
-		MaxTokens:   voiceMaxOutputTokens,
-		Temperature: 0,
-		Usage:       &usageRequest{Include: true},
-	})
-	if err != nil {
-		return "", fmt.Errorf("encode request: %w", err)
-	}
-	cr, err := openRouterCall(ctx, t.client, t.apiKey, body)
+	raw, err := t.complete(ctx, []contentPart{
+		{Type: "text", Text: voiceTranscribePrompt},
+		{Type: "input_audio", InputAudio: &inputAudioPart{Data: b64, Format: "ogg"}},
+	}, voiceMaxOutputTokens, 0)
 	if err != nil {
 		return "", err
 	}
-	if cr.Usage != nil {
-		t.addCost(cr.Usage.Cost)
-	}
-	return strings.TrimSpace(cr.Choices[0].Message.Content), nil
+	return strings.TrimSpace(raw), nil
 }

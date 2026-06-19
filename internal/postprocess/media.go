@@ -478,13 +478,11 @@ func MediaIndex(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	return res, nil
 }
 
-// runMediaPipeline drives the worker pool + collector shared by the
-// download and describe phases. `process` does the per-row work; the
-// rest — graceful cancellation, fatal-error abort, tallies, progress
-// emission, and an optional FTS rebuild — is identical across phases.
+// runMediaPipeline drives the image download/describe phases. It is a thin
+// per-phase wrapper over the generic runWorkerPipeline (pipeline.go),
+// supplying the media-specific tally, progress emission, and FTS rebuild.
 // It fills res and returns the first FatalError seen (download never
-// produces one). DB writes are serialised by capping the SQLite pool to
-// a single connection.
+// produces one).
 func runMediaPipeline(
 	opts MediaIndexOptions,
 	res *MediaIndexResult,
@@ -495,19 +493,11 @@ func runMediaPipeline(
 	rebuildFTSAfter bool,
 	process func(ctx context.Context, c candidate) oneResult,
 ) error {
-	if opts.ProgressEvery <= 0 {
-		opts.ProgressEvery = 25 // guard the progress-emit modulo
+	progressEvery := opts.ProgressEvery
+	if progressEvery <= 0 {
+		progressEvery = 25 // guard the progress-emit modulo
 	}
-	db.SetMaxOpenConns(1)
-
-	// runCtx is cancelled either by the caller (user Stop) or internally
-	// when a worker hits a FatalError (bad key / no credits) — both make
-	// the feeder stop and the workers drain.
-	runCtx, cancelRun := context.WithCancel(opts.Ctx)
-	defer cancelRun()
-	var fatalErr error
-	var fatalMu sync.Mutex
-
+	tStart := time.Now()
 	cost := func() float64 {
 		if costFn == nil {
 			return 0
@@ -515,111 +505,63 @@ func runMediaPipeline(
 		return costFn()
 	}
 
-	tStart := time.Now()
-	jobsCh := make(chan candidate)
-	resCh := make(chan oneResult, concurrency)
-
-	var wg sync.WaitGroup
-	for w := 0; w < concurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range jobsCh {
-				resCh <- process(runCtx, c)
+	var rebuild func()
+	if rebuildFTSAfter {
+		rebuild = func() {
+			// Rebuild FTS so the new ocr_text + description are searchable.
+			opts.Log("Rebuilding messages_fts…")
+			if ftsN, err := rebuildFTS(db); err != nil {
+				opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
+			} else {
+				res.FTSCountAfter = ftsN
+				opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
 			}
-		}()
+		}
 	}
-	// Feeder: stops early (closing jobsCh) when the run context is
-	// cancelled, so workers drain and exit.
-	go func() {
-		defer close(jobsCh)
-		for _, c := range candidates {
-			select {
-			case <-runCtx.Done():
-				return
-			case jobsCh <- c:
-			}
-		}
-	}()
-	go func() { wg.Wait(); close(resCh) }()
 
-	// Collector (this goroutine) tallies results and emits progress.
-	processed := 0
-	for r := range resCh {
-		if r.fatal != nil {
-			// First fatal wins; cancel the run so the feeder/workers
-			// wind down without marking the rest as errored.
-			fatalMu.Lock()
-			if fatalErr == nil {
-				fatalErr = r.fatal
-				opts.Log("Aborting: " + r.fatal.Error())
+	return runWorkerPipeline(opts.Ctx, db, candidates, concurrency, progressEvery,
+		process,
+		func(r oneResult) (string, error) { return r.status, r.fatal },
+		func(err error) { opts.Log("Aborting: " + err.Error()) },
+		func(r oneResult) {
+			switch r.status {
+			case MediaStatusDownloaded:
+				res.Downloaded++
+			case MediaStatusDescribed:
+				res.Described++
+				if r.withOCR {
+					res.WithOCR++
+				}
+				if r.withDescription {
+					res.WithDesc++
+				}
+			case MediaStatusMissing:
+				res.Missing++
+			case MediaStatusError:
+				res.Errors++
 			}
-			fatalMu.Unlock()
-			cancelRun()
-			continue
-		}
-		if r.status == statusCancelled {
-			continue // in-flight row aborted by cancel; not a real outcome
-		}
-		res.Processed++
-		switch r.status {
-		case MediaStatusDownloaded:
-			res.Downloaded++
-		case MediaStatusDescribed:
-			res.Described++
-			if r.withOCR {
-				res.WithOCR++
-			}
-			if r.withDescription {
-				res.WithDesc++
-			}
-		case MediaStatusMissing:
-			res.Missing++
-		case MediaStatusError:
-			res.Errors++
-		}
-		processed++
-		if opts.Progress != nil && processed%opts.ProgressEvery == 0 {
+			res.Processed++
+		},
+		func() {
 			res.CostUSD = cost()
 			emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
-		}
-	}
-
-	res.CostUSD = cost()
-	res.DurationSec = time.Since(tStart).Seconds()
-	// A user Stop cancels opts.Ctx; a fatal abort cancels only runCtx.
-	if fatalErr == nil && opts.Ctx.Err() != nil {
-		res.Cancelled = true
-		opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
-	}
-	if opts.Progress != nil {
-		emitProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
-	}
-
-	if rebuildFTSAfter {
-		// Rebuild FTS so the new ocr_text + description are searchable.
-		opts.Log("Rebuilding messages_fts…")
-		ftsN, err := rebuildFTS(db)
-		if err != nil {
-			opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
-		} else {
-			res.FTSCountAfter = ftsN
-			opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
-		}
-	}
-	return fatalErr
+		},
+		func(stoppedByUser bool) {
+			res.DurationSec = time.Since(tStart).Seconds()
+			if stoppedByUser {
+				res.Cancelled = true
+				opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
+			}
+		},
+		rebuild,
+	)
 }
 
-// buildDescriber constructs the cloud Describer. opts.Engine must be
-// empty (defaults to cloud) or SourceCloud; cloud requires an API key.
-// The caller owns Close().
+// buildDescriber constructs the Describer for opts.Engine via the
+// imageDescribers registry (empty defaults to cloud). Cloud requires an
+// API key. The caller owns Close().
 func buildDescriber(opts MediaIndexOptions) (Describer, error) {
-	switch opts.Engine {
-	case "", SourceCloud:
-		return newCloudDescriber(opts.APIKey, opts.Model)
-	default:
-		return nil, fmt.Errorf("media-index: unknown engine %q (only %q is supported)", opts.Engine, SourceCloud)
-	}
+	return imageDescribers.build(opts.Engine, opts.APIKey, opts.Model)
 }
 
 func modelSuffix(m string) string {

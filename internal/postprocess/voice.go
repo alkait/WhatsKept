@@ -494,10 +494,7 @@ func VoiceIndex(opts VoiceIndexOptions) (*VoiceIndexResult, error) {
 	opts.Log(fmt.Sprintf("Already transcribed:    %d", alreadyTranscribed))
 	opts.Log(fmt.Sprintf("Queued this run:        %d", len(candidates)))
 
-	if opts.Engine != "" && opts.Engine != SourceCloud {
-		return nil, fmt.Errorf("voice-index: unknown engine %q (only %q is supported)", opts.Engine, SourceCloud)
-	}
-	transcriber, err := newVoiceTranscriber(opts.APIKey, opts.Model)
+	transcriber, err := voiceTranscribers.build(opts.Engine, opts.APIKey, opts.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -584,8 +581,10 @@ func transcribeOneVoice(
 
 // ---- Shared worker pool ----------------------------------------------
 
-// runVoicePipeline drives the worker pool + collector shared by the
-// download and transcribe phases. Mirrors runMediaPipeline.
+// runVoicePipeline drives the voice download/transcribe phases. Like
+// runMediaPipeline, it is a thin per-phase wrapper over the generic
+// runWorkerPipeline (pipeline.go), supplying the voice-specific tally,
+// progress emission, and FTS rebuild.
 func runVoicePipeline(
 	opts VoiceIndexOptions,
 	res *VoiceIndexResult,
@@ -596,16 +595,11 @@ func runVoicePipeline(
 	rebuildFTSAfter bool,
 	process func(ctx context.Context, c voiceCandidate) voiceOneResult,
 ) error {
-	if opts.ProgressEvery <= 0 {
-		opts.ProgressEvery = 1
+	progressEvery := opts.ProgressEvery
+	if progressEvery <= 0 {
+		progressEvery = 1
 	}
-	db.SetMaxOpenConns(1)
-
-	runCtx, cancelRun := context.WithCancel(opts.Ctx)
-	defer cancelRun()
-	var fatalErr error
-	var fatalMu sync.Mutex
-
+	tStart := time.Now()
 	cost := func() float64 {
 		if costFn == nil {
 			return 0
@@ -613,91 +607,52 @@ func runVoicePipeline(
 		return costFn()
 	}
 
-	tStart := time.Now()
-	type job struct {
-		c voiceCandidate
-		r voiceOneResult
+	var rebuild func()
+	if rebuildFTSAfter {
+		rebuild = func() {
+			opts.Log("Rebuilding messages_fts…")
+			if ftsN, err := rebuildFTS(db); err != nil {
+				opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
+			} else {
+				res.FTSCountAfter = ftsN
+			}
+		}
 	}
-	jobsCh := make(chan voiceCandidate)
-	resCh := make(chan job, concurrency)
 
-	var wg sync.WaitGroup
-	for w := 0; w < concurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for c := range jobsCh {
-				resCh <- job{c, process(runCtx, c)}
+	return runWorkerPipeline(opts.Ctx, db, candidates, concurrency, progressEvery,
+		process,
+		func(r voiceOneResult) (string, error) { return r.status, r.fatal },
+		nil, // voice does not log a separate "Aborting" line
+		func(r voiceOneResult) {
+			switch r.status {
+			case VoiceStatusDownloaded:
+				res.Downloaded++
+			case VoiceStatusTranscribed:
+				res.Transcribed++
+				res.AudioSecondsTotal += r.audioSec
+				if r.withText {
+					res.WithText++
+				}
+			case VoiceStatusMissing:
+				res.Missing++
+			case VoiceStatusError:
+				res.Errors++
 			}
-		}()
-	}
-	go func() {
-		defer close(jobsCh)
-		for _, c := range candidates {
-			select {
-			case <-runCtx.Done():
-				return
-			case jobsCh <- c:
-			}
-		}
-	}()
-	go func() { wg.Wait(); close(resCh) }()
-
-	processed := 0
-	for j := range resCh {
-		r := j.r
-		if r.fatal != nil {
-			fatalMu.Lock()
-			if fatalErr == nil {
-				fatalErr = r.fatal
-			}
-			fatalMu.Unlock()
-			cancelRun()
-			continue
-		}
-		switch r.status {
-		case statusCancelled:
-			continue
-		case VoiceStatusDownloaded:
-			res.Downloaded++
-		case VoiceStatusTranscribed:
-			res.Transcribed++
-			res.AudioSecondsTotal += r.audioSec
-			if r.withText {
-				res.WithText++
-			}
-		case VoiceStatusMissing:
-			res.Missing++
-		case VoiceStatusError:
-			res.Errors++
-		}
-		res.Processed++
-		processed++
-		if opts.Progress != nil && processed%opts.ProgressEvery == 0 {
+			res.Processed++
+		},
+		func() {
 			res.CostUSD = cost()
 			emitVoiceProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
-		}
-	}
-
-	res.CostUSD = cost()
-	res.DurationSec = time.Since(tStart).Seconds()
-	if fatalErr == nil && opts.Ctx.Err() != nil {
-		res.Cancelled = true
-		opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
-	}
-	if opts.Progress != nil {
-		emitVoiceProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
-	}
-
-	if rebuildFTSAfter {
-		opts.Log("Rebuilding messages_fts…")
-		if ftsN, err := rebuildFTS(db); err != nil {
-			opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
-		} else {
-			res.FTSCountAfter = ftsN
-		}
-	}
-	return fatalErr
+		},
+		func(stoppedByUser bool) {
+			res.DurationSec = time.Since(tStart).Seconds()
+			if stoppedByUser {
+				res.Cancelled = true
+				opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
+			}
+		},
+		rebuild,
+	)
 }
 
 // ---- helpers ---------------------------------------------------------
