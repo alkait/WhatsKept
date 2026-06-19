@@ -1185,7 +1185,6 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
       dbStatus={dbStatus}
       job={documentJob}
       onDocumentIndex={onDocumentIndex}
-      hasSessionPassword={hasSessionPassword}
       reloadDbStatus={reloadDbStatus}
     />
     </>)}
@@ -1235,7 +1234,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
 
   const reloadStatus = () =>
     api.get("/api/database/media-describe/status").then(setStatus).catch(() => {});
-  useEffect(() => { reloadStatus(); }, []);
+  // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
+  // sync) so coverage reflects files just downloaded, not just on remount.
+  useEffect(() => { reloadStatus(); }, [dbStatus]);
   useEffect(() => {
     if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1784,7 +1785,9 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
 
   const reloadStatus = () =>
     api.get("/api/database/voice-index/status").then(setStatus).catch(() => {});
-  useEffect(() => { reloadStatus(); }, []);
+  // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
+  // sync) so coverage reflects files just downloaded, not just on remount.
+  useEffect(() => { reloadStatus(); }, [dbStatus]);
   useEffect(() => {
     if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2018,98 +2021,119 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
 // ═══════════════════════════════════════════════════════════════════════════
 // DocumentIndexCard — "Sync documents" section under the Database tab
 // ═══════════════════════════════════════════════════════════════════════════
-// Mirrors VoiceIndexCard / CloudDescribeCard but without a model-download
-// step — Apple PDFKit + Vision are first-party macOS frameworks always
-// available on supported OS versions.
-//
-// Counts come from dbStatus:
-//   document_pdf_total   — denominator for the gauge (PDFs only).
-//   document_total       — full document-message count, surfaced in
-//                          the subtitle so the user understands the
-//                          long tail of xlsx/docx is visible-but-skipped.
-//   document_extracted   — rows with body text persisted to wa_document_text.
-//   document_empty       — rows where PDFKit + OCR found nothing
-//                          (image-only PDFs that resisted OCR). Counted
-//                          as done for the gauge.
-//   document_unsupported — non-PDF docs we don't extract today.
-function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword, reloadDbStatus }) {
-  const [prompting, setPrompting] = useState(false);
+// Mirrors VoiceIndexCard: OpenRouter's file-parser plugin extracts text from
+// the PDFs downloaded during the messages sync (free pdf-text for the native
+// layer, mistral-ocr for scanned pages). Password-free (reads documents/ off
+// disk); needs the session OpenRouter key. Cross-platform — replaces the old
+// macOS-only Apple PDFKit + Vision path. Shows coverage, a cost estimate, a
+// live cost meter, and an issues link.
+const DOC_COST_PER_DOC = 0.003; // measured ~$ / doc (POC), for estimates
+
+function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
+  const [status, setStatus]       = useState(null);
+  const [showKey, setShowKey]     = useState(false);
+  const [stopping, setStopping]   = useState(false);
+  const [showIssues, setShowIssues] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [pendingRun, setPendingRun] = useState(null);
+  const [keyModalMode, setKeyModalMode] = useState("run");
+  const CONCURRENCY = 48;
+
   const j = job || {};
   const isRunning = !!j.running;
   const hasDone   = j.done !== undefined && j.done !== null;
   const progress  = j.progress || null;
 
+  const reloadStatus = () =>
+    api.get("/api/database/document-index/status").then(setStatus).catch(() => {});
+  // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
+  // sync) so coverage reflects files just downloaded, not just on remount.
+  useEffect(() => { reloadStatus(); }, [dbStatus]);
   useEffect(() => {
-    if (hasDone && j.done === true) reloadDbStatus();
+    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasDone, j.done]);
+  useEffect(() => { if (!isRunning) setStopping(false); }, [isRunning]);
 
   if (!dbStatus) return null;
-  const hasDB        = !!dbStatus.db_exists;
-  const totalAll     = dbStatus.document_total ?? null;
-  const total        = dbStatus.document_pdf_total ?? null;
-  const extracted    = dbStatus.document_extracted ?? 0;
-  const empty        = dbStatus.document_empty ?? 0;
-  const unsupported  = dbStatus.document_unsupported ?? 0;
-  // "Done" for the gauge = extracted + empty. Empty rows ran the
-  // pipeline cleanly; counting them as remaining would mean a
-  // re-run that does nothing every time.
-  const done         = extracted + empty;
-  const remaining    = total != null ? Math.max(total - done, 0) : null;
-  const allDone      = total != null && total > 0 && done >= total;
+  const hasDB       = !!dbStatus.db_exists;
+  const describable = (status && status.downloaded) || 0;   // PDFs on disk
+  const extracted   = (status && status.extracted) || 0;
+  const empty       = (status && status.empty) || 0;
+  const hasKey      = !!(status && status.has_key);
+  const model       = (status && status.default_model) || "";
+  const missing     = (status && status.missing) || 0;
+  const errorCount  = (status && status.errors) || 0;
+  const unsupported = (status && status.unsupported) || 0;
+  // pending = PDFs a normal run would extract; extractFailed = on-disk PDFs
+  // that failed a prior attempt (only "Retry failures" re-attempts). Both use
+  // the same predicate as the resume queue so the card never implies work the
+  // queue skips.
+  const pending     = (status && status.pending) || 0;
+  const extractFailed = (status && status.extract_failed) || 0;
+  const done        = extracted + empty;                    // processed cleanly
+  const issueCount  = errorCount + missing;
+  const coveragePct = describable > 0 ? Math.min(100, Math.round((done / describable) * 100)) : 0;
+  const allDone     = pending === 0 && describable > 0;
+  const actionCount = pending > 0 ? pending : (extractFailed > 0 ? extractFailed : describable);
+  const estCost     = actionCount * DOC_COST_PER_DOC;
 
-  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
+  const proceed = (opts) => onDocumentIndex({ model: "", concurrency: CONCURRENCY, ...opts });
+  const beginRun = (opts) => {
+    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+    proceed(opts);
+  };
+  const launch = () => {
+    if (pending > 0)        { beginRun({ force: false }); return; }
+    if (extractFailed > 0)  { beginRun({ retryErrors: true }); return; }
+    if (extracted > 0)      { setShowConfirm(true); return; } // all done → force re-run
+    beginRun({ force: false });
+  };
+  const stop = async () => {
+    if (!j.jobId) return;
+    setStopping(true);
+    try { await api.del(`/api/jobs/${j.jobId}`); } catch {}
+  };
+
+  let statusDot = "#9ca3af", title, subtitle, buttonLabel, buttonPrimary = true, buttonDisabled = isRunning;
   if (!hasDB) {
-    title         = "Run a messages sync first";
-    subtitle      = "Document indexing reads the message database — sync that above before extracting documents.";
-    buttonLabel   = "Sync documents";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (totalAll === 0) {
-    title         = "No documents on device";
-    subtitle      = "There's nothing to extract — your WhatsApp has no document messages.";
-    buttonLabel   = "Sync documents";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (total === 0) {
-    title         = "No PDF attachments";
-    subtitle      = totalAll != null
-      ? `${totalAll.toLocaleString()} document messages on the device, but no PDFs. Non-PDF formats (xlsx, docx, …) aren't extracted yet — filenames remain searchable via wa_document.`
-      : "No PDF attachments on the device. Non-PDF formats aren't extracted yet — filenames remain searchable via wa_document.";
-    buttonLabel   = "Sync documents";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (allDone) {
-    title         = "All PDFs extracted";
-    subtitle      = `${done.toLocaleString()} of ${total.toLocaleString()} PDFs processed${empty > 0 ? ` (${empty.toLocaleString()} image-only without recoverable text)` : ""}${unsupported > 0 ? ` · ${unsupported.toLocaleString()} non-PDF skipped` : ""}.`;
-    buttonLabel   = "Re-extract";
-    buttonPrimary = false;
-    statusDot     = "#25D366";
-  } else if (done === 0) {
-    title         = "PDFs not yet extracted";
-    subtitle      = total != null
-      ? `${total.toLocaleString()} PDFs on the device${totalAll != null && totalAll > total ? ` (out of ${totalAll.toLocaleString()} document messages — non-PDF formats aren't extracted yet)` : ""}. PDFKit handles native text; Apple Vision OCR is the fallback for scanned pages.`
-      : "PDFKit + Apple Vision OCR extract every PDF's text and persist it to wa_document_text.";
-    buttonLabel   = "Sync documents";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
+    title = "Run a messages sync first";
+    subtitle = "Document extraction reads the PDFs downloaded during a sync — sync that above first.";
+    buttonLabel = "Extract with cloud"; buttonPrimary = false; buttonDisabled = true;
+  } else if (describable === 0) {
+    title = "No documents downloaded yet";
+    subtitle = "Run a messages sync to download the PDFs, then extract their text here.";
+    buttonLabel = "Extract with cloud"; buttonPrimary = false; buttonDisabled = true;
   } else {
-    title         = "Resume document extraction";
-    subtitle      = `${done.toLocaleString()} / ${total.toLocaleString()} PDFs processed · ${remaining.toLocaleString()} remaining.`;
-    buttonLabel   = "Resume";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
+    subtitle = (
+      <span>
+        {extracted.toLocaleString()} extracted
+        {empty > 0 && <> · {empty.toLocaleString()} image-only</>}
+        {pending > 0 && <> · {pending.toLocaleString()} to extract</>}
+        {unsupported > 0 && <> · {unsupported.toLocaleString()} non-PDF skipped</>}
+        {issueCount > 0 && <> · <button onClick={() => setShowIssues(true)}
+          className="underline decoration-dotted hover:text-gray-700">view {issueCount.toLocaleString()} issue{issueCount === 1 ? "" : "s"}</button></>}
+      </span>
+    );
+    if (allDone && done) { statusDot = "#25D366"; title = "All downloaded PDFs extracted"; }
+    else if (done)       { statusDot = "#25D366"; title = "Document extraction partially done"; }
+    else                 { statusDot = "#f59e0b"; title = "PDFs not yet extracted"; }
+
+    buttonPrimary = pending > 0;
+    buttonLabel = pending > 0
+                    ? (done > 0 ? "Resume" : "Extract with cloud")
+                : extractFailed > 0
+                    ? `Retry ${extractFailed.toLocaleString()} failure${extractFailed === 1 ? "" : "s"}`
+                : extracted > 0
+                    ? "Re-extract"
+                    : "Extract with cloud";
   }
 
-  const pct = (total != null && total > 0)
-    ? Math.min(100, Math.round((done / total) * 100))
-    : 0;
-
-  const launch = () => {
-    if (hasSessionPassword) onDocumentIndex("");
-    else setPrompting(true);
-  };
-  const buttonDisabled = isRunning || !hasDB || total === 0;
+  if (isRunning && progress) {
+    const live = (progress.baseline || 0) + (progress.extracted || 0);
+    title = "Document extraction in progress";
+    subtitle = `${live.toLocaleString()} of ${(progress.total || describable).toLocaleString()} extracted. Model: ${model}.`;
+  }
 
   return (
     <section className="mt-6">
@@ -2120,8 +2144,8 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
       <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with document text so the agents can read the documents too</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
-        <h3 className="text-sm font-semibold text-gray-900">Apple PDFKit · local</h3>
-        <p className="text-[11px] text-gray-400 mb-3">Extracts text from each PDF on your Mac, with Vision OCR for scanned pages — free and private.</p>
+        <h3 className="text-sm font-semibold text-gray-900">AI document extraction · cloud</h3>
+        <p className="text-[11px] text-gray-400 mb-3">Sends each PDF to a cloud parser — free native-text extraction, with OCR for scanned pages. Costs a little per scanned document.</p>
 
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
@@ -2131,35 +2155,53 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
-            {!isRunning && hasDB && total != null && total > 0 && (
+            {hasDB && describable > 0 && !isRunning && (
+              <div className="mt-3 h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
+              </div>
+            )}
+
+            {hasDB && describable > 0 && !isRunning && model && (
               <div className="mt-3">
-                <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
-                </div>
-                <p className="text-[10px] text-gray-400 mt-1">{pct}% extracted</p>
+                <p className="text-[11px] text-gray-400">Model: {model}</p>
               </div>
             )}
           </div>
 
-          <button onClick={launch} disabled={buttonDisabled}
-            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
-            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
-            <RefreshIcon />
-            {isRunning ? "Extracting…" : buttonLabel}
-          </button>
+          {isRunning ? (
+            <button onClick={stop} disabled={stopping || !j.jobId}
+              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background: '#b91c1c'}}>
+              {stopping ? "Stopping…" : "Stop"}
+            </button>
+          ) : (
+            <div className="shrink-0 flex flex-col items-end gap-1">
+              <button onClick={launch} disabled={buttonDisabled}
+                className="flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+                style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
+                <RefreshIcon />
+                {buttonLabel}
+              </button>
+              {hasKey && actionCount > 0 && (
+                <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
+              )}
+            </div>
+          )}
         </div>
 
-        {j.error && (
-          <p className="text-sm text-red-500 mt-3">{j.error}</p>
-        )}
+        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
 
         {isRunning && (
           <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
-            {progress ? (
+            {progress ? (() => {
+              const liveTotal = (progress.baseline || 0) + (progress.extracted || 0);
+              const grandTotal = progress.total || 0;
+              const pct = grandTotal > 0 ? Math.min(100, Math.round((liveTotal / grandTotal) * 100)) : 0;
+              return (
               <>
                 <div className="flex items-baseline justify-between text-xs mb-2">
                   <span className="font-semibold text-gray-900">
-                    {progress.done.toLocaleString()} / {(progress.pending || 0).toLocaleString()} documents
+                    {liveTotal.toLocaleString()} / {grandTotal.toLocaleString()} extracted
                   </span>
                   <span className="text-gray-500">
                     {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)} docs/s` : ""}
@@ -2167,61 +2209,62 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
                   </span>
                 </div>
                 <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
-                  <div className="h-full rounded-full transition-all duration-500" style={{
-                    width: `${Math.min(100, Math.round((progress.done / Math.max(progress.pending, 1)) * 100))}%`,
-                    background:'#25D366',
-                  }}></div>
+                  <div className="h-full rounded-full transition-all duration-500" style={{width: `${pct}%`, background:'#25D366'}}></div>
                 </div>
                 <div className="grid grid-cols-4 gap-2 mt-3 text-[11px] text-gray-600">
-                  <div title="PDFs whose text was extracted (PDFKit native and/or Vision OCR) and persisted to wa_document_text.">
-                    <span className="font-semibold text-gray-900">{progress.extracted.toLocaleString()}</span> extracted
-                  </div>
-                  <div title="PDFs that opened but had no recoverable text — image-only PDFs whose OCR also returned blank.">
-                    <span className="font-semibold text-gray-900">{(progress.empty || 0).toLocaleString()}</span> empty
-                  </div>
-                  <div title="Document referenced in DB but the file isn't in the iOS backup.">
-                    <span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing
-                  </div>
-                  <div title="Decrypt / write / PDFKit failure. Run with --retry-errors to re-attempt.">
-                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
-                  </div>
+                  <div title="PDFs extracted this run (this session)."><span className="font-semibold text-gray-900">{(progress.extracted||0).toLocaleString()}</span> this run</div>
+                  <div title="PDFs that parsed cleanly but had no recoverable text."><span className="font-semibold text-gray-900">{(progress.empty||0).toLocaleString()}</span> empty</div>
+                  <div title="Spend so far this run, reported by OpenRouter."><span className="font-semibold text-gray-900">${(progress.cost_usd||0).toFixed(4)}</span> spent</div>
+                  <div title="PDFs that failed this run (auto-retried next run)."><span className="font-semibold text-gray-900">{(progress.errors||0).toLocaleString()}</span> errors</div>
                 </div>
-                {progress.unsupported > 0 && (
-                  <p className="text-[10px] text-gray-400 mt-2">
-                    {progress.unsupported.toLocaleString()} non-PDF skipped (xlsx/docx/etc. — filenames remain searchable via wa_document).
-                  </p>
-                )}
-                {progress.current_label && (
-                  <p className="text-[10px] text-gray-400 mt-1 font-mono truncate">
-                    Now: {progress.current_label}
-                  </p>
+                {progress.errors > 0 && (
+                  <div className="mt-2">
+                    <button onClick={() => setShowIssues(true)}
+                      className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
+                      View {progress.errors.toLocaleString()} error{progress.errors === 1 ? "" : "s"}
+                    </button>
+                  </div>
                 )}
               </>
-            ) : (
+              );
+            })() : (
               <p className="text-xs text-gray-500">Preparing…</p>
             )}
             {j.lines && j.lines.length > 0 && (
-              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
-                {j.lines[j.lines.length - 1]}
-              </p>
+              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">{j.lines[j.lines.length - 1]}</p>
             )}
           </div>
         )}
 
         {hasDone && j.done === true && !isRunning && (
-          <p className="text-xs text-gray-500 mt-3">✓ Extraction complete. Agent queries can now MATCH on document body text.</p>
+          extracted > 0
+            ? <p className="text-xs text-gray-500 mt-3">✓ Done. Documents are now searchable by their text.</p>
+            : <p className="text-xs text-gray-500 mt-3">Nothing to extract — no downloaded PDFs were found. Run a messages sync to download documents first.</p>
         )}
       </div>
 
-
-      {prompting && (
-        <PasswordPromptModal
-          device={{ name: "the latest iPhone backup" }}
-          onConfirm={(pw, remember) => { setPrompting(false); onDocumentIndex(pw, remember); }}
-          onCancel={() => setPrompting(false)}
-          confirmLabel="Sync documents"
+      {showKey && (
+        <OpenRouterKeyModal
+          onClose={() => setShowKey(false)}
+          onSaved={() => {
+            setShowKey(false);
+            reloadStatus();
+            if (keyModalMode === "run") proceed(pendingRun || {});
+          }}
         />
       )}
+
+      {showConfirm && (
+        <ConfirmModal
+          title="Re-extract all documents?"
+          body={`This re-runs the parser on all ${describable.toLocaleString()} PDFs on disk, overwriting existing text. Estimated cost ≈ $${(describable * DOC_COST_PER_DOC).toFixed(2)}.`}
+          confirmLabel="Re-extract all"
+          onConfirm={() => { setShowConfirm(false); beginRun({ force: true }); }}
+          onCancel={() => setShowConfirm(false)}
+        />
+      )}
+
+      {showIssues && <MediaIssuesModal endpoint="/api/database/document-index/issues" onClose={() => setShowIssues(false)} />}
     </section>
   );
 }
@@ -3023,9 +3066,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── start document extraction (document-index) ────────────────────────
-  // Same shape as startVoiceIndex / startMediaDescribe but with no
-  // model-required precondition (PDFKit + Vision are first-party).
-  const startDocumentIndex = async (password, remember) => {
+  // Cloud extract over the PDFs downloaded during the messages sync. Same
+  // shape as startVoiceIndex: API-key gated, no backup password.
+  const startDocumentIndex = async (opts) => {
     const key = "db:document-index";
     patchJob(key, {
       running: true, done: null,
@@ -3034,7 +3077,13 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       startedAt: new Date().toISOString(), error: "",
     });
     try {
-      const { job_id } = await api.post("/api/database/document-index", { password, remember: !!remember });
+      const { job_id } = await api.post("/api/database/document-index", {
+        model: (opts && opts.model) || "",
+        concurrency: (opts && opts.concurrency) || 0,
+        force: !!(opts && opts.force),
+        retry_errors: !!(opts && opts.retryErrors),
+      });
+      patchJob(key, { jobId: job_id });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });

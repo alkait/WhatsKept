@@ -1,65 +1,57 @@
 package postprocess
 
+// WhatsApp PDF documents, in two phases mirroring the voice pipeline
+// (voice.go):
+//
+//   1. DownloadDocument — decrypt every WhatsApp PDF from the iOS backup
+//      into <workspace>/documents/<rowid>.pdf. The only step that needs
+//      the backup password; run as part of SyncMessages. Non-PDF
+//      documents (xlsx/docx/…) are parked as 'unsupported' without any
+//      decrypt — there's no extractor for them yet; their filenames stay
+//      searchable via wa_document (rebuilt by views.sql every sync).
+//   2. DocumentIndex — extract every 'downloaded' PDF's text via the
+//      cloud (OpenRouter's file-parser plugin: free pdf-text for the
+//      native layer, mistral-ocr for scanned pages), persisting the body
+//      in wa_document_text and flipping the row to 'extracted'. No
+//      password — a pure consumer of documents/. Needs an OpenRouter key.
+//
+// Both are resumable per-row. This replaces the previous macOS-only path
+// (Apple PDFKit + Vision OCR via a bundled Swift helper); the cloud path
+// is a pure in-process HTTP client, so it works on macOS, Windows, and
+// Linux. See document_cloud.go for the extractor.
+
 import (
-	"bufio"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"whatskept/internal/backup"
 )
 
-// This file owns one user-visible operation:
-//
-//   `whatskept document-index` (CLI) / "Sync documents" (GUI):
-//   walk every WhatsApp PDF document in ChatStorage.sqlite, decrypt
-//   the PDF from the iOS backup, extract its body text via Apple
-//   PDFKit (with a Vision OCR fallback per scanned page), and
-//   persist the results in wa_document_text + document_index.
-//
-// Pipeline per document (PDF only — see "Why PDF only" below):
-//
-//   1. Look up the manifest record by ZMEDIALOCALPATH (with the
-//      "Message/" prefix all WhatsApp media uses).
-//   2. Decrypt to memory. WhatsApp PDFs are small in the median
-//      case (716 KB) and bounded at ~45 MB; no streaming needed.
-//   3. Sniff "%PDF-" magic. Anything else is recorded as 'error'
-//      rather than handed to PDFKit (which would fail with a
-//      generic "could not open document" message).
-//   4. Write to <Workspace>/documents/<rowid>.pdf atomically.
-//   5. Invoke the bundled Swift helper with {kind:"pdf", path:…}.
-//      The helper does the actual PDFKit-then-OCR work and returns
-//      {text, page_count, pages_with_text, pages_ocr, method}.
-//   6. Atomic two-table commit: wa_document_text (the body text)
-//      and document_index (terminal state for resume).
-//   7. After the loop, rebuild messages_fts so the new text is
-//      MATCHable.
-//
-// Why PDF only? Roughly 84% of WhatsApp documents in a heavy user's
-// corpus are PDFs; xlsx/docx/etc. are a long tail and need different
-// extractors (textutil / unzip+XPath). We park those as status=
-// 'unsupported' so resume logic is cheap and a future expansion
-// only has to flip the status check, not redo the indexer's bones.
-// See wa_document for the bare filename FTS coverage of the
-// long tail (which views.sql rebuilds on every sync).
-
 const (
 	// Status values stored in document_index.status. See
-	// createDocumentSidecarsSQL for the closed set.
+	// createDocumentSidecarsSQL for the closed set and the full notes.
 	DocumentStatusExtracted      = "extracted"
 	DocumentStatusExtractedEmpty = "extracted_empty"
 	DocumentStatusMissing        = "missing"
 	DocumentStatusUnsupported    = "unsupported"
 	DocumentStatusError          = "error"
+
+	// DocumentStatusDownloaded means the PDF is on disk at
+	// <Workspace>/documents/<rowid>.pdf but not yet extracted — the resting
+	// state between the (password-gated) download and the cloud extract. A
+	// per-doc extract failure keeps this status and records the reason in
+	// extract_error, so the download step never re-downloads a file that's
+	// already on disk.
+	DocumentStatusDownloaded = "downloaded"
 
 	// All WhatsApp ChatStorage references to media files (including
 	// document attachments) are relative paths under Message/ in the
@@ -67,53 +59,47 @@ const (
 	documentManifestPrefix = "Message/"
 )
 
-// DocumentIndexOptions configures one DocumentIndex run. Mirrors
-// MediaIndexOptions / VoiceIndexOptions for cross-call symmetry —
-// see media.go for the shared field semantics.
+// docExtExpr is the SUBSTR-after-last-dot idiom matching wa_document.ext in
+// views.sql; keeping the two in lockstep avoids an "extension differs between
+// FTS and indexer" drift bug. Yields a lowercase extension ('' if none).
+const docExtExpr = `LOWER(CASE
+		         WHEN mi.ZMEDIALOCALPATH IS NULL OR INSTR(mi.ZMEDIALOCALPATH, '.') = 0 THEN ''
+		         ELSE SUBSTR(
+		           mi.ZMEDIALOCALPATH,
+		           LENGTH(RTRIM(mi.ZMEDIALOCALPATH, REPLACE(mi.ZMEDIALOCALPATH, '.', ''))) + 1
+		         )
+		       END)`
+
+// DocumentIndexOptions configures a document download or extract run.
+// Mirrors VoiceIndexOptions; see voice.go / media.go for shared semantics.
 type DocumentIndexOptions struct {
-	// Workspace is the directory containing ChatStorage.sqlite.
-	// Decrypted PDFs land in <Workspace>/documents/<rowid>.pdf.
 	Workspace string
 
-	// BackupPath / BackupRoot — optional override and search root
-	// for backup discovery; identical semantics to MediaIndex.
+	// Download-phase fields (decrypt from the encrypted backup).
 	BackupPath string
 	BackupRoot string
+	Password   string
 
-	// Password to unlock the encrypted backup. Required.
-	Password string
+	// Extract-phase fields (cloud). Engine must be empty or SourceCloud.
+	Engine string
+	APIKey string
+	Model  string
 
-	// Limit caps the number of rows attempted in this run. 0 =
-	// unlimited.
+	// Limit caps rows attempted this run (0 = unlimited).
 	Limit int
 
-	// RetryMissing / RetryErrors — re-attempt rows previously
-	// marked terminal. Same semantics as media-index. Note that
-	// 'unsupported' rows are always skipped (no retry flag) — we
-	// don't have an extractor for them yet, so attempting again
-	// would just produce the same result.
+	// RetryMissing / RetryErrors re-attempt terminal rows.
 	RetryMissing bool
 	RetryErrors  bool
 
-	// MaxOCRPages / RenderScale override the Swift helper's PDF
-	// tunables (WHATSKEPT_PDF_MAX_OCR_PAGES / _RENDER_SCALE). Zero
-	// means "use helper default" (100 pages / 2.0× scale).
-	MaxOCRPages int
-	RenderScale float32
+	// Concurrency caps in-flight extract calls (0 = sensible default).
+	Concurrency int
 
-	// Ctx is checked between rows for graceful cancellation. Same
-	// rules as the other indexers: closing the helper's stdin
-	// causes it to exit cleanly; the current row's commit either
-	// finishes or rolls back.
-	Ctx context.Context
+	// Force re-extracts every on-disk PDF, overwriting existing rows.
+	Force bool
 
-	// Log receives one-line human-readable progress lines.
-	Log func(string)
-
-	// Progress receives a structured update every ProgressEvery
-	// rows. ProgressEvery=0 → default of 5 rows (documents are slow
-	// enough that batching makes the UI feel sluggish; not as slow
-	// as voice though, so 5 strikes the balance).
+	Ctx           context.Context
+	Log           func(string)
 	Progress      func(DocumentIndexProgress)
 	ProgressEvery int
 }
@@ -123,7 +109,9 @@ type DocumentIndexProgress struct {
 	Done         int     `json:"done"`        // processed this run (any status)
 	Total        int     `json:"total"`       // total candidates ever
 	Pending      int     `json:"pending"`     // queued for this run
-	Extracted    int     `json:"extracted"`   // text recovered (any text >0 chars)
+	Baseline     int     `json:"baseline"`    // already done before this run
+	Downloaded   int     `json:"downloaded"`  // decrypted this run (download phase)
+	Extracted    int     `json:"extracted"`   // text recovered this run
 	Empty        int     `json:"empty"`       // ran cleanly but no text
 	Missing      int     `json:"missing"`     // file absent in backup
 	Errors       int     `json:"errors"`      // failures this run
@@ -134,220 +122,36 @@ type DocumentIndexProgress struct {
 	RatePerSec   float64 `json:"rate_per_sec"`
 	ETASeconds   float64 `json:"eta_seconds"`
 	ElapsedSec   float64 `json:"elapsed_sec"`
+	CostUSD      float64 `json:"cost_usd"`
 }
 
 // DocumentIndexResult is the final stats summary.
 type DocumentIndexResult struct {
-	BackupPath       string  `json:"backup_path"`
-	Workspace        string  `json:"workspace"`
-	TotalCandidates  int     `json:"total_candidates"`
-	AlreadyExtracted int     `json:"already_extracted"`
-	Processed        int     `json:"processed"`
-	Extracted        int     `json:"extracted"`
-	Empty            int     `json:"empty"`
-	Missing          int     `json:"missing"`
-	Errors           int     `json:"errors"`
-	Unsupported      int     `json:"unsupported"`
-	PagesText        int     `json:"pages_text"`
-	PagesOCR         int     `json:"pages_ocr"`
-	DurationSec      float64 `json:"duration_sec"`
-	FTSCountAfter    int     `json:"fts_count_after"`
-	Cancelled        bool    `json:"cancelled,omitempty"`
+	BackupPath        string  `json:"backup_path"`
+	Workspace         string  `json:"workspace"`
+	TotalCandidates   int     `json:"total_candidates"`
+	AlreadyExtracted  int     `json:"already_extracted"`
+	AlreadyDownloaded int     `json:"already_downloaded"`
+	Processed         int     `json:"processed"`
+	Downloaded        int     `json:"downloaded"`
+	Extracted         int     `json:"extracted"`
+	Empty             int     `json:"empty"`
+	Missing           int     `json:"missing"`
+	Errors            int     `json:"errors"`
+	Unsupported       int     `json:"unsupported"`
+	PagesText         int     `json:"pages_text"`
+	PagesOCR          int     `json:"pages_ocr"`
+	DurationSec       float64 `json:"duration_sec"`
+	FTSCountAfter     int     `json:"fts_count_after"`
+	CostUSD           float64 `json:"cost_usd,omitempty"`
+	Cancelled         bool    `json:"cancelled,omitempty"`
 }
 
-// DocumentIndex runs the full PDF-extraction pipeline against the
-// workspace. See file-level comment for the full design notes.
-func DocumentIndex(opts DocumentIndexOptions) (*DocumentIndexResult, error) {
-	if opts.Workspace == "" {
-		return nil, errors.New("document-index: Workspace required")
-	}
-	if opts.Password == "" {
-		return nil, errors.New("document-index: Password required for encrypted backups")
-	}
-	if opts.Ctx == nil {
-		opts.Ctx = context.Background()
-	}
-	if opts.Log == nil {
-		opts.Log = func(string) {}
-	}
-	if opts.ProgressEvery <= 0 {
-		opts.ProgressEvery = 5
-	}
-
-	dbPath := filepath.Join(opts.Workspace, "ChatStorage.sqlite")
-	docDir := filepath.Join(opts.Workspace, "documents")
-	if err := os.MkdirAll(docDir, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir documents dir: %w", err)
-	}
-
-	// --- Open DB + ensure schema --------------------------------
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open db: %w", err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(createDocumentSidecarsSQL); err != nil {
-		return nil, fmt.Errorf("create document sidecar tables: %w", err)
-	}
-
-	// --- Locate and unlock the backup ---------------------------
-	info, err := pickDocumentIndexBackup(opts)
-	if err != nil {
-		return nil, err
-	}
-	if !info.IsEncrypted {
-		return nil, errors.New("document-index: backup is not encrypted (whatskept document-index requires an encrypted backup)")
-	}
-	opts.Log(fmt.Sprintf("Backup: %s", info.Path))
-	opts.Log("Unlocking iOS backup…")
-	bundle, err := backup.Open(info, opts.Password)
-	if err != nil {
-		return nil, fmt.Errorf("open backup: %w", err)
-	}
-
-	opts.Log("Indexing backup manifest…")
-	manifestIdx := buildManifestIndex(bundle, backup.WhatsAppDomain)
-
-	// --- Pick candidates ---------------------------------------
-	total, already, err := countDocumentCandidates(db)
-	if err != nil {
-		return nil, err
-	}
-	candidates, err := selectDocumentCandidates(db, opts.RetryMissing, opts.RetryErrors, opts.Limit)
-	if err != nil {
-		return nil, err
-	}
-	if len(candidates) == 0 {
-		opts.Log(fmt.Sprintf("Nothing to do: %d / %d already extracted.", already, total))
-		ftsN, _ := rebuildFTS(db)
-		return &DocumentIndexResult{
-			BackupPath:       info.Path,
-			Workspace:        opts.Workspace,
-			TotalCandidates:  total,
-			AlreadyExtracted: already,
-			FTSCountAfter:    ftsN,
-		}, nil
-	}
-	opts.Log(fmt.Sprintf("Documents on device:      %d", total))
-	opts.Log(fmt.Sprintf("Already extracted:        %d", already))
-	opts.Log(fmt.Sprintf("Queued this run:          %d", len(candidates)))
-
-	// --- Start the Swift PDF worker -----------------------------
-	helperPath, err := resolveVisionHelper()
-	if err != nil {
-		return nil, fmt.Errorf("locate vision helper: %w", err)
-	}
-	worker, err := startPDFWorker(opts.Ctx, helperPath, opts.MaxOCRPages, opts.RenderScale)
-	if err != nil {
-		return nil, fmt.Errorf("start vision helper: %w", err)
-	}
-	defer worker.Close()
-
-	// --- Main loop ---------------------------------------------
-	res := &DocumentIndexResult{
-		BackupPath:       info.Path,
-		Workspace:        opts.Workspace,
-		TotalCandidates:  total,
-		AlreadyExtracted: already,
-	}
-	tStart := time.Now()
-
-	for i, c := range candidates {
-		select {
-		case <-opts.Ctx.Done():
-			res.Cancelled = true
-			opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
-			res.DurationSec = time.Since(tStart).Seconds()
-			return res, nil
-		default:
-		}
-
-		status, pagesText, pagesOCR := processOneDocument(db, bundle, manifestIdx, worker, docDir, c, opts.Log)
-		res.Processed++
-		switch status {
-		case DocumentStatusExtracted:
-			res.Extracted++
-			res.PagesText += pagesText
-			res.PagesOCR += pagesOCR
-		case DocumentStatusExtractedEmpty:
-			res.Empty++
-		case DocumentStatusMissing:
-			res.Missing++
-		case DocumentStatusUnsupported:
-			res.Unsupported++
-		case DocumentStatusError:
-			res.Errors++
-		}
-
-		if opts.Progress != nil && (i+1)%opts.ProgressEvery == 0 {
-			emitDocumentProgress(opts.Progress, res, total, already, len(candidates), tStart, c)
-		}
-	}
-
-	res.DurationSec = time.Since(tStart).Seconds()
-	if opts.Progress != nil {
-		emitDocumentProgress(opts.Progress, res, total, already, len(candidates), tStart, documentCandidate{})
-	}
-
-	opts.Log(fmt.Sprintf(
-		"Done in %.0fs. extracted=%d empty=%d missing=%d errors=%d unsupported=%d (rate %.1f/s)",
-		res.DurationSec, res.Extracted, res.Empty, res.Missing, res.Errors, res.Unsupported,
-		float64(res.Processed)/maxF(res.DurationSec, 0.001),
-	))
-
-	// Rebuild FTS so the new wa_document_text rows become searchable.
-	opts.Log("Rebuilding messages_fts…")
-	ftsN, err := rebuildFTS(db)
-	if err != nil {
-		opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
-	} else {
-		res.FTSCountAfter = ftsN
-		opts.Log(fmt.Sprintf("messages_fts: %d rows indexed.", ftsN))
-	}
-
-	return res, nil
-}
-
-// pickDocumentIndexBackup honours opts.BackupPath if set, otherwise
-// picks the most-recent encrypted backup under opts.BackupRoot.
-// Mirrors pickMediaIndexBackup / pickVoiceIndexBackup; kept separate
-// so future divergence in any path doesn't force an awkward refactor.
-func pickDocumentIndexBackup(opts DocumentIndexOptions) (backup.Info, error) {
-	if opts.BackupPath != "" {
-		info, err := backup.LoadInfo(opts.BackupPath)
-		if err != nil {
-			return backup.Info{}, fmt.Errorf("load backup %s: %w", opts.BackupPath, err)
-		}
-		return *info, nil
-	}
-	root := opts.BackupRoot
-	if root == "" {
-		root = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "MobileSync", "Backup")
-	}
-	infos, err := backup.Discover(root)
-	if err != nil {
-		return backup.Info{}, fmt.Errorf("discover backups: %w", err)
-	}
-	var encrypted []backup.Info
-	for _, b := range infos {
-		if b.IsEncrypted {
-			encrypted = append(encrypted, b)
-		}
-	}
-	if len(encrypted) == 0 {
-		return backup.Info{}, fmt.Errorf("no encrypted backups under %s", root)
-	}
-	sort.SliceStable(encrypted, func(i, j int) bool {
-		return encrypted[i].LastBackup.After(encrypted[j].LastBackup)
-	})
-	return encrypted[0], nil
-}
-
-// documentCandidate is one row we'll attempt to extract.
+// documentCandidate is one document row.
 type documentCandidate struct {
 	rowid        int64
 	manifestPath string // 'Message/Media/.../foo.pdf'
-	filename     string // ZWAMEDIAITEM.ZAUTHORNAME (the sender-supplied original name)
+	filename     string // ZWAMEDIAITEM.ZAUTHORNAME (sender-supplied name)
 	ext          string // lowercase extension parsed from the manifest path
 }
 
@@ -361,16 +165,25 @@ func (c documentCandidate) label() string {
 	return fmt.Sprintf("rowid=%d", c.rowid)
 }
 
-// countDocumentCandidates returns (total_document_messages,
-// already_extracted). "Total" counts all ZMESSAGETYPE=8 rows
-// regardless of extension — the GUI's progress gauge uses this as
-// the denominator so the user sees "1,558 / 1,930" rather than
-// pretending the long tail doesn't exist.
+// documentOneResult is downloadOneDocument/extractOneDocument's outcome.
+type documentOneResult struct {
+	status    string
+	pagesText int
+	pagesOCR  int
+	withText  bool
+	fatal     error
+}
+
+// pickDocumentIndexBackup honours opts.BackupPath if set, otherwise picks
+// the most-recent encrypted backup under opts.BackupRoot.
+func pickDocumentIndexBackup(opts DocumentIndexOptions) (backup.Info, error) {
+	return pickMediaIndexBackup(MediaIndexOptions{BackupPath: opts.BackupPath, BackupRoot: opts.BackupRoot})
+}
+
+// countDocumentCandidates returns (total_document_messages, already_extracted).
+// "Total" counts all ZMESSAGETYPE=8 rows with a manifest path regardless of
+// extension — the GUI gauge uses this as the denominator.
 func countDocumentCandidates(db *sql.DB) (total, already int, err error) {
-	// Rows with NULL ZMEDIALOCALPATH are unreachable (no manifest path
-	// to decrypt) and excluded from the addressable total. The GUI
-	// gauge denominator (document_pdf_total) already matches this
-	// filter via the wa_document view.
 	if err = db.QueryRow(
 		`SELECT COUNT(*)
 		 FROM ZWAMESSAGE m
@@ -381,25 +194,64 @@ func countDocumentCandidates(db *sql.DB) (total, already int, err error) {
 		return 0, 0, fmt.Errorf("count total: %w", err)
 	}
 	if err = db.QueryRow(
-		`SELECT COUNT(*) FROM document_index WHERE status = ?`,
-		DocumentStatusExtracted,
+		`SELECT COUNT(*) FROM document_index WHERE status = ?`, DocumentStatusExtracted,
 	).Scan(&already); err != nil {
 		return 0, 0, fmt.Errorf("count extracted: %w", err)
 	}
 	return total, already, nil
 }
 
-// selectDocumentCandidates is the resume query. Rows already in
-// document_index with a "skip" status are excluded. 'unsupported'
-// is always skipped (re-attempting it with no extractor change
-// just produces the same result), but the user can flush it via
-// `DELETE FROM document_index WHERE status='unsupported'` if a
-// future build adds support.
-func selectDocumentCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int) ([]documentCandidate, error) {
+// countDocumentDownloaded returns how many PDFs are on disk — rows
+// 'downloaded' (awaiting extract) or terminal-but-present ('extracted' /
+// 'extracted_empty').
+func countDocumentDownloaded(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM document_index WHERE status IN (?, ?, ?)`,
+		DocumentStatusDownloaded, DocumentStatusExtracted, DocumentStatusExtractedEmpty,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count downloaded: %w", err)
+	}
+	return n, nil
+}
+
+// CountDocumentExtractPending returns on-disk PDFs a normal extract run (no
+// force, no retry) would queue: fresh 'downloaded' rows with no prior
+// extract_error. Mirrors selectDocumentExtractCandidates' non-force predicate
+// so the UI can gate "Resume" on real work.
+func CountDocumentExtractPending(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM document_index WHERE status = ? AND extract_error IS NULL`,
+		DocumentStatusDownloaded,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count document extract pending: %w", err)
+	}
+	return n, nil
+}
+
+// CountDocumentExtractFailed returns on-disk PDFs that failed a previous
+// extract attempt (extract_error set, row still 'downloaded'). A normal run
+// skips these; only "Retry failures" (retryErrors) re-attempts.
+func CountDocumentExtractFailed(db *sql.DB) (int, error) {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM document_index WHERE status = ? AND extract_error IS NOT NULL`,
+		DocumentStatusDownloaded,
+	).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count document extract failed: %w", err)
+	}
+	return n, nil
+}
+
+// selectDocumentDownloadCandidates: every document message whose row isn't
+// already in a skip status. 'downloaded'/'extracted'/'extracted_empty'/
+// 'unsupported' skipped; 'missing'/'error' skipped unless the retry flag is
+// set. Non-PDFs reach downloadOneDocument and are parked 'unsupported'.
+func selectDocumentDownloadCandidates(db *sql.DB, retryMissing, retryErrors bool, limit int) ([]documentCandidate, error) {
 	skip := []any{
-		DocumentStatusExtracted,
-		DocumentStatusExtractedEmpty,
-		DocumentStatusUnsupported,
+		DocumentStatusDownloaded, DocumentStatusExtracted,
+		DocumentStatusExtractedEmpty, DocumentStatusUnsupported,
 	}
 	if !retryMissing {
 		skip = append(skip, DocumentStatusMissing)
@@ -407,47 +259,50 @@ func selectDocumentCandidates(db *sql.DB, retryMissing, retryErrors bool, limit 
 	if !retryErrors {
 		skip = append(skip, DocumentStatusError)
 	}
-	placeholders := make([]byte, 0, len(skip)*2)
-	for i := range skip {
-		if i > 0 {
-			placeholders = append(placeholders, ',')
-		}
-		placeholders = append(placeholders, '?')
-	}
+	where := fmt.Sprintf(
+		"m.ZMESSAGETYPE = 8 AND mi.ZMEDIALOCALPATH IS NOT NULL"+
+			"\n\t\t  AND m.Z_PK NOT IN (SELECT rowid FROM document_index WHERE status IN (%s))",
+		placeholders(len(skip)))
+	return queryDocumentCandidates(db, where, skip, limit)
+}
 
-	// The SUBSTR-after-last-dot idiom matches the one in views.sql
-	// for wa_document.ext; keeping the two in lockstep avoids a
-	// subtle "extension differs between FTS and indexer" drift bug.
+// selectDocumentExtractCandidates: 'downloaded' rows not yet extracted
+// (extract_error skipped unless retryErrors). With force, every on-disk PDF
+// ('downloaded'/'extracted'/'extracted_empty') is re-extracted.
+func selectDocumentExtractCandidates(db *sql.DB, retryErrors, force bool, limit int) ([]documentCandidate, error) {
+	var sub string
+	if force {
+		sub = "SELECT rowid FROM document_index WHERE status IN ('" +
+			DocumentStatusDownloaded + "','" + DocumentStatusExtracted + "','" + DocumentStatusExtractedEmpty + "')"
+	} else {
+		ready := "status = '" + DocumentStatusDownloaded + "'"
+		if !retryErrors {
+			ready += " AND extract_error IS NULL"
+		}
+		sub = "SELECT rowid FROM document_index WHERE " + ready
+	}
+	where := "m.ZMESSAGETYPE = 8 AND mi.ZMEDIALOCALPATH IS NOT NULL\n\t\t  AND m.Z_PK IN (" + sub + ")"
+	return queryDocumentCandidates(db, where, nil, limit)
+}
+
+func queryDocumentCandidates(db *sql.DB, whereClause string, args []any, limit int) ([]documentCandidate, error) {
 	q := fmt.Sprintf(`
 		SELECT m.Z_PK,
 		       '%s' || mi.ZMEDIALOCALPATH,
 		       COALESCE(mi.ZAUTHORNAME, ''),
-		       LOWER(CASE
-		         WHEN mi.ZMEDIALOCALPATH IS NULL OR INSTR(mi.ZMEDIALOCALPATH, '.') = 0 THEN ''
-		         ELSE SUBSTR(
-		           mi.ZMEDIALOCALPATH,
-		           LENGTH(RTRIM(mi.ZMEDIALOCALPATH, REPLACE(mi.ZMEDIALOCALPATH, '.', ''))) + 1
-		         )
-		       END)
+		       %s
 		FROM   ZWAMESSAGE   m
 		JOIN   ZWAMEDIAITEM mi ON mi.ZMESSAGE = m.Z_PK
-		WHERE  m.ZMESSAGETYPE = 8
-		  AND  mi.ZMEDIALOCALPATH IS NOT NULL
-		  AND  m.Z_PK NOT IN (
-		         SELECT rowid FROM document_index WHERE status IN (%s)
-		       )
-		ORDER BY m.Z_PK ASC`,
-		documentManifestPrefix, string(placeholders))
+		WHERE  %s
+		ORDER BY m.Z_PK ASC`, documentManifestPrefix, docExtExpr, whereClause)
 	if limit > 0 {
 		q += fmt.Sprintf("\n\t\tLIMIT %d", limit)
 	}
-
-	rows, err := db.Query(q, skip...)
+	rows, err := db.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("select document candidates: %w", err)
 	}
 	defer rows.Close()
-
 	var out []documentCandidate
 	for rows.Next() {
 		var c documentCandidate
@@ -456,173 +311,548 @@ func selectDocumentCandidates(db *sql.DB, retryMissing, retryErrors bool, limit 
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
-// processOneDocument runs the full decrypt → write → extract →
-// commit pipeline for one candidate. Returns
-// (status, pages_with_text, pages_ocr) — non-Extracted statuses
-// return (status, 0, 0).
-//
-// Per-row commit means a SIGINT mid-loop is safe.
-func processOneDocument(
+// ---- Download phase --------------------------------------------------
+
+// DownloadDocument decrypts every WhatsApp PDF into <ws>/documents/.
+func DownloadDocument(opts DocumentIndexOptions) (*DocumentIndexResult, error) {
+	if opts.Workspace == "" {
+		return nil, errors.New("document-download: Workspace required")
+	}
+	if opts.Password == "" {
+		return nil, errors.New("document-download: Password required for encrypted backups")
+	}
+	defDocOpts(&opts, 25)
+
+	db, docDir, err := openDocumentDB(opts.Workspace)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+
+	info, err := pickDocumentIndexBackup(opts)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsEncrypted {
+		return nil, errors.New("document-download: backup is not encrypted")
+	}
+	opts.Log(fmt.Sprintf("Backup: %s", info.Path))
+	opts.Log("Unlocking iOS backup…")
+	bundle, err := backup.Open(info, opts.Password)
+	if err != nil {
+		return nil, fmt.Errorf("open backup: %w", err)
+	}
+	res := &DocumentIndexResult{BackupPath: info.Path, Workspace: opts.Workspace}
+	if err := downloadDocumentWithBundle(opts, db, bundle, docDir, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// downloadDocumentDuringSync pulls PDFs as a step of SyncMessages, reusing the
+// already-open backup bundle. Fail-soft.
+func downloadDocumentDuringSync(bundle *backup.Bundle, workspace, dbPath string, log func(string)) (*DocumentIndexResult, error) {
+	docDir := filepath.Join(workspace, "documents")
+	if err := os.MkdirAll(docDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir documents dir: %w", err)
+	}
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open db: %w", err)
+	}
+	defer db.Close()
+	if err := ensureDocumentSidecarSchema(db); err != nil {
+		return nil, err
+	}
+	opts := DocumentIndexOptions{
+		Workspace:     workspace,
+		Ctx:           context.Background(),
+		Log:           log,
+		ProgressEvery: 200,
+		Progress: func(p DocumentIndexProgress) {
+			log(fmt.Sprintf("Downloading documents… %d / %d", p.Done, p.Pending))
+		},
+	}
+	res := &DocumentIndexResult{Workspace: workspace}
+	if err := downloadDocumentWithBundle(opts, db, bundle, docDir, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+func downloadDocumentWithBundle(opts DocumentIndexOptions, db *sql.DB, bundle *backup.Bundle, docDir string, res *DocumentIndexResult) error {
+	manifestIdx := buildManifestIndex(bundle, backup.WhatsAppDomain)
+	total, _, err := countDocumentCandidates(db)
+	if err != nil {
+		return err
+	}
+	alreadyDownloaded, err := countDocumentDownloaded(db)
+	if err != nil {
+		return err
+	}
+	candidates, err := selectDocumentDownloadCandidates(db, opts.RetryMissing, opts.RetryErrors, opts.Limit)
+	if err != nil {
+		return err
+	}
+	res.TotalCandidates = total
+	res.AlreadyDownloaded = alreadyDownloaded
+	if len(candidates) == 0 {
+		opts.Log(fmt.Sprintf("Documents: %d / %d already on disk; nothing to download.", alreadyDownloaded, total))
+		return nil
+	}
+	opts.Log(fmt.Sprintf("Documents on device: %d · on disk: %d · to download: %d",
+		total, alreadyDownloaded, len(candidates)))
+
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = defaultDownloadConcurrency
+	}
+	var decryptMu sync.Mutex
+	process := func(ctx context.Context, c documentCandidate) documentOneResult {
+		return downloadOneDocument(ctx, db, bundle, &decryptMu, manifestIdx, docDir, c)
+	}
+	_ = runDocumentPipeline(opts, res, db, candidates, total, alreadyDownloaded, concurrency, nil, false, process)
+	opts.Log(fmt.Sprintf("Downloaded %d documents (%d missing, %d errors, %d non-PDF) in %.0fs.",
+		res.Downloaded, res.Missing, res.Errors, res.Unsupported, res.DurationSec))
+	return nil
+}
+
+// downloadOneDocument decrypts one PDF, sanity-checks the %PDF- magic, writes
+// it atomically, and records the outcome in document_index. Non-PDFs are
+// parked 'unsupported' without any decrypt. Safe for the pool: decrypt is
+// serialised behind decryptMu.
+func downloadOneDocument(
+	ctx context.Context,
 	db *sql.DB,
 	bundle *backup.Bundle,
+	decryptMu *sync.Mutex,
 	manifestIdx map[string]*backup.Record,
-	worker *pdfWorker,
 	docDir string,
 	c documentCandidate,
-	log func(string),
-) (string, int, int) {
+) documentOneResult {
 	now := nowUTC()
-
-	// Long-tail formats (xlsx, docx, html, etc.) are recorded as
-	// 'unsupported' without any decrypt/write — there's no
-	// extractor to run. The bare filename is still in wa_document
-	// (and thus messages_fts), so "did Khalid send me that
-	// budget.xlsx" still works.
-	if c.ext != "pdf" {
-		writeDocumentIndex(db, c, DocumentStatusUnsupported, 0, 0, "non-PDF format", now)
-		return DocumentStatusUnsupported, 0, 0
+	if ctx.Err() != nil {
+		return documentOneResult{status: statusCancelled}
 	}
 
-	// 1. Find the file in the manifest.
+	// Long-tail formats (xlsx, docx, …) — no extractor; park without decrypt.
+	if c.ext != "pdf" {
+		writeDocumentIndex(db, c, DocumentStatusUnsupported, 0, 0, "non-PDF format", now)
+		return documentOneResult{status: DocumentStatusUnsupported}
+	}
+
 	rec, ok := manifestIdx[c.manifestPath]
 	if !ok {
 		writeDocumentIndex(db, c, DocumentStatusMissing, 0, 0, "", now)
-		return DocumentStatusMissing, 0, 0
+		return documentOneResult{status: DocumentStatusMissing}
 	}
 
-	// 2. Decrypt to memory. EOF gets its own bucket — same logic
-	//    as the image and voice indexers: the manifest references
-	//    the blob but iOS didn't actually persist its bytes
-	//    (selective backup, or the document was never opened on
-	//    the phone and got evicted). User-visible that's identical
-	//    to "missing from manifest", so reclassify as missing.
+	decryptMu.Lock()
 	rd, err := bundle.FileReader(*rec)
 	if err != nil {
+		decryptMu.Unlock()
 		if errors.Is(err, io.EOF) {
 			writeDocumentIndex(db, c, DocumentStatusMissing, 0, 0, "", now)
-			return DocumentStatusMissing, 0, 0
+			return documentOneResult{status: DocumentStatusMissing}
 		}
-		writeDocumentIndex(db, c, DocumentStatusError, 0, 0,
-			fmt.Sprintf("decrypt: %v", err), now)
-		return DocumentStatusError, 0, 0
+		writeDocumentIndex(db, c, DocumentStatusError, 0, 0, fmt.Sprintf("decrypt: %v", err), now)
+		return documentOneResult{status: DocumentStatusError}
 	}
 	data, err := io.ReadAll(rd)
 	_ = rd.Close()
+	decryptMu.Unlock()
 	if err != nil {
 		if errors.Is(err, io.EOF) {
 			writeDocumentIndex(db, c, DocumentStatusMissing, 0, 0, "", now)
-			return DocumentStatusMissing, 0, 0
+			return documentOneResult{status: DocumentStatusMissing}
 		}
-		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0,
-			fmt.Sprintf("read: %v", err), now)
-		return DocumentStatusError, 0, 0
+		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0, fmt.Sprintf("read: %v", err), now)
+		return documentOneResult{status: DocumentStatusError}
 	}
-
-	// 3. Magic-byte check. Anything not starting with "%PDF-" goes
-	//    to error — handing PDFKit a non-PDF would just give us
-	//    "could not open document" with no signal about what
-	//    actually went wrong.
 	if len(data) < 5 || string(data[:5]) != "%PDF-" {
-		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0,
-			"not a PDF (bad magic)", now)
-		return DocumentStatusError, 0, 0
+		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0, "not a PDF (bad magic)", now)
+		return documentOneResult{status: DocumentStatusError}
 	}
 
-	// 4. Write to disk atomically (tmp+rename). Same rationale as
-	//    media.go: an interrupted write must not leave a half-file
-	//    that future runs would barf on.
 	out := filepath.Join(docDir, fmt.Sprintf("%d.pdf", c.rowid))
 	if err := writeFileAtomic(out, data); err != nil {
-		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0,
-			fmt.Sprintf("write: %v", err), now)
-		return DocumentStatusError, 0, 0
+		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0, fmt.Sprintf("write: %v", err), now)
+		return documentOneResult{status: DocumentStatusError}
 	}
+	writeDocumentIndex(db, c, DocumentStatusDownloaded, int64(len(data)), 0, "", now)
+	return documentOneResult{status: DocumentStatusDownloaded}
+}
 
-	// 5. PDFKit + Vision via the Swift helper.
-	resp, err := worker.extract(c.rowid, out)
+// ---- Extract phase ---------------------------------------------------
+
+// DocumentIndex extracts text from already-downloaded PDFs via the cloud.
+// No backup password — it reads documents/ and calls OpenRouter's file-parser
+// plugin. Needs an API key. Resumable per-row.
+func DocumentIndex(opts DocumentIndexOptions) (*DocumentIndexResult, error) {
+	if opts.Workspace == "" {
+		return nil, errors.New("document-index: Workspace required")
+	}
+	defDocOpts(&opts, 5)
+
+	db, docDir, err := openDocumentDB(opts.Workspace)
 	if err != nil {
-		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0,
-			fmt.Sprintf("pdfkit: %v", err), now)
-		return DocumentStatusError, 0, 0
+		return nil, err
 	}
-	if !resp.OK {
-		writeDocumentIndex(db, c, DocumentStatusError, int64(len(data)), 0,
-			fmt.Sprintf("pdfkit: %s", resp.Error), now)
-		return DocumentStatusError, 0, 0
+	defer db.Close()
+
+	// Re-adopt on-disk PDFs missing from the index (recovered after a
+	// re-sync rebuilt ChatStorage.sqlite). Same rationale as voice.
+	if n, rErr := reconcileDocumentIndexFromDisk(db, docDir); rErr != nil {
+		return nil, rErr
+	} else if n > 0 {
+		opts.Log(fmt.Sprintf("Re-adopted %d on-disk document(s) missing from the index (recovered after a re-sync).", n))
 	}
 
-	text := strings.TrimSpace(resp.Text)
+	total, alreadyExtracted, err := countDocumentCandidates(db)
+	if err != nil {
+		return nil, err
+	}
+	downloaded, err := countDocumentDownloaded(db)
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := selectDocumentExtractCandidates(db, opts.RetryErrors, opts.Force, opts.Limit)
+	if err != nil {
+		return nil, err
+	}
+	res := &DocumentIndexResult{Workspace: opts.Workspace, TotalCandidates: total, AlreadyExtracted: alreadyExtracted}
+	if len(candidates) == 0 {
+		opts.Log(fmt.Sprintf("Nothing to extract: %d / %d downloaded PDFs already extracted.", alreadyExtracted, downloaded))
+		ftsN, _ := rebuildFTS(db)
+		res.FTSCountAfter = ftsN
+		return res, nil
+	}
+	opts.Log(fmt.Sprintf("Documents downloaded: %d", downloaded))
+	opts.Log(fmt.Sprintf("Already extracted:    %d", alreadyExtracted))
+	opts.Log(fmt.Sprintf("Queued this run:      %d", len(candidates)))
+
+	extractor, err := documentExtractors.build(opts.Engine, opts.APIKey, opts.Model)
+	if err != nil {
+		return nil, err
+	}
+	concurrency := resolveConcurrency(opts.Concurrency)
+	opts.Log(fmt.Sprintf("Extractor: cloud (%s) (concurrency %d)", extractor.Model(), concurrency))
+
+	baseline := alreadyExtracted
+	process := func(ctx context.Context, c documentCandidate) documentOneResult {
+		return extractOneDocument(ctx, db, extractor, docDir, c, opts.Log)
+	}
+	fatalErr := runDocumentPipeline(opts, res, db, candidates, total, baseline, concurrency,
+		func() float64 { return extractor.CostUSD() }, true, process)
+
+	opts.Log(fmt.Sprintf("Done in %.0fs. extracted=%d empty=%d errors=%d ($%.4f)",
+		res.DurationSec, res.Extracted, res.Empty, res.Errors, res.CostUSD))
+	if fatalErr != nil {
+		return res, fmt.Errorf("extract run aborted after %d documents: %w", res.Extracted, fatalErr)
+	}
+	return res, nil
+}
+
+// extractOneDocument reads one PDF off disk and extracts its text via the
+// cloud, writing wa_document_text and flipping document_index to 'extracted'
+// (or 'extracted_empty' for a clean-but-empty result). A per-doc failure
+// keeps status='downloaded' and records the reason in extract_error so the
+// file isn't re-downloaded.
+func extractOneDocument(
+	ctx context.Context,
+	db *sql.DB,
+	extractor *cloudDocumentExtractor,
+	docDir string,
+	c documentCandidate,
+	log func(string),
+) documentOneResult {
+	now := nowUTC()
+	path := filepath.Join(docDir, fmt.Sprintf("%d.pdf", c.rowid))
+	data, err := os.ReadFile(path)
+	if err != nil {
+		setDocumentExtractError(db, c.rowid, "file missing on disk at extract time", now)
+		return documentOneResult{status: DocumentStatusError}
+	}
+
+	ext, err := extractor.Extract(ctx, data, documentFilename(c))
+	if err != nil {
+		var fatal *FatalError
+		if errors.As(err, &fatal) {
+			return documentOneResult{status: statusCancelled, fatal: err}
+		}
+		if ctx.Err() != nil {
+			return documentOneResult{status: statusCancelled}
+		}
+		setDocumentExtractError(db, c.rowid, fmt.Sprintf("extract: %v", err), now)
+		return documentOneResult{status: DocumentStatusError}
+	}
+
+	text := strings.TrimSpace(ext.Text)
 	if text == "" {
-		// PDFKit opened it but found nothing extractable (and OCR
-		// also found nothing). The file is on disk, the row is
-		// terminal-but-clean, and a future re-run shouldn't bother
-		// repeating the work.
-		writeDocumentIndex(db, c, DocumentStatusExtractedEmpty,
-			int64(len(data)), resp.PageCount, "", now)
-		return DocumentStatusExtractedEmpty, 0, 0
+		// Ran cleanly but no recoverable text. Flip to 'extracted_empty',
+		// clearing any prior extract_error; no wa_document_text row.
+		if _, e := db.Exec(
+			`UPDATE document_index SET status = ?, page_count = ?, extract_error = NULL, attempted_at = ? WHERE rowid = ?`,
+			DocumentStatusExtractedEmpty, nullableInt(ext.PageCount), now, c.rowid,
+		); e != nil {
+			log(fmt.Sprintf("[rowid=%d] update document_index (empty): %v", c.rowid, e))
+			return documentOneResult{status: DocumentStatusError}
+		}
+		return documentOneResult{status: DocumentStatusExtractedEmpty}
 	}
 
-	// 6. Persist results. Two-table atomic commit (wa_document_text
-	//    and document_index together) — same pattern as media.go.
-	//    INSERT OR REPLACE so a --retry-errors run cleanly overwrites.
 	tx, err := db.Begin()
 	if err != nil {
 		log(fmt.Sprintf("[rowid=%d] begin tx: %v", c.rowid, err))
-		return DocumentStatusError, 0, 0
+		return documentOneResult{status: DocumentStatusError}
 	}
 	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO wa_document_text
-		 (rowid, text, page_count, pages_with_text, pages_ocr, method, generated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		c.rowid, text, resp.PageCount, resp.PagesWithText, resp.PagesOCR, resp.Method, now,
+		 (rowid, text, page_count, pages_with_text, pages_ocr, method, model, generated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.rowid, text, ext.PageCount, ext.PagesText, ext.PagesOCR, ext.Method, extractor.Model(), now,
 	); err != nil {
 		_ = tx.Rollback()
 		log(fmt.Sprintf("[rowid=%d] insert wa_document_text: %v", c.rowid, err))
-		return DocumentStatusError, 0, 0
+		return documentOneResult{status: DocumentStatusError}
 	}
 	if _, err := tx.Exec(
-		`INSERT OR REPLACE INTO document_index
-		 (rowid, manifest_path, ext, status, bytes, page_count, error, attempted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
-		c.rowid, c.manifestPath, c.ext, DocumentStatusExtracted,
-		int64(len(data)), resp.PageCount, now,
+		`UPDATE document_index SET status = ?, page_count = ?, extract_error = NULL, attempted_at = ? WHERE rowid = ?`,
+		DocumentStatusExtracted, nullableInt(ext.PageCount), now, c.rowid,
 	); err != nil {
 		_ = tx.Rollback()
-		log(fmt.Sprintf("[rowid=%d] insert document_index: %v", c.rowid, err))
-		return DocumentStatusError, 0, 0
+		log(fmt.Sprintf("[rowid=%d] update document_index: %v", c.rowid, err))
+		return documentOneResult{status: DocumentStatusError}
 	}
 	if err := tx.Commit(); err != nil {
 		log(fmt.Sprintf("[rowid=%d] commit: %v", c.rowid, err))
-		return DocumentStatusError, 0, 0
+		return documentOneResult{status: DocumentStatusError}
 	}
-	return DocumentStatusExtracted, resp.PagesWithText, resp.PagesOCR
+	return documentOneResult{status: DocumentStatusExtracted, pagesText: ext.PagesText, pagesOCR: ext.PagesOCR, withText: true}
 }
 
-// writeDocumentIndex commits a single document_index row outside
-// any caller-managed transaction. Used for terminal-status writes
-// (missing / error / unsupported / extracted_empty) where there's
-// no wa_document_text row to keep atomic with.
-func writeDocumentIndex(db *sql.DB, c documentCandidate, status string, bytesLen int64, pageCount int, errMsg string, now string) {
+// documentFilename is the sender-supplied name when present (so the file-parser
+// sees a real ".pdf" name), else a synthetic one from the rowid.
+func documentFilename(c documentCandidate) string {
+	if c.filename != "" {
+		return c.filename
+	}
+	return fmt.Sprintf("%d.pdf", c.rowid)
+}
+
+// ---- Shared worker pool ----------------------------------------------
+
+// runDocumentPipeline drives the document download/extract phases — a thin
+// per-phase wrapper over the generic runWorkerPipeline (pipeline.go), supplying
+// the document-specific tally, progress emission, and FTS rebuild. Mirrors
+// runVoicePipeline.
+func runDocumentPipeline(
+	opts DocumentIndexOptions,
+	res *DocumentIndexResult,
+	db *sql.DB,
+	candidates []documentCandidate,
+	total, baseline, concurrency int,
+	costFn func() float64,
+	rebuildFTSAfter bool,
+	process func(ctx context.Context, c documentCandidate) documentOneResult,
+) error {
+	progressEvery := opts.ProgressEvery
+	if progressEvery <= 0 {
+		progressEvery = 1
+	}
+	tStart := time.Now()
+	cost := func() float64 {
+		if costFn == nil {
+			return 0
+		}
+		return costFn()
+	}
+
+	var rebuild func()
+	if rebuildFTSAfter {
+		rebuild = func() {
+			opts.Log("Rebuilding messages_fts…")
+			if ftsN, err := rebuildFTS(db); err != nil {
+				opts.Log(fmt.Sprintf("FTS rebuild failed (non-fatal): %v", err))
+			} else {
+				res.FTSCountAfter = ftsN
+			}
+		}
+	}
+
+	return runWorkerPipeline(opts.Ctx, db, candidates, concurrency, progressEvery,
+		process,
+		func(r documentOneResult) (string, error) { return r.status, r.fatal },
+		nil,
+		func(r documentOneResult) {
+			switch r.status {
+			case DocumentStatusDownloaded:
+				res.Downloaded++
+			case DocumentStatusExtracted:
+				res.Extracted++
+				res.PagesText += r.pagesText
+				res.PagesOCR += r.pagesOCR
+			case DocumentStatusExtractedEmpty:
+				res.Empty++
+			case DocumentStatusMissing:
+				res.Missing++
+			case DocumentStatusUnsupported:
+				res.Unsupported++
+			case DocumentStatusError:
+				res.Errors++
+			}
+			res.Processed++
+		},
+		func() {
+			res.CostUSD = cost()
+			emitDocumentProgress(opts.Progress, res, total, baseline, len(candidates), tStart)
+		},
+		func(stoppedByUser bool) {
+			res.DurationSec = time.Since(tStart).Seconds()
+			if stoppedByUser {
+				res.Cancelled = true
+				opts.Log("Stopped on user request. All committed rows are safe; re-run to resume.")
+			}
+		},
+		rebuild,
+	)
+}
+
+// ---- helpers ---------------------------------------------------------
+
+func defDocOpts(opts *DocumentIndexOptions, progressEvery int) {
+	if opts.Ctx == nil {
+		opts.Ctx = context.Background()
+	}
+	if opts.Log == nil {
+		opts.Log = func(string) {}
+	}
+	if opts.ProgressEvery <= 0 {
+		opts.ProgressEvery = progressEvery
+	}
+}
+
+func openDocumentDB(workspace string) (*sql.DB, string, error) {
+	docDir := filepath.Join(workspace, "documents")
+	if err := os.MkdirAll(docDir, 0o755); err != nil {
+		return nil, "", fmt.Errorf("mkdir documents dir: %w", err)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(workspace, "ChatStorage.sqlite"))
+	if err != nil {
+		return nil, "", fmt.Errorf("open db: %w", err)
+	}
+	if err := ensureDocumentSidecarSchema(db); err != nil {
+		_ = db.Close()
+		return nil, "", err
+	}
+	return db, docDir, nil
+}
+
+// reconcileDocumentIndexFromDisk adopts orphaned documents/<rowid>.pdf files
+// into document_index as 'downloaded' rows. A messages re-sync rebuilds
+// ChatStorage.sqlite — and with it document_index — from the backup, leaving
+// the on-disk documents/ untouched. If the carry-forward dropped those rows,
+// every PDF is present on disk yet invisible to the extract queue. Re-create a
+// 'downloaded' row for each on-disk PDF mapping to a real document message.
+// Mirrors reconcileVoiceIndexFromDisk. Returns the number of rows adopted.
+func reconcileDocumentIndexFromDisk(db *sql.DB, docDir string) (int, error) {
+	entries, err := os.ReadDir(docDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read documents dir: %w", err)
+	}
+
+	known := map[int64]bool{}
+	rows, err := db.Query(`SELECT rowid FROM document_index`)
+	if err != nil {
+		return 0, fmt.Errorf("load document_index rowids: %w", err)
+	}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan document_index rowid: %w", err)
+		}
+		known[id] = true
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate document_index rowids: %w", err)
+	}
+
+	now := nowUTC()
+	adopted := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".pdf") {
+			continue
+		}
+		rowid, err := strconv.ParseInt(strings.TrimSuffix(e.Name(), ".pdf"), 10, 64)
+		if err != nil || known[rowid] {
+			continue
+		}
+		var c documentCandidate
+		err = db.QueryRow(fmt.Sprintf(
+			`SELECT m.Z_PK, ? || mi.ZMEDIALOCALPATH, COALESCE(mi.ZAUTHORNAME, ''), %s
+			   FROM ZWAMESSAGE   m
+			   JOIN ZWAMEDIAITEM mi ON mi.ZMESSAGE = m.Z_PK
+			  WHERE m.Z_PK = ? AND m.ZMESSAGETYPE = 8 AND mi.ZMEDIALOCALPATH IS NOT NULL`, docExtExpr),
+			documentManifestPrefix, rowid,
+		).Scan(&c.rowid, &c.manifestPath, &c.filename, &c.ext)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return adopted, fmt.Errorf("look up document message %d: %w", rowid, err)
+		}
+		var bytesLen int64
+		if info, statErr := e.Info(); statErr == nil {
+			bytesLen = info.Size()
+		}
+		writeDocumentIndex(db, c, DocumentStatusDownloaded, bytesLen, 0, "", now)
+		adopted++
+	}
+	return adopted, nil
+}
+
+// writeDocumentIndex commits a single document_index row (terminal download
+// outcomes). INSERT OR REPLACE resets extract_error to NULL.
+func writeDocumentIndex(db *sql.DB, c documentCandidate, status string, bytesLen int64, pageCount int, errMsg, now string) {
 	var errVal any
 	if errMsg != "" {
 		errVal = errMsg
 	}
-	var pcVal any
-	if pageCount > 0 {
-		pcVal = pageCount
-	}
 	_, _ = db.Exec(
 		`INSERT OR REPLACE INTO document_index
-		 (rowid, manifest_path, ext, status, bytes, page_count, error, attempted_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.rowid, c.manifestPath, c.ext, status, bytesLen, pcVal, errVal, now,
+		 (rowid, manifest_path, ext, status, bytes, page_count, error, extract_error, attempted_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+		c.rowid, c.manifestPath, c.ext, status, bytesLen, nullableInt(pageCount), errVal, now,
 	)
 }
 
-func emitDocumentProgress(cb func(DocumentIndexProgress), res *DocumentIndexResult, total, already, pending int, started time.Time, current documentCandidate) {
+// setDocumentExtractError records a per-doc extract failure without changing
+// status (the file stays on disk, not re-downloaded).
+func setDocumentExtractError(db *sql.DB, rowid int64, msg, now string) {
+	_, _ = db.Exec(
+		`UPDATE document_index SET extract_error = ?, attempted_at = ? WHERE rowid = ?`,
+		msg, now, rowid,
+	)
+}
+
+// nullableInt stores a positive count, NULL for zero/unknown (keeps the
+// page_count column meaningfully sparse).
+func nullableInt(n int) any {
+	if n > 0 {
+		return n
+	}
+	return nil
+}
+
+func emitDocumentProgress(cb func(DocumentIndexProgress), res *DocumentIndexResult, total, baseline, pending int, started time.Time) {
 	if cb == nil {
 		return
 	}
@@ -634,144 +864,21 @@ func emitDocumentProgress(cb func(DocumentIndexProgress), res *DocumentIndexResu
 		eta = float64(remaining) / rate
 	}
 	cb(DocumentIndexProgress{
-		Done:         res.Processed,
-		Total:        total,
-		Pending:      pending,
-		Extracted:    res.Extracted,
-		Empty:        res.Empty,
-		Missing:      res.Missing,
-		Errors:       res.Errors,
-		Unsupported:  res.Unsupported,
-		PagesText:    res.PagesText,
-		PagesOCR:     res.PagesOCR,
-		CurrentLabel: current.label(),
-		RatePerSec:   rate,
-		ETASeconds:   eta,
-		ElapsedSec:   elapsed,
+		Done:        res.Processed,
+		Total:       total,
+		Pending:     pending,
+		Baseline:    baseline,
+		Downloaded:  res.Downloaded,
+		Extracted:   res.Extracted,
+		Empty:       res.Empty,
+		Missing:     res.Missing,
+		Errors:      res.Errors,
+		Unsupported: res.Unsupported,
+		PagesText:   res.PagesText,
+		PagesOCR:    res.PagesOCR,
+		RatePerSec:  rate,
+		ETASeconds:  eta,
+		ElapsedSec:  elapsed,
+		CostUSD:     res.CostUSD,
 	})
-}
-
-// -------------------------------------------------------------------
-// PDF worker subprocess client
-// -------------------------------------------------------------------
-
-// pdfWorker is the request-response client for the Swift Vision
-// helper's PDF mode. Synchronous, one PDF in flight at a time, with
-// request/response types matching the helper's `kind:"pdf"` wire
-// contract. document-index spawns its own helper process so it has a
-// clean shutdown semantic per run.
-type pdfWorker struct {
-	cmd      *exec.Cmd
-	stdin    io.WriteCloser
-	stdout   *bufio.Reader
-	stderr   io.ReadCloser
-	closeErr error
-}
-
-type pdfRequest struct {
-	ID   int64  `json:"id"`
-	Kind string `json:"kind"`
-	Path string `json:"path"`
-}
-
-type pdfResponse struct {
-	ID            int64  `json:"id"`
-	OK            bool   `json:"ok"`
-	Text          string `json:"text"`
-	PageCount     int    `json:"page_count"`
-	PagesWithText int    `json:"pages_with_text"`
-	PagesOCR      int    `json:"pages_ocr"`
-	Method        string `json:"method"`
-	Error         string `json:"error"`
-}
-
-// startPDFWorker spawns the bundled Swift helper with PDF tunables
-// pre-baked into its env. Pass maxOCRPages=0 / renderScale=0 to
-// inherit the helper's own defaults (100 pages, 2.0× scale).
-func startPDFWorker(ctx context.Context, path string, maxOCRPages int, renderScale float32) (*pdfWorker, error) {
-	cmd := exec.CommandContext(ctx, path)
-	env := os.Environ()
-	if maxOCRPages > 0 {
-		env = append(env, fmt.Sprintf("WHATSKEPT_PDF_MAX_OCR_PAGES=%d", maxOCRPages))
-	}
-	if renderScale > 0 {
-		env = append(env, fmt.Sprintf("WHATSKEPT_PDF_RENDER_SCALE=%.2f", renderScale))
-	}
-	cmd.Env = env
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdin pipe: %w", err)
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stderr pipe: %w", err)
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start helper: %w", err)
-	}
-	// Swift helper emits JSON lines that can exceed the default
-	// bufio max (PDFs with hundreds of pages of OCR text easily
-	// crest 1 MB per response). bufio.NewReader's default 4096-byte
-	// buffer grows on demand via ReadBytes, but we still raise the
-	// initial size so the common case avoids a few realloc cycles.
-	return &pdfWorker{
-		cmd:    cmd,
-		stdin:  stdin,
-		stdout: bufio.NewReaderSize(stdout, 256*1024),
-		stderr: stderr,
-	}, nil
-}
-
-func (w *pdfWorker) extract(rowid int64, path string) (*pdfResponse, error) {
-	req := pdfRequest{ID: rowid, Kind: "pdf", Path: path}
-	enc, err := json.Marshal(req)
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-	enc = append(enc, '\n')
-	if _, err := w.stdin.Write(enc); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
-	}
-	// ReadBytes grows its buffer past the bufio reader's initial
-	// size as needed, so a 5 MB response (large OCR'd contract) is
-	// handled without truncation. We only have to worry about
-	// per-process memory, which the cap on max pages bounds.
-	line, err := w.stdout.ReadBytes('\n')
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-	var resp pdfResponse
-	if err := json.Unmarshal(line, &resp); err != nil {
-		// Truncated dump only — these responses can be huge and
-		// the full line would drown the DB error column.
-		preview := string(line)
-		if len(preview) > 256 {
-			preview = preview[:256] + "…"
-		}
-		return nil, fmt.Errorf("decode response: %w (line=%q)", err, preview)
-	}
-	if resp.ID != rowid {
-		return nil, fmt.Errorf("response id mismatch: want=%d got=%d", rowid, resp.ID)
-	}
-	return &resp, nil
-}
-
-// Close shuts the worker down cleanly. Closing stdin → Swift loop
-// exits with status 0 → cmd.Wait returns. Called via defer from
-// DocumentIndex; safe to call twice.
-func (w *pdfWorker) Close() error {
-	if w.cmd == nil {
-		return w.closeErr
-	}
-	if w.stdin != nil {
-		_ = w.stdin.Close()
-		w.stdin = nil
-	}
-	w.closeErr = w.cmd.Wait()
-	w.cmd = nil
-	return w.closeErr
 }

@@ -21,7 +21,6 @@ const (
 	embedRoot       = "bundle"
 	IdeviceID       = "idevice_id"
 	IdeviceBackup   = "idevicebackup2"
-	WhatskeptVision = "whatskept-vision" // Swift wrapper over Vision.framework (OCR + classify)
 )
 
 // extractMu serialises Path() callers across goroutines so concurrent

@@ -51,15 +51,14 @@ agent-friendly workspace on disk.
   refresh the source without leaving the app.
 - **Decrypts** the WhatsApp `ChatStorage.sqlite` and the media/voice
   blobs from the encrypted iOS backup, using your backup password.
-- **Extracts PDF document text locally** through Apple PDFKit (with
-  Vision OCR fallback for scanned pages).
-- **Cloud enrichment** (opt-in): images are described and voice notes
-  transcribed by cloud AI models through
+- **Cloud enrichment** (opt-in): images are described, voice notes
+  transcribed, and PDF document text extracted by cloud AI models through
   [OpenRouter](https://openrouter.ai), using your own API key — image
-  OCR + descriptions, and voice-note transcripts in any language. These
+  OCR + descriptions, voice-note transcripts in any language, and PDF
+  text (native layer for free, OCR for scanned pages). These
   are the features that **send data off the device** (the images /
-  voice notes you choose to run). Both are off by default, behind their
-  own buttons. See [Privacy](#privacy).
+  voice notes / documents you choose to run). All are off by default,
+  behind their own buttons. See [Privacy](#privacy).
 - **Normalizes** everything into a single SQLite database (with FTS5)
   alongside extracted `media/`, `voice/`, `documents/`, and
   `profiles/` folders, joined against your macOS Contacts so chats
@@ -243,11 +242,11 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   The version check contacts a well-known host and carries none of your
   WhatsApp data. The GUI's HTTP server binds to `127.0.0.1` only — it is
   not reachable from other devices on your network.
-- **Local processing stays on-device.** PDF text extraction runs
-  through Apple PDFKit + Vision OCR (`whatskept-vision`). It doesn't talk
-  to a cloud service — that data never leaves the Mac. (Image
-  *descriptions* and voice *transcription* are the exceptions: they're
-  cloud-only and opt-in — see below.)
+- **Enrichment is opt-in and cloud-only.** Image *descriptions*, voice
+  *transcription*, and PDF *text extraction* run through cloud AI models
+  (OpenRouter) — they're the features that send the images / voice notes
+  / documents you choose to run off the device. Each is off by default,
+  behind its own button — see below.
 - **Backup password is never transmitted.** It's read from
   `$BACKUP_PASSWORD` or a `.env` file in the workspace, held in
   process memory for the lifetime of the app session, and cleared

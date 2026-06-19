@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"whatskept/internal/backup"
-	"whatskept/internal/helpers"
 )
 
 // This file is the Go port of the Python whatskept.media_indexer
@@ -1089,19 +1088,4 @@ func emitProgress(cb func(MediaIndexProgress), res *MediaIndexResult, total, alr
 		ElapsedSec: elapsed,
 		CostUSD:    res.CostUSD,
 	})
-}
-
-// resolveVisionHelper returns the absolute path to the extracted
-// whatskept-vision binary. helpers.Path() handles the embed →
-// cache-dir extraction; we just append the filename.
-func resolveVisionHelper() (string, error) {
-	dir, err := helpers.Path()
-	if err != nil {
-		return "", err
-	}
-	p := filepath.Join(dir, helpers.WhatskeptVision)
-	if _, err := os.Stat(p); err != nil {
-		return "", fmt.Errorf("helper not found at %s: %w", p, err)
-	}
-	return p, nil
 }

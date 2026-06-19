@@ -42,6 +42,7 @@ in a separate repository.`,
 	root.AddCommand(newMediaIndexCmd())
 	root.AddCommand(newVoiceDownloadCmd())
 	root.AddCommand(newVoiceIndexCmd())
+	root.AddCommand(newDocumentDownloadCmd())
 	root.AddCommand(newDocumentIndexCmd())
 
 	return root

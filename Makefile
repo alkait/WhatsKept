@@ -1,8 +1,6 @@
 BIN            := dist/whatskept
 APP            := dist/WhatsKept.app
 PKG            := ./cmd/whatskept
-VISION_HELPER  := internal/helpers/bundle/whatskept-vision
-VISION_SRC     := build/vision-helper/main.swift
 VERSION        ?= 0.0.0-dev
 
 # Build tags enabled in dist/whatskept:
@@ -13,40 +11,21 @@ VERSION        ?= 0.0.0-dev
 #                  this tag. Required for the Database tab's sync.
 GO_TAGS := sqlite_fts5
 
-.PHONY: build bundle vision-helper run list extract app clean tidy fmt vet test
+.PHONY: build bundle run list extract app clean tidy fmt vet test
 
 build: $(BIN)
 
-# go:embed glob in internal/helpers/embed.go pulls
-# internal/helpers/bundle/* into the binary at compile time, so the
-# Swift Vision helper must already be built and present in that
-# directory before `go build` runs. Listing it as an explicit prereq
-# also gives us free incremental rebuilds via Make's file-mtime
-# checking: edit main.swift and `make build` rebuilds the helper +
-# Go binary; no edits and nothing happens.
-$(BIN): vision-helper $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -path './internal/helpers/bundle/*' \) -not -path './dist/*' -not -path './.git/*')
+# The go:embed glob in internal/helpers/embed.go pulls
+# internal/helpers/bundle/* into the binary at compile time. Those are
+# committed third-party binaries (the libimobiledevice iOS-backup tools
+# and their dylibs), so a fresh clone can `make build` with no extra
+# build step. Listing the bundle as a prereq gives free incremental
+# rebuilds via Make's file-mtime checking.
+$(BIN): $(shell find . \( -name '*.go' -o -name '*.html' -o -name '*.js' -o -path './internal/helpers/bundle/*' \) -not -path './dist/*' -not -path './.git/*')
 	@mkdir -p dist
 	go build -tags "$(GO_TAGS)" -ldflags "-X main.Version=$(VERSION)" -o $(BIN) $(PKG)
 	@chmod +x build/sign.sh
 	@./build/sign.sh $(BIN)
-
-# Apple Vision wrapper used by `whatskept media-index`. A ~250-line
-# Swift program compiled to a single ad-hoc-signed arm64 Mach-O that
-# whatskept spawns as a persistent subprocess, talking JSON over
-# stdin/stdout. See build/vision-helper/main.swift for the protocol.
-#
-# Building requires Xcode Command Line Tools (`xcode-select --install`),
-# which is already a prerequisite for `cgo`-using parts of mattn/go-sqlite3.
-# The compiled binary is committed to the repo so a fresh clone can
-# `make build` without Swift being touched until you edit the .swift.
-vision-helper: $(VISION_HELPER)
-
-$(VISION_HELPER): $(VISION_SRC)
-	@command -v swiftc >/dev/null || { echo "swiftc not found — install Xcode CLT: xcode-select --install"; exit 1; }
-	@mkdir -p $(dir $(VISION_HELPER))
-	swiftc -O -o $(VISION_HELPER) $(VISION_SRC)
-	@chmod +x build/sign.sh
-	@./build/sign.sh $(VISION_HELPER)
 
 # Always re-sign, even on a no-op build. On Apple Silicon, ANY filesystem-side
 # byte modification of a Go-linker-signed Mach-O after build (including some

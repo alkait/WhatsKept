@@ -145,6 +145,8 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// Document indexing — PDF text extraction (PDFKit + Vision OCR
 	// fallback) into wa_document_text + document_index. No external
 	// model required, so no model-status pre-flight unlike voice.
+	mux.HandleFunc("GET /api/database/document-index/status", s.handleDocumentStatus)
+	mux.HandleFunc("GET /api/database/document-index/issues", s.handleDocumentIndexIssues)
 	mux.HandleFunc("POST /api/database/document-index", s.handleDocumentIndex)
 
 	// Agents — list supported agents (with installed flag) and launch
@@ -1751,60 +1753,186 @@ func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
 // Document indexing
 // ---------------------------------------------------------------------------
 
-// documentIndexRequest is the JSON body of POST /api/database/document-index.
-// Only the password matters; workspace + backup are implicit in
-// server state.
+// documentIndexRequest is the body of POST /api/database/document-index. The
+// OpenRouter key comes from the session store (never the body). Cloud extract
+// reads documents/ off disk — no backup password (the PDFs were decrypted
+// during the messages sync).
 type documentIndexRequest struct {
-	Password string `json:"password"`
-	Remember bool   `json:"remember"` // persist the password across restarts
+	Model       string `json:"model"`
+	Concurrency int    `json:"concurrency"`  // 0 = server default
+	Force       bool   `json:"force"`        // re-extract everything
+	RetryErrors bool   `json:"retry_errors"` // re-attempt PDFs that failed a prior extract
 }
 
-// handleDocumentIndex starts a `postprocess.DocumentIndex` run as
-// an in-process SSE job. Same shape as handleVoiceIndex:
-// emits "line" + "progress" events through the existing SSE
-// machinery, and DELETE /api/jobs/{id} would cancel via context
-// teardown between rows.
-//
-// No model-status pre-flight here — PDFKit + Vision are first-party
-// macOS frameworks always present on supported OS versions.
+// handleDocumentIndex starts a cloud document-extract run as a cancellable
+// SSE job over the already-downloaded PDFs. Mirrors handleVoiceIndex.
 func (s *server) handleDocumentIndex(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
 		httpError(w, http.StatusBadRequest, "no workspace open")
 		return
 	}
-
+	key := s.apiKey.get()
+	if key == "" {
+		httpError(w, http.StatusBadRequest, "OpenRouter API key required — set it first")
+		return
+	}
 	var req documentIndexRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		httpError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	attempted := req.Password
-	userSupplied := attempted != ""
-	if attempted == "" {
-		attempted = s.pw.get()
-	}
-	if attempted == "" {
-		httpError(w, http.StatusBadRequest, "backup password is required")
-		return
-	}
-
-	jobID := s.jobs.startInProcessProgress("document-index",
-		func(log func(string), progress func(any)) error {
+	jobID := s.jobs.startInProcessProgressCtx("document-index",
+		func(ctx context.Context, log func(string), progress func(any)) error {
 			_, err := postprocess.DocumentIndex(postprocess.DocumentIndexOptions{
-				Workspace:  cur,
-				BackupRoot: backup.DefaultRoot(),
-				Password:   attempted,
-				Log:        log,
+				Workspace:   cur,
+				Engine:      postprocess.SourceCloud,
+				APIKey:      key,
+				Model:       req.Model,
+				Concurrency: req.Concurrency,
+				Force:       req.Force,
+				RetryErrors: req.RetryErrors,
+				Ctx:         ctx,
+				Log:         log,
 				Progress: func(p postprocess.DocumentIndexProgress) {
 					progress(p)
 				},
 			})
-			if err == nil {
-				s.rememberVerifiedPassword("", attempted, userSupplied, req.Remember)
-			}
 			return err
 		})
-
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+}
+
+// documentStatusResponse drives the cloud document card: whether a key is
+// held, how many PDFs exist, and how many are downloaded / extracted.
+type documentStatusResponse struct {
+	HasKey        bool   `json:"has_key"`
+	TotalDocuments int   `json:"total_documents"` // PDFs on disk (extract addressable set)
+	Downloaded    int    `json:"downloaded"`      // PDFs on disk (downloaded + extracted + empty)
+	Extracted     int    `json:"extracted"`       // document_index status='extracted'
+	Empty         int    `json:"empty"`           // ran cleanly, no recoverable text
+	Missing       int    `json:"missing"`         // referenced but not in the backup
+	Errors        int    `json:"errors"`          // download errors + per-doc extract failures
+	Unsupported   int    `json:"unsupported"`     // non-PDF formats parked
+	Pending       int    `json:"pending"`         // fresh on-disk PDFs a normal run would extract
+	ExtractFailed int    `json:"extract_failed"`  // on-disk PDFs that failed before — retryable
+	DefaultModel  string `json:"default_model"`
+}
+
+// handleDocumentStatus reports cloud-extract readiness + coverage. Read-only.
+func (s *server) handleDocumentStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := documentStatusResponse{
+		HasKey:       s.apiKey.has(),
+		DefaultModel: postprocess.DefaultDocumentModel,
+	}
+	cur := s.ws.get()
+	if cur == "" {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	defer db.Close()
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status IN ('downloaded','extracted','extracted_empty')`).Scan(&resp.Downloaded)
+	resp.TotalDocuments = resp.Downloaded
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'extracted'`).Scan(&resp.Extracted)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'extracted_empty'`).Scan(&resp.Empty)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'missing'`).Scan(&resp.Missing)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'unsupported'`).Scan(&resp.Unsupported)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'error' OR extract_error IS NOT NULL`).Scan(&resp.Errors)
+	resp.Pending, _ = postprocess.CountDocumentExtractPending(db)
+	resp.ExtractFailed, _ = postprocess.CountDocumentExtractFailed(db)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDocumentIndexIssues lists failed/missing documents (mirrors the voice
+// issues endpoint). Errors span download failures (status='error') and
+// per-doc extract failures (extract_error set).
+func (s *server) handleDocumentIndexIssues(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		httpError(w, http.StatusBadRequest, "no database in workspace")
+		return
+	}
+	limit := 200
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+	}
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "open db: "+err.Error())
+		return
+	}
+	defer db.Close()
+
+	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Missing: []mediaIndexIssue{}, Limit: limit}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='document_index'`).Scan(&n); err != nil || n == 0 {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'error' OR extract_error IS NOT NULL`).Scan(&out.ErrorsTotal)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+	if out.ErrorsTotal > 0 {
+		out.Errors = queryDocumentErrors(db, limit)
+	}
+	if out.MissingTotal > 0 {
+		out.Missing = queryDocumentIssues(db, "missing", limit)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func queryDocumentErrors(db *sql.DB, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path,
+		        COALESCE(NULLIF(error, ''), extract_error, ''),
+		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM document_index
+		 WHERE status = 'error' OR extract_error IS NOT NULL
+		 ORDER BY attempted_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func queryDocumentIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM document_index WHERE status = ? ORDER BY attempted_at DESC LIMIT ?`, status, limit)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
 }

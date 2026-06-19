@@ -278,11 +278,17 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 		if _, err := db.Exec(createDocumentSidecarsSQL); err != nil {
 			return nil, fmt.Errorf("create document sidecar tables: %w", err)
 		}
-		res, err := db.Exec(
-			`INSERT OR REPLACE INTO main.wa_document_text
-			 SELECT * FROM old.wa_document_text
-			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
-		)
+		// Copy by the old↔new column intersection rather than SELECT *, so a
+		// schema change (model / extract_error added) can't shift values into
+		// the wrong columns.
+		dtCols, err := copyColumnsFor(db, "wa_document_text", documentSidecarColumns)
+		if err != nil {
+			return nil, fmt.Errorf("plan wa_document_text copy: %w", err)
+		}
+		res, err := db.Exec(fmt.Sprintf(
+			`INSERT OR REPLACE INTO main.wa_document_text (%[1]s)
+			 SELECT %[1]s FROM old.wa_document_text
+			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`, dtCols))
 		if err != nil {
 			return nil, fmt.Errorf("preserve wa_document_text: %w", err)
 		}
@@ -296,11 +302,14 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 			return nil, fmt.Errorf("count dropped document rows: %w", err)
 		}
 		if had, _ := attachedTableExists(db, "old", "document_index"); had {
-			res, err := db.Exec(
-				`INSERT OR REPLACE INTO main.document_index
-				 SELECT * FROM old.document_index
-				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
-			)
+			diCols, err := copyColumnsFor(db, "document_index", documentIndexColumns)
+			if err != nil {
+				return nil, fmt.Errorf("plan document_index copy: %w", err)
+			}
+			res, err := db.Exec(fmt.Sprintf(
+				`INSERT OR REPLACE INTO main.document_index (%[1]s)
+				 SELECT %[1]s FROM old.document_index
+				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`, diCols))
 			if err != nil {
 				return nil, fmt.Errorf("preserve document_index: %w", err)
 			}
@@ -587,13 +596,20 @@ func copyColumnsFor(db dbExecQuerier, table string, canonical []string) (string,
 //	  PDF that the sender attached.
 //
 //	document_index   — terminal-state ledger driving the per-row
-//	  resume logic. status values:
-//	     'extracted'   PDFKit and/or Vision OCR returned text;
-//	                   wa_document_text row exists.
-//	     'extracted_empty'  pipeline ran cleanly but the PDF has
-//	                   no recoverable text (image-only PDF whose
-//	                   OCR also came back blank). No wa_document_text
-//	                   row but the file is on disk.
+//	  resume logic. Two-phase, mirroring voice_index: the (password-
+//	  gated) download writes a 'downloaded' / 'missing' / 'error' /
+//	  'unsupported' row; the cloud extract step flips it to 'extracted'
+//	  / 'extracted_empty' or records a per-doc failure in extract_error
+//	  (leaving status='downloaded' so the file isn't re-downloaded).
+//	  status values:
+//	     'downloaded'  PDF decrypted to <ws>/documents/<rowid>.pdf,
+//	                   awaiting cloud extraction.
+//	     'extracted'   the cloud parser returned text; wa_document_text
+//	                   row exists.
+//	     'extracted_empty'  extraction ran cleanly but the PDF has
+//	                   no recoverable text (image-only PDF whose OCR
+//	                   also came back blank). No wa_document_text row
+//	                   but the file is on disk.
 //	     'missing'     file referenced in DB but not in the iOS
 //	                   backup manifest, or stored as a zero-byte
 //	                   record (selective backup / not downloaded
@@ -602,10 +618,16 @@ func copyColumnsFor(db dbExecQuerier, table string, canonical []string) (string,
 //	                   We don't have an extractor for these yet;
 //	                   the row is parked here so future runs can
 //	                   skip it cheaply.
-//	     'error'       decrypt / write / PDFKit / Vision failure.
+//	     'error'       decrypt / write failure (download phase).
+//	  extract_error: a per-doc cloud-extract failure, recorded without
+//	  changing status (the file stays on disk, not re-downloaded) so a
+//	  normal re-run skips it and only "Retry failures" re-attempts.
 //
-// pages_with_text + pages_ocr add up to <= page_count (some pages
-// may have been blank entirely, or skipped due to the OCR cap).
+// pages_with_text + pages_ocr are a document-level approximation of the
+// old per-page counts (the cloud parser reports no per-page provenance):
+// a pdf-text result attributes every page to text, an OCR result every
+// page to OCR. method is 'cloud-text' / 'cloud-ocr' / 'empty'; model is
+// the carrier model slug.
 const createDocumentSidecarsSQL = `
 CREATE TABLE IF NOT EXISTS wa_document_text (
     rowid           INTEGER PRIMARY KEY,
@@ -614,6 +636,7 @@ CREATE TABLE IF NOT EXISTS wa_document_text (
     pages_with_text INTEGER NOT NULL DEFAULT 0,
     pages_ocr       INTEGER NOT NULL DEFAULT 0,
     method          TEXT NOT NULL DEFAULT '',
+    model           TEXT NOT NULL DEFAULT '',
     generated_at    TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS document_index (
@@ -624,11 +647,63 @@ CREATE TABLE IF NOT EXISTS document_index (
     bytes         INTEGER,
     page_count    INTEGER,
     error         TEXT,
+    extract_error TEXT,
     attempted_at  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS document_index_status_idx ON document_index(status);
 CREATE INDEX IF NOT EXISTS document_index_ext_idx    ON document_index(ext);
 `
+
+// documentSidecarColumns / documentIndexColumns are the canonical column
+// sets in schema order, used by migrateDocumentSidecar and by the
+// merge-forward copy (to intersect old↔new so a schema change can't shift
+// values into the wrong columns).
+var documentSidecarColumns = []string{
+	"rowid", "text", "page_count", "pages_with_text", "pages_ocr", "method", "model", "generated_at",
+}
+var documentIndexColumns = []string{
+	"rowid", "manifest_path", "ext", "status", "bytes", "page_count", "error", "extract_error", "attempted_at",
+}
+
+// ensureDocumentSidecarSchema creates the document tables if absent, then
+// migrates an older (narrower) schema up to the current column set. The
+// single entry point callers use instead of createDocumentSidecarsSQL.
+func ensureDocumentSidecarSchema(db dbExecQuerier) error {
+	if _, err := db.Exec(createDocumentSidecarsSQL); err != nil {
+		return fmt.Errorf("create document sidecar tables: %w", err)
+	}
+	return migrateDocumentSidecar(db)
+}
+
+// migrateDocumentSidecar ADD COLUMNs fields introduced after the document
+// tables were first created by an older whatskept (wa_document_text.model,
+// document_index.extract_error). Each is nullable or carries a DEFAULT, so
+// existing rows need no backfill.
+func migrateDocumentSidecar(db dbExecQuerier) error {
+	adds := []struct{ table, col, ddl string }{
+		{"wa_document_text", "model", `ALTER TABLE wa_document_text ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
+		{"document_index", "extract_error", `ALTER TABLE document_index ADD COLUMN extract_error TEXT`},
+	}
+	cols := map[string]map[string]bool{}
+	for _, a := range adds {
+		have, ok := cols[a.table]
+		if !ok {
+			var err error
+			have, err = tableColumns(db, "main", a.table)
+			if err != nil {
+				return fmt.Errorf("inspect %s: %w", a.table, err)
+			}
+			cols[a.table] = have
+		}
+		if len(have) == 0 || have[a.col] {
+			continue
+		}
+		if _, err := db.Exec(a.ddl); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", a.table, a.col, err)
+		}
+	}
+	return nil
+}
 
 // pruneOrphans enforces the "./media folder mirrors device state"
 // invariant after a SyncMessages run. Two passes:

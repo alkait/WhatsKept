@@ -445,6 +445,18 @@ func SyncMessages(
 			voiceStats.Downloaded, voiceStats.Missing, voiceStats.Errors))
 	}
 
+	// Document (PDF) download. Same rationale as images/voice: decrypt the
+	// PDF blobs here (cheap), so the cloud extract step is a password-free
+	// consumer of documents/. Non-fatal.
+	log("Downloading WhatsApp documents…")
+	docStats, docErr := downloadDocumentDuringSync(bundle, workspace, livePath, log)
+	if docErr != nil {
+		log(fmt.Sprintf("Document download failed: %v", docErr))
+	} else if docStats != nil {
+		log(fmt.Sprintf("Documents: %d downloaded this sync (%d missing, %d errors, %d non-PDF).",
+			docStats.Downloaded, docStats.Missing, docStats.Errors, docStats.Unsupported))
+	}
+
 	log("Writing AGENTS.md, CLAUDE.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err

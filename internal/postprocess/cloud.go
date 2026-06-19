@@ -90,24 +90,38 @@ func (c *cloudClient) addCost(usd float64) {
 // global auth/billing failure surfaces as a *FatalError (from openRouterCall)
 // so the caller's run aborts instead of marking every row errored.
 func (c *cloudClient) complete(ctx context.Context, parts []contentPart, maxTokens int, temperature float64) (string, error) {
+	cr, err := c.completeRaw(ctx, parts, nil, maxTokens, temperature)
+	if err != nil {
+		return "", err
+	}
+	return cr.Choices[0].Message.Content, nil
+}
+
+// completeRaw is complete's lower layer: it returns the decoded response so
+// callers that need more than the assistant text (e.g. the document
+// extractor, which reads file-parser annotations) can. plugins is optional —
+// pass the file-parser plugin to extract PDF text. Cost is accrued here, so
+// every cloud call funnels through this one place.
+func (c *cloudClient) completeRaw(ctx context.Context, parts []contentPart, plugins []pdfPlugin, maxTokens int, temperature float64) (*chatResponse, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Messages:    []chatMessage{{Role: "user", Content: parts}},
 		MaxTokens:   maxTokens,
 		Temperature: temperature,
+		Plugins:     plugins,
 		Usage:       &usageRequest{Include: true},
 	})
 	if err != nil {
-		return "", fmt.Errorf("encode request: %w", err)
+		return nil, fmt.Errorf("encode request: %w", err)
 	}
 	cr, err := openRouterCall(ctx, c.client, c.apiKey, body)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if cr.Usage != nil {
 		c.addCost(cr.Usage.Cost)
 	}
-	return cr.Choices[0].Message.Content, nil
+	return cr, nil
 }
 
 // --- Engine registry --------------------------------------------------
@@ -225,6 +239,11 @@ func openRouterCall(ctx context.Context, client *http.Client, apiKey string, bod
 			return nil, &FatalError{Msg: fmt.Sprintf(
 				"OpenRouter rejected the request (HTTP %d): %s — check your API key and credit balance",
 				resp.StatusCode, clip(respBody, 160))}
+		case resp.StatusCode == http.StatusRequestEntityTooLarge:
+			// The document (or a provider's image-content budget within it)
+			// is too large for one request. Not transient and not global —
+			// a typed error so the document extractor can split-and-retry.
+			return nil, &tooLargeError{msg: clip(respBody, 160)}
 		case resp.StatusCode != http.StatusOK:
 			return nil, fmt.Errorf("openrouter http %d: %s", resp.StatusCode, clip(respBody, 200))
 		}
@@ -257,6 +276,13 @@ func backoff(ctx context.Context, attempt int) bool {
 	}
 }
 
+// tooLargeError is returned for an HTTP 413 (payload / image content too
+// large). The document extractor treats it as a signal to split the PDF into
+// smaller page-range chunks and retry, rather than a per-row failure.
+type tooLargeError struct{ msg string }
+
+func (e *tooLargeError) Error() string { return "openrouter http 413 (too large): " + e.msg }
+
 func clip(b []byte, n int) string {
 	if len(b) > n {
 		return string(b[:n])
@@ -271,7 +297,19 @@ type chatRequest struct {
 	Messages    []chatMessage `json:"messages"`
 	MaxTokens   int           `json:"max_tokens"`
 	Temperature float64       `json:"temperature"`
+	Plugins     []pdfPlugin   `json:"plugins,omitempty"`
 	Usage       *usageRequest `json:"usage,omitempty"`
+}
+
+// pdfPlugin selects OpenRouter's file-parser plugin and its PDF engine
+// ("pdf-text" for the native text layer, "mistral-ocr" for scanned pages).
+type pdfPlugin struct {
+	ID  string          `json:"id"`
+	PDF pdfPluginConfig `json:"pdf"`
+}
+
+type pdfPluginConfig struct {
+	Engine string `json:"engine"`
 }
 
 type usageRequest struct {
@@ -288,10 +326,18 @@ type contentPart struct {
 	Text       string          `json:"text,omitempty"`
 	ImageURL   *imageURLPart   `json:"image_url,omitempty"`
 	InputAudio *inputAudioPart `json:"input_audio,omitempty"`
+	File       *filePart       `json:"file,omitempty"`
 }
 
 type imageURLPart struct {
 	URL string `json:"url"`
+}
+
+// filePart carries a base64 data-URI document (PDF) for the file-parser
+// plugin. FileData is "data:application/pdf;base64,<...>".
+type filePart struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 // inputAudioPart carries base64 audio for transcription models. `Format`
@@ -304,7 +350,8 @@ type inputAudioPart struct {
 type chatResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content     string           `json:"content"`
+			Annotations []fileAnnotation `json:"annotations"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage *struct {
@@ -313,4 +360,20 @@ type chatResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// fileAnnotation is the file-parser plugin's parsed-document result, returned
+// alongside the assistant message. The extracted text lives in
+// File.Content[].Text — the faithful, length-safe source (vs. the model's
+// prose reply, which can truncate a long document).
+type fileAnnotation struct {
+	Type string `json:"type"`
+	File struct {
+		Hash    string `json:"hash"`
+		Name    string `json:"name"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"file"`
 }
