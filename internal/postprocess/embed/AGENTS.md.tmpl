@@ -381,48 +381,6 @@ Companion `voice_index(rowid, status)` tracks resume state; `status` ∈
 back up the blob (common for voice notes the user hasn't replayed on the
 device since the last backup) — not an error, just unavailable.
 
-### `v_person_photo` — named people in photos ⭐
-
-Optional. Present once the user has run **Find people** and **named** people
-in the app's People view (on-device face clustering + manual naming). This
-is how you answer *"show me photos of <name>"*.
-
-| column        | meaning                                                          |
-|---------------|------------------------------------------------------------------|
-| `person`      | The lowercase name the user assigned (e.g. `hasan`, `dad`).       |
-| `rowid`       | The image message (`= v_messages.rowid`).                        |
-| `ts`          | UTC ISO timestamp of the photo.                                  |
-| `chat_title`  | Which chat it came from.                                          |
-| `sender_name` | Who sent it (`me` if the user sent it).                          |
-| `image_path`  | `./media/<rowid>.jpg` — hand to `open` to show the user.         |
-
-Names are **lowercase**; match case-insensitively (`WHERE person = lower(:n)`).
-Backed by `wa_person_face(rowid, person)` (one row per labeled face); the
-view de-dups to one row per (person, photo). A person can have many photos;
-a photo can contain several named people.
-
-```sql
--- Every photo of Hasan, newest first; open them one at a time.
-SELECT rowid, ts, chat_title, sender_name, image_path
-FROM   v_person_photo
-WHERE  person = 'hasan'
-ORDER  BY ts DESC;
--- then, per the user's pick:  open ./media/<rowid>.jpg
-```
-
-```sql
--- Photos with two named people together (e.g. Hasan AND Sara).
-SELECT a.rowid, a.ts, a.chat_title, a.image_path
-FROM   v_person_photo a
-JOIN   v_person_photo b ON b.rowid = a.rowid
-WHERE  a.person = 'hasan' AND b.person = 'sara'
-ORDER  BY a.ts DESC;
-```
-
-The real image extension may be png/heic/gif, not jpg (see `./media/`);
-prefer `open ./media/<rowid>.*` so the shell resolves it. If
-`v_person_photo` doesn't exist, the user hasn't named anyone yet.
-
 ## Pitfalls — read these before writing your first query
 
 1. **Cocoa epoch.** `ZMESSAGEDATE` / `ZLASTMESSAGEDATE` are seconds since

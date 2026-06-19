@@ -223,8 +223,8 @@ func newMediaDownloadCmd() *cobra.Command {
 		Long: `Decrypts every WhatsApp image referenced in ChatStorage.sqlite from
 the encrypted iOS backup and writes it to <workspace>/media/<rowid>.<ext>,
 marking each row 'downloaded'. This is the only image command that needs
-the backup password; the describers (media-index / cloud) and face
-clustering are pure consumers of the media/ folder.
+the backup password; the describers (media-index / cloud) are pure
+consumers of the media/ folder.
 
 Resumable per-row: Ctrl+C between rows is safe and a re-run resumes.
 Use --retry-missing / --retry-errors to revisit terminal-status rows

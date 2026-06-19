@@ -22,7 +22,6 @@ const (
 	IdeviceID       = "idevice_id"
 	IdeviceBackup   = "idevicebackup2"
 	WhatskeptVision = "whatskept-vision" // Swift wrapper over Vision.framework (OCR + classify)
-	WhatskeptFaces  = "whatskept-faces"  // Swift face detector + clusterer over media/ (people MVP)
 )
 
 // extractMu serialises Path() callers across goroutines so concurrent

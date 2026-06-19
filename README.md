@@ -38,7 +38,6 @@ examples of what becomes possible:
 | **Summarize a relationship or thread** | *"Summarize what my brother and I have talked about this year — what's been on his mind?"* |
 | **Reconstruct a timeline** | *"Build a timeline of my 2023 — major events, trips, life changes — using only what's in WhatsApp."* |
 | **Index recommendations friends have sent** | *"List every restaurant, book, and movie friends have recommended in the last 2 years, grouped by category."* |
-| **Find photos of a specific person** (after tagging them in the People view) | *"Show me a random photo of my son Hasan"* · *"Photos with Hasan and Sara together from 2023."* |
 
 ## What this is (and what it isn't)
 
@@ -178,26 +177,6 @@ re-run to resume where it left off. Re-running the top-level sync
 carries the already-processed work forward and prunes anything tied
 to messages you've since deleted on the phone.
 
-### People (face tagging)
-
-The **People** step (Database tab → Image enrichment) groups the faces in
-your photos so you can find everyone who recurs. It runs **entirely on your
-Mac**: Apple Vision detects + aligns faces, an on-device face-recognition
-model embeds them, and they're clustered into people. Nothing is uploaded.
-
-The model (AdaFace, MIT — see
-[`build/faces-helper/convert/`](build/faces-helper/convert/)) is **not**
-bundled; it's downloaded once on first use (~120 MB) to
-`~/Library/Application Support/whatskept/models/` and SHA-256 verified.
-
-You then **name** the people you care about in the grid (type a name; the
-same name on two groups merges them; ✕ a stray photo to remove it). Naming
-happens in the app; the tags are written into `ChatStorage.sqlite`
-(`wa_person` / `wa_person_face` / the `v_person_photo` view) and carried
-forward across re-syncs. Your agent reads them — *"show me photos of
-hasan"* resolves to the messages and `open`s the images. The app itself is
-only for tagging; querying is the agent's job.
-
 ## Download
 
 Pre-built **macOS arm64 (Apple Silicon)** binaries, ad-hoc signed.
@@ -265,12 +244,10 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   WhatsApp data. The GUI's HTTP server binds to `127.0.0.1` only — it is
   not reachable from other devices on your network.
 - **Local processing stays on-device.** PDF text extraction runs
-  through Apple PDFKit + Vision OCR (`whatskept-vision`); **face
-  detection + recognition** for the People feature run through Apple
-  Vision + a local CoreML model (`whatskept-faces`). Neither talks to a
-  cloud service — that data never leaves the Mac. (Image *descriptions*
-  and voice *transcription* are the exceptions: they're cloud-only and
-  opt-in — see below.)
+  through Apple PDFKit + Vision OCR (`whatskept-vision`). It doesn't talk
+  to a cloud service — that data never leaves the Mac. (Image
+  *descriptions* and voice *transcription* are the exceptions: they're
+  cloud-only and opt-in — see below.)
 - **Backup password is never transmitted.** It's read from
   `$BACKUP_PASSWORD` or a `.env` file in the workspace, held in
   process memory for the lifetime of the app session, and cleared

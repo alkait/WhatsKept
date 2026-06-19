@@ -11,16 +11,14 @@ import (
 )
 
 // This file owns the on-disk lifecycle of large ML model files that
-// are too big to embed into the Go binary. The AdaFace face model is
-// ~120 MB; embedding it would inflate every dev build, every CI
-// artifact, and every release ZIP by that much, while also forcing
-// users to re-download it on every app update. Instead the model
-// lives in ~/Library/Application Support/whatskept/models/ and is
-// fetched on first use, persisting across upgrades.
+// are too big to embed into the Go binary. Such a model lives in
+// ~/Library/Application Support/whatskept/models/ and is fetched on
+// first use, persisting across upgrades, rather than inflating every
+// dev build, CI artifact, and release ZIP.
 //
 // This file only owns specs (URL, sha256, expected size) and path
-// resolution; the download itself is driven by the feature that needs
-// the model (e.g. the People face card).
+// resolution; the download itself (internal/helpers/download.go) is
+// driven by whichever feature needs the model.
 
 // ModelSpec describes one downloadable ML model.
 //
@@ -30,34 +28,11 @@ import (
 // Content-Length alone, since CDNs occasionally serve truncated
 // files when their backend storage is in trouble.
 type ModelSpec struct {
-	Name    string // basename used on disk and in UI ("AdaFace_IR101.mlpackage.zip")
+	Name    string // basename used on disk and in UI
 	Display string // human-readable name shown to the user
 	URL     string // HTTPS source
 	SHA256  string // lower-hex; used to verify post-download
 	Bytes   int64  // expected file size in bytes
-}
-
-// AdaFaceModel is the on-device face-recognition model used by the
-// "Find people" feature. It's a CoreML conversion of AdaFace IR-101
-// trained on WebFace12M (minchul/cvlface, MIT-licensed): 112×112 RGB
-// aligned face chips in, a 512-dim L2-normalized identity embedding out.
-// Unlike Apple's general feature-print — or the smaller IR-18 backbone —
-// it actually distinguishes look-alike individuals.
-//
-// Distributed as a zipped .mlpackage, fetched on first use and SHA-256
-// verified, then unzipped beside the archive. Name is the .zip we
-// download and verify; the unzipped AdaFace_IR101.mlpackage/ dir is what
-// the faces helper loads (see internal/app/faces.go).
-//
-// Hosted as a dedicated GitHub release asset (decoupled from app version
-// tags — the model rarely changes). See build/faces-helper/convert/ for
-// how the .mlpackage was produced and its licensing.
-var AdaFaceModel = ModelSpec{
-	Name:    "AdaFace_IR101.mlpackage.zip",
-	Display: "AdaFace IR-101 / WebFace12M (face recognition, MIT)",
-	URL:     "https://github.com/alkait/WhatsKept/releases/download/model-adaface-ir101-v1/AdaFace_IR101.mlpackage.zip",
-	SHA256:  "e897eee264645c90132ad042c999c958b325fc37e4bc2329860330d49803d653",
-	Bytes:   121192622,
 }
 
 // AppSupportDir returns ~/Library/Application Support/whatskept,

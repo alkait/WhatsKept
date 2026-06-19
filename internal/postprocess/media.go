@@ -33,8 +33,7 @@ import (
 //      description, persist them in wa_image_text, and flip the row to
 //      'described'. A pure consumer of media/ — no password.
 //
-// Both are resumable per-row. Face clustering (faces.go) is a third
-// pure consumer of media/.
+// Both are resumable per-row.
 //
 // Design notes (departures from the Python original):
 //
@@ -242,8 +241,8 @@ type MediaIndexResult struct {
 // ChatStorage.sqlite from the encrypted iOS backup and writes it to
 // <Workspace>/media/<rowid>.<ext>. This is the only image step that
 // touches the backup, so it is the only one that needs Password. The
-// enrichment steps (MediaIndex / face clustering) are pure consumers of
-// the media/ folder. Resumable per-row: a row is marked 'downloaded'
+// enrichment step (MediaIndex) is a pure consumer of the media/ folder.
+// Resumable per-row: a row is marked 'downloaded'
 // only after its atomic write + DB commit succeed.
 func DownloadMedia(opts MediaIndexOptions) (*MediaIndexResult, error) {
 	if opts.Workspace == "" {
