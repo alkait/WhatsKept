@@ -453,9 +453,10 @@ function BackupCard({ backup, onDelete, isBound }) {
 function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Start backup" }) {
   const [password, setPassword] = useState("");
   const [show, setShow] = useState(false);
+  const [remember, setRemember] = useState(true);
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
-  const submit = () => { if (password) onConfirm(password); };
+  const submit = () => { if (password) onConfirm(password, remember); };
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
       <div className="w-[380px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
@@ -475,6 +476,13 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
             {show ? "hide" : "show"}
           </button>
         </div>
+        <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
+          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} className="mt-0.5" />
+          <span className="text-xs text-gray-600">
+            Remember on this computer
+            <span className="block text-[11px] text-gray-400">Saved in a private file once a backup succeeds, so you won't be asked again. Manage it in Settings.</span>
+          </span>
+        </label>
         <div className="flex gap-2">
           <button onClick={onCancel}
             className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">
@@ -715,7 +723,7 @@ function DeviceRow({ device, job, onStart, hasSessionPassword, onForgetPassword 
       {prompting && (
         <PasswordPromptModal
           device={device}
-          onConfirm={pw => { setPrompting(false); onStart(device, pw); }}
+          onConfirm={(pw, remember) => { setPrompting(false); onStart(device, pw, remember); }}
           onCancel={() => setPrompting(false)}
         />
       )}
@@ -1204,7 +1212,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
     {prompting && (
       <PasswordPromptModal
         device={{ name: "the latest iPhone backup" }}
-        onConfirm={pw => { setPrompting(false); onSync(pw); }}
+        onConfirm={(pw, remember) => { setPrompting(false); onSync(pw, remember); }}
         onCancel={() => setPrompting(false)}
         confirmLabel="Sync messages"
       />
@@ -2151,20 +2159,32 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
 // descriptions and voice transcription): status plus set / change /
 // forget. Key entry reuses OpenRouterKeyModal. This is the single place
 // the key is managed; the feature cards no longer repeat it.
-function SettingsModal({ onClose }) {
+function SettingsModal({ onClose, onPasswordChanged }) {
   const [keyStatus, setKeyStatus] = useState(null); // { has, persisted }
+  const [pwStatus, setPwStatus]   = useState(null); // backup pw { has, persisted }
   const [showKey, setShowKey]     = useState(false);
 
   const reload = () =>
     api.get("/api/session/openrouter-key").then(setKeyStatus).catch(() => {});
-  useEffect(() => { reload(); }, []);
+  const reloadPw = () =>
+    api.get("/api/session/password").then(setPwStatus).catch(() => {});
+  useEffect(() => { reload(); reloadPw(); }, []);
 
-  const hasKey    = !!(keyStatus && keyStatus.has);
-  const persisted = !!(keyStatus && keyStatus.persisted);
+  const hasKey      = !!(keyStatus && keyStatus.has);
+  const persisted   = !!(keyStatus && keyStatus.persisted);
+  const hasPw       = !!(pwStatus && pwStatus.has);
+  const pwPersisted = !!(pwStatus && pwStatus.persisted);
 
   const forgetKey = async () => {
     try { await api.del("/api/session/openrouter-key"); } catch {}
     reload();
+  };
+  // The backup password is entered (and verified) via the run prompt, not
+  // here — Settings only reports status and forgets it (RAM + disk).
+  const forgetPw = async () => {
+    try { await api.del("/api/session/password"); } catch {}
+    reloadPw();
+    onPasswordChanged && onPasswordChanged();
   };
 
   return (
@@ -2209,6 +2229,32 @@ function SettingsModal({ onClose }) {
                 </button>
               )}
             </div>
+          </div>
+        </div>
+
+        <div className="rounded-xl border p-4 mt-3" style={{borderColor:'#DCF8C6'}}>
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <p className="font-medium text-gray-700 text-sm">iPhone backup password</p>
+              <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                Decrypts this device's iOS backup. Entered when you run a backup or sync — tick “Remember on this computer” there to keep it across restarts.
+              </p>
+              <p className="text-[11px] text-gray-400 mt-2">
+                {hasPw
+                  ? (pwPersisted
+                      ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
+                      : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
+                  : <>Status: <span className="font-medium text-gray-600">not set</span></>}
+              </p>
+            </div>
+            {hasPw && (
+              <div className="shrink-0 flex flex-col items-end gap-2">
+                <button onClick={forgetPw}
+                  className="text-[11px] text-gray-400 underline decoration-dotted hover:text-gray-700">
+                  forget
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -2689,7 +2735,7 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
       {prompting && (
         <PasswordPromptModal
           device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onDocumentIndex(pw); }}
+          onConfirm={(pw, remember) => { setPrompting(false); onDocumentIndex(pw, remember); }}
           onCancel={() => setPrompting(false)}
           confirmLabel="Sync documents"
         />
@@ -3410,11 +3456,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   // `password` may be "" when the caller knows the server already has
   // one cached for this session. The server falls back to its cache
   // and, if a fresh non-empty password is provided, replaces it.
-  const startBackup = async (device, password) => {
+  const startBackup = async (device, password, remember) => {
     const key = device.udid;
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
-      const { job_id } = await api.post("/api/backup/run", { udid: key, password: password || null });
+      const { job_id } = await api.post("/api/backup/run", { udid: key, password: password || null, remember: !!remember });
       // Don't flip hasSessionPassword=true here — the server hasn't
       // verified the password yet. The streamJob "done" handler will
       // reconcile from /api/session/password once the backup either
@@ -3427,11 +3473,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── start messages sync ────────────────────────────────────────────────
-  const startSync = async (password) => {
+  const startSync = async (password, remember) => {
     const key = "db:sync";
     patchJob(key, { running: true, done: null, lines: [], adopted: false, pid: null, startedAt: new Date().toISOString(), error: "" });
     try {
-      const { job_id } = await api.post("/api/database/sync", { password });
+      const { job_id } = await api.post("/api/database/sync", { password, remember: !!remember });
       // See startBackup: server-side cache commit is deferred to the
       // job's success, so we read it back from /api/session/password
       // on "done" rather than assuming it took.
@@ -3497,7 +3543,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   // ── start document extraction (document-index) ────────────────────────
   // Same shape as startVoiceIndex / startMediaDescribe but with no
   // model-required precondition (PDFKit + Vision are first-party).
-  const startDocumentIndex = async (password) => {
+  const startDocumentIndex = async (password, remember) => {
     const key = "db:document-index";
     patchJob(key, {
       running: true, done: null,
@@ -3506,7 +3552,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       startedAt: new Date().toISOString(), error: "",
     });
     try {
-      const { job_id } = await api.post("/api/database/document-index", { password });
+      const { job_id } = await api.post("/api/database/document-index", { password, remember: !!remember });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -3746,7 +3792,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
 
       </main>
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} onPasswordChanged={reloadSessionPassword} />}
 
       {deleteTarget && (
         <DeleteConfirmModal

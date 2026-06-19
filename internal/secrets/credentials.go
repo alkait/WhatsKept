@@ -30,8 +30,20 @@ const (
 
 // credentials is the on-disk shape of credentials.json. Add fields here
 // as more app-level (non-workspace) secrets need to persist.
+//
+// BackupPasswords is keyed by device UDID: unlike the OpenRouter key (a
+// single global account credential), each iOS backup has its own
+// encryption password, so a user with two iPhones has two entries.
 type credentials struct {
-	OpenRouterAPIKey string `json:"openrouter_api_key,omitempty"`
+	OpenRouterAPIKey string            `json:"openrouter_api_key,omitempty"`
+	BackupPasswords  map[string]string `json:"backup_passwords,omitempty"`
+}
+
+// isEmpty reports whether the file would carry no secrets (so it can be
+// removed rather than left as an empty husk). A struct == comparison can't
+// be used now that a map field is present.
+func (c credentials) isEmpty() bool {
+	return c.OpenRouterAPIKey == "" && len(c.BackupPasswords) == 0
 }
 
 // appConfigDir resolves the per-user config directory, honouring the
@@ -130,7 +142,14 @@ func DeleteOpenRouterKey() error {
 		return err
 	}
 	c.OpenRouterAPIKey = ""
-	if c == (credentials{}) {
+	return saveOrRemove(c)
+}
+
+// saveOrRemove writes the credentials file, or deletes it entirely when no
+// secrets remain (so we don't leave an empty {} file behind). A missing
+// file on removal is a no-op.
+func saveOrRemove(c credentials) error {
+	if c.isEmpty() {
 		p, err := credentialsPath()
 		if err != nil {
 			return err
@@ -141,4 +160,58 @@ func DeleteOpenRouterKey() error {
 		return nil
 	}
 	return saveCredentials(c)
+}
+
+// LoadBackupPassword returns the persisted backup password for the given
+// device UDID and whether one is present. Best-effort: any read/parse
+// error reports "not present".
+func LoadBackupPassword(udid string) (string, bool) {
+	if udid == "" {
+		return "", false
+	}
+	c, err := loadCredentials()
+	if err != nil {
+		return "", false
+	}
+	pw, ok := c.BackupPasswords[udid]
+	if !ok || pw == "" {
+		return "", false
+	}
+	return pw, true
+}
+
+// SaveBackupPassword persists the backup password for a device UDID,
+// preserving any other fields (incl. other devices' passwords).
+func SaveBackupPassword(udid, password string) error {
+	if udid == "" {
+		return errors.New("SaveBackupPassword: empty udid")
+	}
+	c, err := loadCredentials()
+	if err != nil {
+		// Corrupt/unreadable file: overwrite rather than refuse to save.
+		c = credentials{}
+	}
+	if c.BackupPasswords == nil {
+		c.BackupPasswords = map[string]string{}
+	}
+	c.BackupPasswords[udid] = password
+	return saveCredentials(c)
+}
+
+// DeleteBackupPassword removes the persisted password for one device. If
+// nothing else remains in the file it is deleted entirely. A missing file
+// or absent entry is a no-op.
+func DeleteBackupPassword(udid string) error {
+	c, err := loadCredentials()
+	if err != nil {
+		return err
+	}
+	if _, ok := c.BackupPasswords[udid]; !ok {
+		return nil
+	}
+	delete(c.BackupPasswords, udid)
+	if len(c.BackupPasswords) == 0 {
+		c.BackupPasswords = nil
+	}
+	return saveOrRemove(c)
 }

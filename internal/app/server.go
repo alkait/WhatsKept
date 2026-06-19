@@ -321,9 +321,10 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// time, and (b) the modal already exists for the only operation
 	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
-	s.pw.clear()
-	// The OpenRouter key is a global account credential, not
-	// workspace-specific, so it intentionally survives a workspace switch.
+	// Brand-new workspace: no bound device yet, so no persisted password —
+	// this just resets the in-RAM cache. The OpenRouter key is a global
+	// account credential, not workspace-specific, so it survives a switch.
+	s.pw.loadForWorkspace("")
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -361,15 +362,17 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 	// templates from the first Sync, same as before. Refresh
 	// failures (read-only mount, full disk) are non-fatal — the
 	// user can still browse the workspace.
-	if info := describeWorkspace(abs); info.HasChat {
+	info := describeWorkspace(abs)
+	if info.HasChat {
 		if err := postprocess.WriteAssets(abs, AgentIgnoreFiles()); err != nil {
 			fmt.Fprintf(os.Stderr, "open workspace: refresh assets failed (continuing): %v\n", err)
 		}
 	}
 	s.ws.set(abs)
-	s.pw.clear()
-	// The OpenRouter key is a global account credential, not
-	// workspace-specific, so it intentionally survives a workspace switch.
+	// Load any persisted backup password for this workspace's device so the
+	// prompt can be skipped after a restart. The OpenRouter key is a global
+	// account credential, not workspace-specific, so it survives a switch.
+	s.pw.loadForWorkspace(bindingUDID(info))
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -428,7 +431,9 @@ func (s *server) handleDeleteWorkspace(w http.ResponseWriter, _ *http.Request) {
 	}
 	removeRecent(cur)
 	s.ws.set("")
-	s.pw.clear()
+	// Drop the cached password and any persisted copy for the deleted
+	// workspace's device (forget uses the active device, which is this one).
+	_ = s.pw.forget()
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -626,6 +631,7 @@ type runBackupRequest struct {
 	UDID     string `json:"udid"`
 	Network  bool   `json:"network"`
 	Password string `json:"password"`
+	Remember bool   `json:"remember"` // persist the password across restarts
 }
 
 type jobResponse struct {
@@ -657,6 +663,7 @@ func (s *server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 	// password, with no way for the user to enter a correct one
 	// without manually clicking "Use a different password".
 	attempted := req.Password
+	userSupplied := attempted != ""
 	if attempted == "" {
 		attempted = s.pw.get()
 	}
@@ -667,8 +674,8 @@ func (s *server) handleRunBackup(w http.ResponseWriter, r *http.Request) {
 	// event, so the GET /api/session/password call the frontend
 	// issues on "done" observes the post-success state.
 	onDone := func(ok bool) {
-		if ok && attempted != "" {
-			s.pw.set(attempted)
+		if ok {
+			s.rememberVerifiedPassword(req.UDID, attempted, userSupplied, req.Remember)
 		}
 	}
 
@@ -1056,6 +1063,7 @@ func readDBCounts(dbPath string) dbCounts {
 
 type syncDatabaseRequest struct {
 	Password string `json:"password"`
+	Remember bool   `json:"remember"` // persist the password across restarts
 }
 
 // handleSyncDatabase kicks off postprocess.SyncMessages as an
@@ -1081,6 +1089,7 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 	// (which decrypts the backup as its very first step) succeeds.
 	// Caching upfront let typos lock the user out of retrying.
 	attempted := req.Password
+	userSupplied := attempted != ""
 	if attempted == "" {
 		attempted = s.pw.get()
 	}
@@ -1098,7 +1107,7 @@ func (s *server) handleSyncDatabase(w http.ResponseWriter, r *http.Request) {
 			log,
 		)
 		if err == nil {
-			s.pw.set(attempted)
+			s.rememberVerifiedPassword("", attempted, userSupplied, req.Remember)
 		}
 		return err
 	})
@@ -1403,15 +1412,51 @@ func queryMediaIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
 // only a boolean. The frontend uses this to decide whether to skip the
 // password modal before kicking off a backup or sync.
 func (s *server) handleSessionPasswordStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]bool{"has": s.pw.has()})
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"has":       s.pw.has(),
+		"persisted": s.pw.isPersisted(),
+	})
 }
 
-// handleSessionPasswordClear forgets the cached password. Called when
-// the user clicks "Use a different password" after a sync/backup
-// failure that was likely a wrong-password error.
+// handleSessionPasswordClear forgets the cached password — from RAM and,
+// if it was remembered, from disk too. Called when the user clicks "Use a
+// different password" after a sync/backup failure that was likely a
+// wrong-password error, or "forget" in Settings.
 func (s *server) handleSessionPasswordClear(w http.ResponseWriter, _ *http.Request) {
-	s.pw.clear()
+	if err := s.pw.forget(); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("forget password: %v", err))
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// bindingUDID returns the device UDID a workspace is bound to, or "" if it
+// has no binding yet (brand-new or unsynced workspace).
+func bindingUDID(info workspaceInfo) string {
+	if info.Binding != nil {
+		return info.Binding.UDID
+	}
+	return ""
+}
+
+// rememberVerifiedPassword caches a backup password the caller has just
+// verified (a backup/sync/document run succeeded with it). udid is the
+// device it belongs to, or "" to use the active one. When the user typed
+// the password this run (userSupplied), honour the `remember` choice —
+// persisting it across restarts or removing any stale persisted copy. When
+// it came from the session cache, only refresh RAM so a no-remember re-run
+// can't silently un-persist an already-remembered password.
+func (s *server) rememberVerifiedPassword(udid, pw string, userSupplied, remember bool) {
+	if pw == "" {
+		return
+	}
+	if !userSupplied {
+		s.pw.set(pw)
+		return
+	}
+	if err := s.pw.setVerified(udid, pw, remember); err != nil {
+		fmt.Fprintf(os.Stderr, "remember backup password: %v\n", err)
+	}
 }
 
 // handleCancelJob cancels a running cancellable in-process job (the
@@ -1722,6 +1767,7 @@ func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
 // server state.
 type documentIndexRequest struct {
 	Password string `json:"password"`
+	Remember bool   `json:"remember"` // persist the password across restarts
 }
 
 // handleDocumentIndex starts a `postprocess.DocumentIndex` run as
@@ -1745,6 +1791,7 @@ func (s *server) handleDocumentIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	attempted := req.Password
+	userSupplied := attempted != ""
 	if attempted == "" {
 		attempted = s.pw.get()
 	}
@@ -1765,7 +1812,7 @@ func (s *server) handleDocumentIndex(w http.ResponseWriter, r *http.Request) {
 				},
 			})
 			if err == nil {
-				s.pw.set(attempted)
+				s.rememberVerifiedPassword("", attempted, userSupplied, req.Remember)
 			}
 			return err
 		})
