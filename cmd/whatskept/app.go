@@ -34,6 +34,11 @@ The window hosts a small React UI backed by an internal HTTP server on
 localhost. No external services are contacted; nothing leaves the
 machine. Closing the window terminates the server.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Drop the stray console window on a Windows double-click launch
+			// (no-op elsewhere, and when run from a real terminal). Must
+			// happen before the window opens.
+			hideConsoleIfOwned()
+
 			// Title shows the running version so a user with two
 			// builds open (e.g. a tag release alongside a fresh dev
 			// preview) can tell them apart at a glance. Em dash so

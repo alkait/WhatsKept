@@ -189,7 +189,7 @@ Resumable per-row. Password is read from $BACKUP_PASSWORD or a .env.`,
 	}
 	cmd.Flags().StringVar(&workspace, "workspace", "", "Workspace dir containing ChatStorage.sqlite (default: cwd)")
 	cmd.Flags().StringVar(&backupPath, "backup", "", "Path to a specific iOS backup directory (default: most-recent)")
-	cmd.Flags().StringVar(&backupRoot, "backup-root", "", "iOS backup root (default: ~/Library/Application Support/MobileSync/Backup)")
+	cmd.Flags().StringVar(&backupRoot, "backup-root", "", "iOS backup root (defaults to your platform's backup folder)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Process at most N documents this run (0 = no cap)")
 	cmd.Flags().BoolVar(&retryMissing, "retry-missing", false, "Re-attempt rows previously marked 'missing'")
 	cmd.Flags().BoolVar(&retryErrors, "retry-errors", false, "Re-attempt rows previously marked 'error'")

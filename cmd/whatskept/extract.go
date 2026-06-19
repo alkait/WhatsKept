@@ -77,7 +77,7 @@ the Python implementation — this command only does the decryption + write.`,
 	cmd.Flags().StringVar(&backupPath, "backup", "",
 		"Use the backup at this path instead of auto-discovering")
 	cmd.Flags().StringVar(&backupRoot, "backup-root", "",
-		"Backup discovery root (default: $HOME/Library/Application Support/MobileSync/Backup)")
+		"Backup discovery root (defaults to your platform's iOS backup folder)")
 	cmd.Flags().StringVarP(&outDir, "out", "o", "",
 		"Output workspace directory (default: current directory)")
 	return cmd

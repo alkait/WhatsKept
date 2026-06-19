@@ -15,7 +15,7 @@ func newListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List discovered iOS backups (newest first)",
-		Long: `Probes ~/Library/Application Support/MobileSync/Backup/ for valid
+		Long: `Probes the platform's iOS backup folder for valid
 iOS backups and prints them with device, iOS version, last-backup date, and
 encryption status. Newest first.
 
@@ -42,6 +42,6 @@ Pass --backup-root to override the discovery root.`,
 	}
 
 	cmd.Flags().StringVar(&backupRoot, "backup-root", "",
-		"Backup discovery root (default: $HOME/Library/Application Support/MobileSync/Backup)")
+		"Backup discovery root (defaults to your platform's iOS backup folder)")
 	return cmd
 }
