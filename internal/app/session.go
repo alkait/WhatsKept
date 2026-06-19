@@ -120,6 +120,14 @@ func (p *passwordStore) isPersisted() bool {
 	return p.persisted
 }
 
+// device returns the UDID the active workspace's backup belongs to, or "" if
+// the workspace isn't bound to a device yet.
+func (p *passwordStore) device() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.udid
+}
+
 // apiKeyStore holds the OpenRouter API key for the cloud media describer.
 // Unlike the backup password, the key is a GLOBAL account credential (not
 // workspace-specific), so it is NOT cleared on workspace switches.

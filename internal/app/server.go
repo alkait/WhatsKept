@@ -165,6 +165,7 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	// password is already cached, and lets it explicitly forget one
 	// (e.g. after a typo). The password value is never returned.
 	mux.HandleFunc("GET /api/session/password", s.handleSessionPasswordStatus)
+	mux.HandleFunc("POST /api/session/password", s.handleSessionPasswordSet)
 	mux.HandleFunc("DELETE /api/session/password", s.handleSessionPasswordClear)
 	mux.HandleFunc("GET /api/session/openrouter-key", s.handleSessionAPIKeyStatus)
 	mux.HandleFunc("POST /api/session/openrouter-key", s.handleSessionAPIKeySet)
@@ -1419,6 +1420,72 @@ func (s *server) handleSessionPasswordClear(w http.ResponseWriter, _ *http.Reque
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+type sessionPasswordSetRequest struct {
+	Password string `json:"password"`
+	Remember bool   `json:"remember"` // persist across restarts (per device UDID)
+}
+
+// handleSessionPasswordSet verifies a backup password by actually decrypting
+// the user's iOS backup, then caches it for the session (and persists it when
+// Remember is set). Unlike the OpenRouter key — which OpenRouter can validate
+// standalone — a backup password has no standalone check; the only proof it's
+// correct is that it unlocks a backup. So the app historically only collected
+// it inside the run/sync flow. This endpoint backs the Settings "Set password"
+// affordance, which is the sole way to pre-set the password on Windows, where
+// the in-app Run Backup flow (the other entry point) isn't available.
+func (s *server) handleSessionPasswordSet(w http.ResponseWriter, r *http.Request) {
+	var req sessionPasswordSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if strings.TrimSpace(req.Password) == "" {
+		httpError(w, http.StatusBadRequest, "password is required")
+		return
+	}
+
+	// Pick a backup to verify against: the active workspace's device if bound,
+	// otherwise the most recent encrypted backup on disk (Discover sorts
+	// newest-first).
+	infos, err := backup.Discover(backup.DefaultRoot())
+	if err != nil {
+		httpError(w, http.StatusBadRequest, fmt.Sprintf("cannot read backups: %v", err))
+		return
+	}
+	want := s.pw.device()
+	var target *backup.Info
+	for i := range infos {
+		if !infos[i].IsEncrypted {
+			continue
+		}
+		if want != "" && filepath.Base(infos[i].Path) == want {
+			target = &infos[i]
+			break
+		}
+		if target == nil {
+			target = &infos[i] // newest encrypted, as the fallback
+		}
+	}
+	if target == nil {
+		httpError(w, http.StatusBadRequest, "no encrypted iOS backup found to verify the password against")
+		return
+	}
+
+	// The proof: opening unlocks the keybag (SetPassword) and loads the
+	// manifest (Load). A wrong password fails at unlock.
+	if _, err := backup.Open(*target, req.Password); err != nil {
+		httpError(w, http.StatusBadRequest, "incorrect backup password")
+		return
+	}
+
+	udid := filepath.Base(target.Path)
+	if err := s.pw.setVerified(udid, req.Password, req.Remember); err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("save password: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 // bindingUDID returns the device UDID a workspace is bound to, or "" if it

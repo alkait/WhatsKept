@@ -168,11 +168,11 @@ func (s *server) handleUpdateRun(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// handleOpenURL opens an https URL in the user's default browser via
-// LaunchServices. The UI uses it for the "What's new" release-notes link
-// — a bare <a> would navigate the WKWebView itself away from the app. We
-// only allow https so a malformed request can't be coerced into opening
-// a file:// or arbitrary-scheme handler.
+// handleOpenURL opens an https URL in the user's default browser via the
+// platform opener (see openURLCmd). The UI uses it for the "Get a key" /
+// "What's new" links — a bare <a> would navigate the WKWebView/WebView2 itself
+// away from the app. We only allow https so a malformed request can't be
+// coerced into opening a file:// or arbitrary-scheme handler.
 func (s *server) handleOpenURL(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL string `json:"url"`
@@ -185,7 +185,7 @@ func (s *server) handleOpenURL(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "only https URLs may be opened")
 		return
 	}
-	cmd := exec.Command("/usr/bin/open", req.URL)
+	cmd := openURLCmd(req.URL)
 	if err := cmd.Start(); err != nil {
 		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open URL: %v", err))
 		return

@@ -33,3 +33,20 @@ func fileManagerCmd(target string, reveal bool) *exec.Cmd {
 		return exec.Command("xdg-open", target)
 	}
 }
+
+// openURLCmd builds a command that opens an https URL in the user's default
+// browser. Used by the "Get a key" / "What's new" links, which must not
+// navigate the WKWebView/WebView2 away from the app itself.
+func openURLCmd(url string) *exec.Cmd {
+	switch runtime.GOOS {
+	case "windows":
+		// rundll32 …FileProtocolHandler is the canonical default-browser
+		// launcher and, unlike `cmd /c start`, doesn't mangle URLs that
+		// contain & or other cmd metacharacters.
+		return exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		return exec.Command("/usr/bin/open", url)
+	default:
+		return exec.Command("xdg-open", url)
+	}
+}

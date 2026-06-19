@@ -1645,6 +1645,84 @@ function OpenRouterKeyModal({ onClose, onSaved }) {
   );
 }
 
+// BackupPasswordModal — enter the iOS backup password. On save the server
+// VERIFIES it by actually decrypting the backup (there's no standalone check
+// for a backup password), so a wrong password is rejected here. "Remember on
+// this computer" persists it per-device across restarts.
+function BackupPasswordModal({ onClose, onSaved }) {
+  const [pw, setPw]       = useState("");
+  const [show, setShow]   = useState(false);
+  const [busy, setBusy]   = useState(false);
+  const [err, setErr]     = useState("");
+  const [remember, setRemember] = useState(true);
+  const inputRef = useRef(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const save = async () => {
+    if (!pw.trim() || busy) return;
+    setBusy(true); setErr("");
+    try {
+      await api.post("/api/session/password", { password: pw, remember });
+      onSaved();
+      onClose();
+    } catch (ex) {
+      setErr(ex.message || "Incorrect backup password");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="w-[420px] rounded-2xl bg-white border shadow-2xl p-6" style={{borderColor:'#ECE5DD'}}>
+        <h2 className="text-base font-semibold text-gray-900 mb-1">iPhone backup password</h2>
+        <p className="text-xs text-gray-500 mb-4">
+          The password you set when you turned on “Encrypt local backup” in Finder/iTunes. It's verified against your backup.
+        </p>
+        <div className="relative mb-3">
+          <input ref={inputRef} type={show ? "text" : "password"} value={pw}
+            onChange={e => setPw(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === "Enter") { save(); return; }
+              // WKWebView/WebView2 don't wire ⌘/Ctrl+V to the input; handle
+              // paste ourselves via the Clipboard API (secure localhost ctx).
+              if ((e.metaKey || e.ctrlKey) && (e.key === "v" || e.key === "V")) {
+                e.preventDefault();
+                navigator.clipboard.readText().then(t => setPw(t.trim())).catch(() => {});
+              }
+            }}
+            className="w-full border rounded-lg px-3 py-2 pr-14 text-sm font-mono"
+            style={{borderColor:'#128C7E'}}
+            placeholder="Backup password" />
+          <button onClick={() => setShow(x => !x)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-gray-600 px-1">
+            {show ? "hide" : "show"}
+          </button>
+        </div>
+        {err && <p className="text-xs text-red-500 mb-3">{err}</p>}
+        <label className="flex items-start gap-2 mb-4 cursor-pointer select-none">
+          <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} className="mt-0.5" />
+          <span className="text-xs text-gray-600">
+            Remember on this computer
+            <span className="block text-[11px] text-gray-400">Stored in a private file in your user folder so it survives restarts. Leave unchecked to keep it for this session only.</span>
+          </span>
+        </label>
+        <div className="flex gap-2">
+          <button onClick={onClose}
+            className="flex-1 rounded-lg bg-gray-100 hover:bg-gray-200 px-4 py-2 text-sm font-medium text-gray-700">
+            Cancel
+          </button>
+          <button onClick={save} disabled={!pw.trim() || busy}
+            className="flex-1 rounded-lg text-white disabled:opacity-40 px-4 py-2 text-sm font-semibold"
+            style={{background:'#128C7E'}}>
+            {busy ? "Verifying…" : "Verify & save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // SettingsModal — app-wide settings dialog, opened from the gear icon in
 // the header. Currently the OpenRouter API key (shared by cloud image
 // descriptions and voice transcription): status plus set / change /
@@ -1654,6 +1732,7 @@ function SettingsModal({ onClose, onPasswordChanged }) {
   const [keyStatus, setKeyStatus] = useState(null); // { has, persisted }
   const [pwStatus, setPwStatus]   = useState(null); // backup pw { has, persisted }
   const [showKey, setShowKey]     = useState(false);
+  const [showPw, setShowPw]       = useState(false);
 
   const reload = () =>
     api.get("/api/session/openrouter-key").then(setKeyStatus).catch(() => {});
@@ -1728,7 +1807,7 @@ function SettingsModal({ onClose, onPasswordChanged }) {
             <div className="min-w-0">
               <p className="font-medium text-gray-700 text-sm">iPhone backup password</p>
               <p className="text-xs text-gray-500 mt-1 leading-relaxed">
-                Decrypts this device's iOS backup. Entered when you run a backup or sync — tick “Remember on this computer” there to keep it across restarts.
+                Decrypts this device's iOS backup. Set it here (it's verified against your backup), or when you run a sync — tick “Remember on this computer” to keep it across restarts.
               </p>
               <p className="text-[11px] text-gray-400 mt-2">
                 {hasPw
@@ -1738,14 +1817,19 @@ function SettingsModal({ onClose, onPasswordChanged }) {
                   : <>Status: <span className="font-medium text-gray-600">not set</span></>}
               </p>
             </div>
-            {hasPw && (
-              <div className="shrink-0 flex flex-col items-end gap-2">
+            <div className="shrink-0 flex flex-col items-end gap-2">
+              <button onClick={() => setShowPw(true)}
+                className="rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
+                style={{background:'#075E54'}}>
+                {hasPw ? "Change password" : "Set password"}
+              </button>
+              {hasPw && (
                 <button onClick={forgetPw}
                   className="text-[11px] text-gray-400 underline decoration-dotted hover:text-gray-700">
                   forget
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
         </div>
 
@@ -1753,6 +1837,12 @@ function SettingsModal({ onClose, onPasswordChanged }) {
           <OpenRouterKeyModal
             onClose={() => setShowKey(false)}
             onSaved={() => { setShowKey(false); reload(); }}
+          />
+        )}
+        {showPw && (
+          <BackupPasswordModal
+            onClose={() => setShowPw(false)}
+            onSaved={() => { setShowPw(false); reloadPw(); onPasswordChanged && onPasswordChanged(); }}
           />
         )}
       </div>
