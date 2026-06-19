@@ -61,6 +61,11 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 20
 
+    # Expose the computed version to the windows job (a separate runner;
+    # GITHUB_OUTPUT is per-job, so it must be re-exported at job level).
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -277,7 +282,7 @@ jobs:
           prerelease: false
           generate_release_notes: true
           body: |
-            macOS arm64 (Apple Silicon).
+            macOS arm64 (Apple Silicon) + Windows x64.
 
             **Recommended — one Terminal command, zero Gatekeeper friction:**
 
@@ -290,6 +295,7 @@ jobs:
             **Other ways to get it:**
             - `WhatsKept-darwin-arm64-*.app.zip` — browser download. Unzip, then double-click `Install WhatsKept.command` inside the unzipped folder. macOS will ask to confirm the `.command` (right-click → Open the first time) but the script itself runs the same install steps.
             - `whatskept-darwin-arm64-*.zip` — bare CLI for `whatskept extract` / scripts.
+            - `WhatsKept-windows-amd64-*.zip` — Windows 10/11 x64. Unzip and run `whatskept.exe`.
 
             **Why this dance?** WhatsKept is open-source and ad-hoc signed (no Apple Developer account). On Sequoia the kernel refuses to launch ad-hoc-signed apps that carry a quarantine xattr, with no right-click bypass. The curl|bash route avoids quarantine entirely; the .command route works around it after a one-time confirmation.
           files: |
@@ -299,3 +305,105 @@ jobs:
             WhatsKept-darwin-arm64.app.zip
             whatskept-darwin-arm64.zip
             SHA256SUMS
+
+  # ---------------------------------------------------------------------------
+  # Windows x64 build.
+  #
+  # Runs on a native windows-latest runner (cross-compiling the two cgo deps —
+  # mattn/go-sqlite3 and webview_go's WebView2 binding — from macOS is more
+  # trouble than it's worth). `needs: build` so it starts AFTER the macOS job
+  # has created/updated the release for this ref; this windows job then just
+  # APPENDS its .exe zip to that same release (softprops updates in place), so
+  # each push ships the Windows binary right alongside the Mac one.
+  #
+  # Not yet wired in (tracked for the follow-up port work):
+  #   - The embedded libimobiledevice bundle is still macOS Mach-O, so the
+  #     Windows .exe builds and runs the GUI / on-disk-backup reading, but the
+  #     in-app "back up my iPhone" path needs Windows idevicebackup2.exe + an
+  #     OS-split go:embed before it works.
+  #   - No Authenticode signing; SmartScreen will warn on first run.
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows amd64
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # windows-latest ships a MinGW-w64 gcc on PATH, which cgo needs for
+      # go-sqlite3. Surface its version so a future toolchain change that
+      # breaks the build is obvious in the logs.
+      - name: Verify C toolchain
+        shell: bash
+        run: gcc --version
+
+      - name: Build
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          CGO_ENABLED: "1"
+        run: |
+          mkdir -p dist
+          go build -tags sqlite_fts5 \
+            -ldflags "-X main.Version=${VERSION}" \
+            -o dist/whatskept.exe ./cmd/whatskept
+          ls -lh dist/whatskept.exe
+
+      # Package the .exe + README into a versioned zip plus a stable,
+      # unversioned alias so /releases/latest/download/<file> links never go
+      # stale — same pattern as the macOS assets above.
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          mkdir -p out
+          cp README.md out/README.md
+          cp dist/whatskept.exe out/whatskept.exe
+          ( cd out && 7z a -tzip "../WhatsKept-windows-amd64-${VERSION}.zip" whatskept.exe README.md )
+          cp "WhatsKept-windows-amd64-${VERSION}.zip" "WhatsKept-windows-amd64.zip"
+          certutil -hashfile "WhatsKept-windows-amd64-${VERSION}.zip" SHA256
+
+      # Every push (PR included) keeps the freshly built .exe as a downloadable
+      # run artifact — your clean-room sanity check without cutting a release.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatskept-windows-amd64
+          path: WhatsKept-windows-amd64-*.zip
+          if-no-files-found: error
+
+      # main pushes: append the .exe to the rolling dev pre-release the macOS
+      # job already created. No name/body here on purpose — softprops leaves
+      # the macOS-authored release notes intact and just adds these assets.
+      - name: Attach to dev pre-release
+        if: ${{ github.ref == 'refs/heads/main' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   "dev-${{ github.run_number }}"
+          prerelease: true
+          files: |
+            WhatsKept-windows-amd64-*.zip
+            WhatsKept-windows-amd64.zip
+
+      # Tag pushes: append the .exe to the real release at that tag.
+      - name: Attach to tagged release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          prerelease: false
+          files: |
+            WhatsKept-windows-amd64-*.zip
+            WhatsKept-windows-amd64.zip

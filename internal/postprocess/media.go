@@ -614,7 +614,7 @@ func pickMediaIndexBackup(opts MediaIndexOptions) (backup.Info, error) {
 	}
 	root := opts.BackupRoot
 	if root == "" {
-		root = filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "MobileSync", "Backup")
+		root = backup.DefaultRoot()
 	}
 	infos, err := backup.Discover(root)
 	if err != nil {

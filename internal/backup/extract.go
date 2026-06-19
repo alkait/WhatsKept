@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 
 	dunhamsteve "github.com/dunhamsteve/ios/backup"
+	"github.com/dunhamsteve/ios/keybag"
+	dsplist "github.com/dunhamsteve/plist"
 )
 
 // WhatsApp file location inside an iOS backup.
@@ -45,10 +47,9 @@ func Open(info Info, password string) (*Bundle, error) {
 	if !info.IsEncrypted {
 		return nil, errors.New("unencrypted backup support not yet implemented in Go port")
 	}
-	udid := filepath.Base(info.Path)
-	mb, err := dunhamsteve.Open(udid)
+	mb, err := openAt(info.Path)
 	if err != nil {
-		return nil, fmt.Errorf("open backup %s: %w", udid, err)
+		return nil, fmt.Errorf("open backup %s: %w", filepath.Base(info.Path), err)
 	}
 	if err := mb.SetPassword(password); err != nil {
 		return nil, fmt.Errorf("unlock keybag: %w", err)
@@ -57,6 +58,34 @@ func Open(info Info, password string) (*Bundle, error) {
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
 	return &Bundle{mb: mb}, nil
+}
+
+// openAt opens a MobileBackup at an explicit directory.
+//
+// We deliberately do NOT use dunhamsteve.Open(guid): that helper re-derives
+// the backup directory from a hardcoded per-OS default — on Windows
+// %APPDATA%\Apple Computer\MobileSync\Backup (the legacy desktop-iTunes
+// location) — and ignores where the backup actually lives. The modern Apple
+// Devices app stores backups under %USERPROFILE%\Apple\MobileSync\Backup, so
+// the library's guess misses and decryption fails with "cannot find the path
+// specified" even though discovery (backup.DefaultRoot → candidateBackupRoots)
+// already located the backup. We have info.Path in hand, so honour it.
+//
+// This mirrors the body of dunhamsteve.Open exactly, minus the path-guessing,
+// so behaviour on macOS (where the guessed path already equalled info.Path) is
+// unchanged. It also makes a non-default backup root work on every OS.
+func openAt(dir string) (*dunhamsteve.MobileBackup, error) {
+	mb := &dunhamsteve.MobileBackup{Dir: dir}
+	r, err := os.Open(filepath.Join(dir, "Manifest.plist"))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	if err := dsplist.Unmarshal(r, &mb.Manifest); err != nil {
+		return nil, err
+	}
+	mb.Keybag = keybag.Read(mb.Manifest.BackupKeyBag)
+	return mb, nil
 }
 
 // Records returns the full manifest. Callers should treat the slice as

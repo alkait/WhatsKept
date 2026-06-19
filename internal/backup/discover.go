@@ -1,5 +1,5 @@
-// Package backup discovers iOS backups under
-// ~/Library/Application Support/MobileSync/Backup/ and reads their metadata
+// Package backup discovers iOS backups in the platform's MobileSync location
+// (see candidateBackupRoots in roots_<os>.go) and reads their metadata
 // (Info.plist + Manifest.plist).
 //
 // Mirrors the existing Python `whatskept.backup` module so the Go and Python
@@ -17,18 +17,27 @@ import (
 	"howett.net/plist"
 )
 
-// DefaultBackupRoot is the canonical macOS location.
+// DefaultRoot returns the backup discovery root for the current user.
 //
-// The actual returned value depends on $HOME at runtime; see DefaultRoot().
-const defaultBackupRootRel = "Library/Application Support/MobileSync/Backup"
-
-// DefaultRoot returns the default backup discovery root for the current user.
+// iOS backups live in different places per OS (macOS uses one fixed location;
+// Windows has two or three depending on whether the backup was made by the
+// Apple Devices app, Store iTunes, or legacy desktop iTunes). The per-OS
+// candidate list lives in candidateBackupRoots() (roots_<os>.go). We return
+// the first candidate that already exists on disk so discovery and the in-app
+// backup target agree on a real directory; if none exist yet, we return the
+// canonical (first) candidate so the UI's "No backups found in <root>" names
+// the place the user should expect them.
 func DefaultRoot() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return defaultBackupRootRel
+	roots := candidateBackupRoots()
+	if len(roots) == 0 {
+		return ""
 	}
-	return filepath.Join(home, defaultBackupRootRel)
+	for _, r := range roots {
+		if fi, err := os.Stat(r); err == nil && fi.IsDir() {
+			return r
+		}
+	}
+	return roots[0]
 }
 
 // ErrAccessDenied is returned when the backup root exists but cannot be read,

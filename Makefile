@@ -1,7 +1,15 @@
 BIN            := dist/whatskept
+WINBIN         := dist/whatskept.exe
 APP            := dist/WhatsKept.app
 PKG            := ./cmd/whatskept
 VERSION        ?= 0.0.0-dev
+
+# WIN_SHARE: path (Mac side) that the Windows VM can see, where
+# `make build-windows` drops the freshly built .exe so the VM picks it up
+# with no extra step. Defaults to ~/Downloads (visible from Parallels via the
+# shared home folder). Override with `make build-windows WIN_SHARE=...`, or
+# set it empty to build into dist/ only.
+WIN_SHARE      ?= $(HOME)/Downloads
 
 # Build tags enabled in dist/whatskept:
 #   sqlite_fts5  — mattn/go-sqlite3 ships the FTS5 amalgamation but
@@ -11,9 +19,33 @@ VERSION        ?= 0.0.0-dev
 #                  this tag. Required for the Database tab's sync.
 GO_TAGS := sqlite_fts5
 
-.PHONY: build bundle run list extract app clean tidy fmt vet test
+.PHONY: build build-windows bundle run list extract app clean tidy fmt vet test
 
 build: $(BIN)
+
+# build-windows cross-compiles the Windows x64 .exe from this Mac for the
+# Parallels test loop — no native build inside the VM required.
+#
+# Needs the mingw-w64 cross toolchain once:  brew install mingw-w64
+# webview_go vendors the WebView2 headers and links only standard Win32
+# system libs, so there is no Windows SDK dependency. The macOS-only
+# build/sign.sh step is intentionally skipped (Authenticode is a separate
+# concern; SmartScreen just warns on first run).
+#
+# Usage:
+#   make build-windows                       # -> dist/whatskept.exe
+#   make build-windows WIN_SHARE=~/win-share # also copies into the share
+build-windows:
+	@mkdir -p dist
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=1 \
+	  CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
+	  go build -tags "$(GO_TAGS)" -ldflags "-X main.Version=$(VERSION)" -o $(WINBIN) $(PKG)
+	@echo "built $(WINBIN) ($$(du -h $(WINBIN) | cut -f1))"
+	@if [ -n "$(WIN_SHARE)" ]; then \
+	  mkdir -p "$(WIN_SHARE)"; \
+	  cp $(WINBIN) "$(WIN_SHARE)/whatskept.exe"; \
+	  echo "copied -> $(WIN_SHARE)/whatskept.exe"; \
+	fi
 
 # The go:embed glob in internal/helpers/embed.go pulls
 # internal/helpers/bundle/* into the binary at compile time. Those are
