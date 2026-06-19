@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -35,8 +36,9 @@ const localDevVersion = "0.0.0-dev"
 // label even when GitHub is unreachable.
 func (s *server) handleMeta(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"version": s.version,
-		"repo":    repoSlug,
+		"version":  s.version,
+		"repo":     repoSlug,
+		"platform": runtime.GOOS, // UI gates mac-only affordances (update, Full Disk Access, device backup) on this
 	})
 }
 
@@ -55,6 +57,14 @@ type updateCheckResponse struct {
 
 func (s *server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	resp := updateCheckResponse{Current: s.version}
+
+	// Self-update is macOS-only: handleUpdateRun reinstalls the .app via the
+	// curl|bash installer through Terminal/osascript, which has no Windows or
+	// Linux equivalent yet. Don't advertise an update we can't apply.
+	if runtime.GOOS != "darwin" {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
 
 	// A plain local build never resolves to a distributable artifact, so
 	// there's nothing to update it to. Skip the network call entirely.

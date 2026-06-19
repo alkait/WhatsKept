@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -49,10 +50,16 @@ in a separate repository.`,
 }
 
 func main() {
-	// .app-bundle launch path: macOS invokes us with no args. Inject
-	// the `app` subcommand so the GUI opens instead of Cobra dumping
-	// help text into a terminal that the user can't see.
-	if len(os.Args) == 1 && strings.Contains(os.Args[0], bundleExecutableHint) {
+	// GUI-launch path: inject the `app` subcommand so the window opens
+	// instead of Cobra dumping help text into a console the user can't see.
+	//   - macOS: a Finder/Dock/`open` launch comes through the .app wrapper,
+	//     detectable via os.Args[0].
+	//   - Windows: there is no .app wrapper; a double-click (or a bare
+	//     `whatskept.exe`) arrives with no args and the user expects the GUI.
+	//     CLI users pass an explicit subcommand (`whatskept.exe list`), which
+	//     is unaffected — so defaulting a bare Windows invocation to `app` is
+	//     the right call for a primarily-GUI app.
+	if len(os.Args) == 1 && (strings.Contains(os.Args[0], bundleExecutableHint) || runtime.GOOS == "windows") {
 		os.Args = append(os.Args, "app")
 	}
 	if err := newRootCmd().Execute(); err != nil {

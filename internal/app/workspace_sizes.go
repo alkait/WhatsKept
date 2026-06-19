@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -170,17 +169,11 @@ func (s *server) handleWorkspaceReveal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Finder is part of the macOS base install; no detection step
-	// needed. `/usr/bin/open` is the canonical entry point and
-	// handles -R (reveal) consistently across macOS versions.
-	var cmd *exec.Cmd
-	if spec.isFile {
-		cmd = exec.Command("/usr/bin/open", "-R", target)
-	} else {
-		cmd = exec.Command("/usr/bin/open", target)
-	}
+	// Reveal in the OS file manager (Finder / Explorer). isFile selects
+	// "highlight within parent" vs "open the directory". See fileManagerCmd.
+	cmd := fileManagerCmd(target, spec.isFile)
 	if err := cmd.Start(); err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open Finder: %v", err))
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open file manager: %v", err))
 		return
 	}
 	go cmd.Wait() // reap child; we don't care about exit code

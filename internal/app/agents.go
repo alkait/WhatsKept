@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 )
 
@@ -32,6 +30,13 @@ type agentSpec struct {
 	AppName     string // GUI mode: ".app" basename under /Applications (empty for CLI)
 	Binary      string // CLI mode: executable basename, e.g. "claude" (empty for GUI)
 
+	// WinLauncher is the Windows CLI shim a GUI editor installs on PATH
+	// (VS Code → "code", Cursor → "cursor", Windsurf → "windsurf"). On
+	// Windows these editors aren't .app bundles, so detection/launch goes
+	// through this command instead of AppName. Empty for CLI agents (which
+	// use Binary cross-platform) and for GUI agents with no Windows shim.
+	WinLauncher string
+
 	// IgnoreFile is the dotfile name this agent (or its inline assistant)
 	// reads to know which workspace paths NOT to feed to a model. Written
 	// into the workspace by postprocess.WriteAssets to keep multi-MB
@@ -48,6 +53,7 @@ var agentRegistry = []agentSpec{
 		Name:        "Windsurf",
 		Description: "Cascade-powered IDE that reads AGENTS.md natively.",
 		AppName:     "Windsurf",
+		WinLauncher: "windsurf",
 		IgnoreFile:  ".windsurfignore",
 	},
 	{
@@ -55,6 +61,7 @@ var agentRegistry = []agentSpec{
 		Name:        "VS Code",
 		Description: "Microsoft's editor — pair with GitHub Copilot or any AGENTS.md-aware extension.",
 		AppName:     "Visual Studio Code",
+		WinLauncher: "code",
 		IgnoreFile:  ".copilotignore", // honoured by GitHub Copilot's content-exclusion plumbing
 	},
 	{
@@ -62,6 +69,7 @@ var agentRegistry = []agentSpec{
 		Name:        "Cursor",
 		Description: "AI-first VS Code fork — Composer reads AGENTS.md and honours .cursorignore.",
 		AppName:     "Cursor",
+		WinLauncher: "cursor",
 		IgnoreFile:  ".cursorignore",
 	},
 	{
@@ -121,69 +129,19 @@ func findAgent(id string) *agentSpec {
 	return nil
 }
 
-// detectAgent returns (true, path) if the agent is installed.
-// For GUI agents, path is the .app bundle. For CLI agents, path is
-// the resolved executable. Returns (false, "") if neither AppName
-// nor Binary is set, or nothing was found.
+// detectAgent returns (true, path) if the agent is installed. For GUI
+// agents, path is the launch target (the .app bundle on macOS, the resolved
+// CLI shim on Windows); for CLI agents, the resolved executable. Returns
+// (false, "") if neither AppName nor Binary is set, or nothing was found.
+//
+// detectGUIAgent / detectCLIAgent are platform-specific (agents_<os>.go):
+// where an agent lives and how it's launched differs by OS.
 func detectAgent(spec agentSpec) (bool, string) {
-	if spec.AppName != "" {
-		return detectGUIAgent(spec.AppName)
+	if spec.AppName != "" || spec.WinLauncher != "" {
+		return detectGUIAgent(spec)
 	}
 	if spec.Binary != "" {
-		return detectCLIAgent(spec.Binary)
-	}
-	return false, ""
-}
-
-// detectGUIAgent walks /Applications then ~/Applications, mirroring
-// Spotlight's lookup order.
-func detectGUIAgent(appName string) (bool, string) {
-	candidates := []string{
-		filepath.Join("/Applications", appName+".app"),
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, "Applications", appName+".app"))
-	}
-	for _, p := range candidates {
-		if st, err := os.Stat(p); err == nil && st.IsDir() {
-			return true, p
-		}
-	}
-	return false, ""
-}
-
-// detectCLIAgent walks the common macOS install locations for a
-// developer-installed binary, then falls back to $PATH. We can't
-// rely solely on exec.LookPath because when whatskept is launched
-// from Finder its PATH is the minimal LaunchServices default — it
-// doesn't include /opt/homebrew/bin, ~/.npm-global/bin, or
-// ~/.claude/local where `claude` actually lives.
-func detectCLIAgent(name string) (bool, string) {
-	var candidates []string
-	if p, err := exec.LookPath(name); err == nil {
-		candidates = append(candidates, p)
-	}
-	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates,
-			filepath.Join(home, ".claude", "local", name), // Anthropic's native installer
-			filepath.Join(home, ".opencode", "bin", name), // opencode's `curl … | bash` installer
-			filepath.Join(home, ".npm-global", "bin", name),
-			filepath.Join(home, ".local", "bin", name),
-			filepath.Join(home, ".volta", "bin", name),
-			filepath.Join(home, ".bun", "bin", name),   // `bun install -g …` (e.g. opencode-ai)
-			filepath.Join(home, ".deno", "bin", name),  // `deno install …`
-			filepath.Join(home, ".cargo", "bin", name), // `cargo install …`
-		)
-	}
-	candidates = append(candidates,
-		"/opt/homebrew/bin/"+name,
-		"/usr/local/bin/"+name,
-		"/usr/bin/"+name,
-	)
-	for _, p := range candidates {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
-			return true, p
-		}
+		return detectCLIAgent(spec)
 	}
 	return false, ""
 }
@@ -276,61 +234,15 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detached: we don't Wait() because we don't care about the agent's
-	// exit code — it'll outlive whatskept.
-	var cmd *exec.Cmd
-	if spec.AppName != "" {
-		// GUI: `open -a` goes through macOS LaunchServices, which (a)
-		// brings the app to focus if it's already running, (b) handles
-		// single-instance apps correctly, and (c) doesn't tie the agent's
-		// lifetime to whatskept (we exit, the agent keeps running).
-		// A bare exec.Command on the bundle's MacOS binary would launch
-		// a *new* instance every time and inherit our environment, both
-		// of which are wrong for an editor.
-		cmd = exec.Command("/usr/bin/open", "-a", resolved, target)
-	} else {
-		// CLI: launch a new Terminal window cd'd into the workspace and
-		// run the binary. We use AppleScript instead of `open -a Terminal`
-		// because we need to chain `cd <workspace> && exec <binary>` —
-		// `open -a` only opens the directory, it doesn't run a command.
-		//
-		// Cold-launch quirk: if Terminal isn't already running, the `tell`
-		// block launches it, and Terminal honours its "On startup, open:
-		// New window with default profile" preference (the macOS default)
-		// by opening an empty window. A subsequent bare `do script` then
-		// opens a *second* window for the agent, leaving the first one
-		// empty and confusing. We work around this by reusing window 1
-		// when we detect a cold launch — that's the default-profile
-		// window Terminal just opened for us. If the user has set
-		// startup-open to "No window", we fall back to a plain `do script`.
-		// Claude Code is launched with --dangerously-skip-permissions so
-		// it can read the workspace + run sqlite3 / open without prompting
-		// on every call (the workspace is local, read-only data the user
-		// already trusts). Other CLI agents launch with no extra args.
-		launch := shellQuote(resolved)
-		if spec.ID == "claude-code" || spec.Binary == "claude" {
-			launch += " --dangerously-skip-permissions"
-		}
-		shellCmd := fmt.Sprintf("cd %s && clear && exec %s", shellQuote(target), launch)
-		quoted := appleScriptQuote(shellCmd)
-		ascript := "tell application \"Terminal\"\n" +
-			"set wasRunning to running\n" +
-			"activate\n" +
-			"if wasRunning then\n" +
-			"do script " + quoted + "\n" +
-			"else\n" +
-			"repeat 20 times\n" +
-			"if (count of windows) > 0 then exit repeat\n" +
-			"delay 0.05\n" +
-			"end repeat\n" +
-			"if (count of windows) > 0 then\n" +
-			"do script " + quoted + " in window 1\n" +
-			"else\n" +
-			"do script " + quoted + "\n" +
-			"end if\n" +
-			"end if\n" +
-			"end tell"
-		cmd = exec.Command("/usr/bin/osascript", "-e", ascript)
+	// Build the platform-specific launch command (GUI editor vs CLI agent
+	// in a terminal). buildAgentCmd lives in agents_<os>.go because the
+	// mechanics differ entirely per OS (LaunchServices + AppleScript on
+	// macOS; the editor's CLI shim + Windows Terminal/cmd on Windows). The
+	// launched process is detached so the agent outlives whatskept.
+	cmd, err := buildAgentCmd(*spec, resolved, target)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch %s: %v", spec.Name, err))
+		return
 	}
 	if err := cmd.Start(); err != nil {
 		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch %s: %v", spec.Name, err))
@@ -346,22 +258,6 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// shellQuote wraps s in single quotes, escaping any embedded single
-// quotes by closing the quoted run, emitting an escaped quote, and
-// reopening — the standard POSIX-shell idiom.
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-// appleScriptQuote wraps s in double quotes for AppleScript string
-// literals, escaping backslashes and double quotes. Order matters:
-// backslashes must be doubled FIRST so the doubled escapes we add
-// next aren't themselves doubled again.
-func appleScriptQuote(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
-}
 
 // handleOpenTerminal opens the workspace directory in macOS Terminal
 // so the user can pick whatever CLI agent (claude, codex, etc.) they
@@ -392,9 +288,13 @@ func (s *server) handleOpenTerminal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command("/usr/bin/open", "-a", "Terminal", target)
+	cmd, err := buildTerminalCmd(target)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch terminal: %v", err))
+		return
+	}
 	if err := cmd.Start(); err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch Terminal: %v", err))
+		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch terminal: %v", err))
 		return
 	}
 	go cmd.Wait()
@@ -403,4 +303,17 @@ func (s *server) handleOpenTerminal(w http.ResponseWriter, r *http.Request) {
 		"ok":     true,
 		"opened": target,
 	})
+}
+
+// appleScriptQuote wraps s in double quotes for AppleScript string literals,
+// escaping backslashes and double quotes. Order matters: backslashes must be
+// doubled FIRST so the doubled escapes we add next aren't doubled again.
+//
+// Lives in shared code (not agents_darwin.go) because the macOS-only update
+// handler in update.go also uses it; it's an inert pure string helper on
+// non-macOS builds.
+func appleScriptQuote(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return `"` + s + `"`
 }

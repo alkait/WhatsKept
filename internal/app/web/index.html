@@ -2760,6 +2760,10 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   const [backups, setBackups]       = useState([]);
   const [backupsKey, setBackupsKey] = useState(0);
   const [loading, setLoading]       = useState(true);
+  // OS reported by the backend (/api/meta). Gates macOS-only UI: Full Disk
+  // Access, in-app device backup, and mac-specific path hints.
+  const [platform, setPlatform]     = useState("");
+  const isMac = platform === "darwin";
   const [deleteTarget, setDeleteTarget] = useState(null);
   // Header workspace-menu state. menuOpen toggles the dropdown,
   // deletingWs gates the confirm modal. The menu auto-closes on any
@@ -2886,6 +2890,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     const id = setInterval(() => reloadBackups({ silent: true }), 3000);
     return () => clearInterval(id);
   }, [tab, reloadBackups]);
+
+  // ── detect the host OS once (gates macOS-only UI) ─────────────────────
+  useEffect(() => {
+    api.get("/api/meta").then(m => setPlatform(m.platform || "")).catch(() => {});
+  }, []);
 
   // ── poll devices every 3 s ────────────────────────────────────────────
   useEffect(() => {
@@ -3190,21 +3199,28 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             {loading ? (
               <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>
             ) : backupsError ? (
-              <div className="rounded-xl border p-5 text-sm" style={{borderColor:'#128C7E',background:'#fff'}}>
-                <div className="font-medium mb-2" style={{color:'#075E54'}}>Full Disk Access required</div>
-                <div className="text-gray-600 mb-4 leading-relaxed">
-                  WhatsKept needs Full Disk Access to read your iOS backups. Turn it on
-                  for WhatsKept in System Settings, then quit and reopen the app.
+              isMac ? (
+                <div className="rounded-xl border p-5 text-sm" style={{borderColor:'#128C7E',background:'#fff'}}>
+                  <div className="font-medium mb-2" style={{color:'#075E54'}}>Full Disk Access required</div>
+                  <div className="text-gray-600 mb-4 leading-relaxed">
+                    WhatsKept needs Full Disk Access to read your iOS backups. Turn it on
+                    for WhatsKept in System Settings, then quit and reopen the app.
+                  </div>
+                  <button onClick={() => window._wkpOpenFullDiskAccess && window._wkpOpenFullDiskAccess()}
+                    className="rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
+                    style={{background:'#075E54'}}>
+                    Open Full Disk Access settings
+                  </button>
                 </div>
-                <button onClick={() => window._wkpOpenFullDiskAccess && window._wkpOpenFullDiskAccess()}
-                  className="rounded-lg text-white px-4 py-2 text-sm font-semibold transition-colors"
-                  style={{background:'#075E54'}}>
-                  Open Full Disk Access settings
-                </button>
-              </div>
+              ) : (
+                <div className="rounded-xl border p-5 text-sm" style={{borderColor:'#128C7E',background:'#fff'}}>
+                  <div className="font-medium mb-2" style={{color:'#075E54'}}>Couldn't read your backups</div>
+                  <div className="text-gray-600 leading-relaxed">{backupsError}</div>
+                </div>
+              )
             ) : backups.length === 0 ? (
               <div className="rounded-xl border border-dashed p-8 text-center text-sm text-gray-400" style={{borderColor:'#128C7E'}}>
-                No backups found in ~/Library/Application Support/MobileSync/Backup
+                No backups found in {platform === "windows" ? "%USERPROFILE%\\Apple\\MobileSync\\Backup" : "~/Library/Application Support/MobileSync/Backup"}
               </div>
             ) : (
               <div className="space-y-3">
@@ -3216,8 +3232,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             )}
           </section>
 
-          {/* ── Run Backup ── */}
-          <section>
+          {/* ── Run Backup (macOS only — Windows in-app device backup is not yet supported; make backups with the Apple Devices app) ── */}
+          {isMac && (<section>
             <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Run Backup</h2>
             {devices.length === 0 ? (
               <div className="rounded-xl border border-dashed p-4 text-sm flex items-center gap-3" style={{borderColor:'#128C7E',background:'#fff',color:'#128C7E'}}>
@@ -3249,7 +3265,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
                 </div>
               );
             })()}
-          </section>
+          </section>)}
         </>)}
 
         {/* ══ AGENTS TAB ══ */}
