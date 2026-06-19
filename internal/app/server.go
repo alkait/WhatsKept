@@ -135,11 +135,11 @@ func (s *server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/database/media-describe/status", s.handleMediaDescribeStatus)
 	mux.HandleFunc("POST /api/database/media-describe", s.handleMediaDescribe)
 
-	// Voice transcription. The model-status route lets the GUI decide
-	// whether to open the "first run, please download model" modal
-	// before kicking off a transcription job.
-	mux.HandleFunc("GET /api/database/voice-index/model-status", s.handleVoiceModelStatus)
-	mux.HandleFunc("POST /api/database/voice-index/model-download", s.handleVoiceModelDownload)
+	// Voice transcription (cloud). status drives the card's coverage +
+	// key gating; issues lists failed/missing clips; the POST runs the
+	// cloud transcribe over already-downloaded voice notes.
+	mux.HandleFunc("GET /api/database/voice-index/status", s.handleVoiceStatus)
+	mux.HandleFunc("GET /api/database/voice-index/issues", s.handleVoiceIndexIssues)
 	mux.HandleFunc("POST /api/database/voice-index", s.handleVoiceIndex)
 
 	// Document indexing — PDF text extraction (PDFKit + Vision OCR
@@ -1520,141 +1520,176 @@ func (s *server) handleForgetBinding(w http.ResponseWriter, _ *http.Request) {
 // Voice transcription
 // ---------------------------------------------------------------------------
 
-// voiceModelStatusResponse is the shape returned by GET
-// /api/database/voice-index/model-status. The frontend uses
-// `installed` to decide whether to open the download modal before
-// kicking off a transcription job.
-//
-// We deliberately do NOT sha-verify on this read path — the call
-// happens on every Database-tab mount, and verifying 574 MB takes
-// ~0.5 s which would make the tab feel sluggish. Verification
-// happens when the file is first downloaded (where corruption
-// risk is highest), and a wrong-content file has the wrong size
-// in 99% of cases anyway.
-type voiceModelStatusResponse struct {
-	Installed    bool   `json:"installed"`     // true iff size matches spec.Bytes
-	Name         string `json:"name"`          // basename, e.g. "ggml-large-v3-turbo-q5_0.bin"
-	Display      string `json:"display"`       // human-readable model name
-	BytesTotal   int64  `json:"bytes_total"`   // expected final size
-	BytesPresent int64  `json:"bytes_present"` // current file size (0 if missing)
-	SourceURL    string `json:"source_url"`
-	Path         string `json:"path"` // absolute path the model would live at
+// voiceStatusResponse drives the cloud voice card: whether a key is held,
+// how many voice notes exist, and how many are downloaded / transcribed.
+type voiceStatusResponse struct {
+	HasKey       bool   `json:"has_key"`
+	TotalVoice   int    `json:"total_voice"`
+	Downloaded   int    `json:"downloaded"`  // .opus on disk (downloaded + transcribed)
+	Transcribed  int    `json:"transcribed"` // voice_index status='transcribed'
+	Missing      int    `json:"missing"`     // referenced but not in the backup
+	Errors       int    `json:"errors"`      // download errors + per-clip transcribe failures
+	DefaultModel string `json:"default_model"`
 }
 
-func (s *server) handleVoiceModelStatus(w http.ResponseWriter, _ *http.Request) {
-	spec := helpers.WhisperModel
-	st, sz, err := helpers.CheckModel(spec, false)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("check model: %v", err))
+// handleVoiceStatus reports cloud-transcribe readiness + coverage. Read-only.
+func (s *server) handleVoiceStatus(w http.ResponseWriter, _ *http.Request) {
+	resp := voiceStatusResponse{
+		HasKey:       s.apiKey.has(),
+		DefaultModel: postprocess.DefaultVoiceModel,
+	}
+	cur := s.ws.get()
+	if cur == "" {
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	path, _ := helpers.ModelPath(spec)
-	writeJSON(w, http.StatusOK, voiceModelStatusResponse{
-		Installed:    st == helpers.ModelPresent || st == helpers.ModelVerified,
-		Name:         spec.Name,
-		Display:      spec.Display,
-		BytesTotal:   spec.Bytes,
-		BytesPresent: sz,
-		SourceURL:    spec.URL,
-		Path:         path,
-	})
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	defer db.Close()
+	_ = db.QueryRow(`SELECT COUNT(*) FROM ZWAMEDIAITEM WHERE ZMEDIALOCALPATH LIKE '%.opus'`).Scan(&resp.TotalVoice)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status IN ('downloaded','transcribed')`).Scan(&resp.Downloaded)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'transcribed'`).Scan(&resp.Transcribed)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`).Scan(&resp.Missing)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'error' OR transcribe_error IS NOT NULL`).Scan(&resp.Errors)
+	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleVoiceModelDownload starts an SSE-streamed model download
-// job. The response is `{job_id}` and progress events flow through
-// /api/stream/{id} as `progress` events whose payload is a
-// helpers.DownloadProgress JSON.
-//
-// Idempotent: if the model is already on disk, the job emits a
-// single "done" event without ever hitting the network.
-func (s *server) handleVoiceModelDownload(w http.ResponseWriter, _ *http.Request) {
-	jobID := s.jobs.startInProcessProgress("voice-model-download",
-		func(log func(string), progress func(any)) error {
-			spec := helpers.WhisperModel
-			log(fmt.Sprintf("Speech model: %s", spec.Display))
-			log(fmt.Sprintf("Source: %s", spec.URL))
-			log(fmt.Sprintf("Size: %d MB", spec.Bytes/(1024*1024)))
-			log("Downloading…")
-			err := helpers.DownloadModel(spec, helpers.DownloadOptions{
-				Ctx: context.Background(),
-				Progress: func(p helpers.DownloadProgress) {
-					progress(p)
-				},
-			})
-			if err != nil {
-				return err
-			}
-			log("Model installed.")
-			return nil
-		})
-	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
+// handleVoiceIndexIssues lists failed/missing voice notes (mirrors the
+// media issues endpoint). Errors span download failures (status='error')
+// and per-clip transcribe failures (transcribe_error set).
+func (s *server) handleVoiceIndexIssues(w http.ResponseWriter, r *http.Request) {
+	cur := s.ws.get()
+	if cur == "" {
+		httpError(w, http.StatusBadRequest, "no workspace open")
+		return
+	}
+	dbPath := filepath.Join(cur, "ChatStorage.sqlite")
+	if _, err := os.Stat(dbPath); err != nil {
+		httpError(w, http.StatusBadRequest, "no database in workspace")
+		return
+	}
+	limit := 200
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 5000 {
+			limit = n
+		}
+	}
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "open db: "+err.Error())
+		return
+	}
+	defer db.Close()
+
+	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Missing: []mediaIndexIssue{}, Limit: limit}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='voice_index'`).Scan(&n); err != nil || n == 0 {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'error' OR transcribe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+	if out.ErrorsTotal > 0 {
+		out.Errors = queryVoiceErrors(db, limit)
+	}
+	if out.MissingTotal > 0 {
+		out.Missing = queryVoiceIssues(db, "missing", limit)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
-// voiceIndexRequest — the JSON body may
-// optionally carry a password override; otherwise the session cache
-// is consulted.
+func queryVoiceErrors(db *sql.DB, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path,
+		        COALESCE(NULLIF(error, ''), transcribe_error, ''),
+		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM voice_index
+		 WHERE status = 'error' OR transcribe_error IS NOT NULL
+		 ORDER BY attempted_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func queryVoiceIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
+	rows, err := db.Query(
+		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
+		 FROM voice_index WHERE status = ? ORDER BY attempted_at DESC LIMIT ?`, status, limit)
+	if err != nil {
+		return []mediaIndexIssue{}
+	}
+	defer rows.Close()
+	out := []mediaIndexIssue{}
+	for rows.Next() {
+		var x mediaIndexIssue
+		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// voiceIndexRequest is the body of POST /api/database/voice-index. The
+// OpenRouter key comes from the session store (never the body). Cloud
+// transcribe reads voice/ off disk — no backup password.
 type voiceIndexRequest struct {
-	Password string `json:"password"`
-	Language string `json:"language"` // optional pin, e.g. "ar" or "en"
+	Model       string `json:"model"`
+	Concurrency int    `json:"concurrency"` // 0 = server default
+	Force       bool   `json:"force"`       // re-transcribe everything
 }
 
-// handleVoiceIndex starts a `postprocess.VoiceIndex` SSE job. If
-// the speech model isn't installed, returns HTTP 412 with
-// `{error: "model_required"}` so the frontend can route to the
-// download modal first.
+// handleVoiceIndex starts a cloud voice-transcribe run as a cancellable
+// SSE job over the already-downloaded voice notes.
 func (s *server) handleVoiceIndex(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
 		httpError(w, http.StatusBadRequest, "no workspace open")
 		return
 	}
-
-	// Pre-flight: model must be installed.
-	st, _, err := helpers.CheckModel(helpers.WhisperModel, false)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("check model: %v", err))
+	key := s.apiKey.get()
+	if key == "" {
+		httpError(w, http.StatusBadRequest, "OpenRouter API key required — set it first")
 		return
 	}
-	if st != helpers.ModelPresent && st != helpers.ModelVerified {
-		writeJSON(w, http.StatusPreconditionFailed, map[string]string{
-			"error": "model_required",
-			"hint":  "POST /api/database/voice-index/model-download first",
-		})
-		return
-	}
-
 	var req voiceIndexRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		httpError(w, http.StatusBadRequest, "invalid JSON body")
 		return
 	}
-	attempted := req.Password
-	if attempted == "" {
-		attempted = s.pw.get()
-	}
-	if attempted == "" {
-		httpError(w, http.StatusBadRequest, "backup password is required")
-		return
-	}
-
-	jobID := s.jobs.startInProcessProgress("voice-index",
-		func(log func(string), progress func(any)) error {
+	jobID := s.jobs.startInProcessProgressCtx("voice-index",
+		func(ctx context.Context, log func(string), progress func(any)) error {
 			_, err := postprocess.VoiceIndex(postprocess.VoiceIndexOptions{
-				Workspace:  cur,
-				BackupRoot: backup.DefaultRoot(),
-				Password:   attempted,
-				Language:   req.Language,
-				Log:        log,
+				Workspace:   cur,
+				Engine:      postprocess.SourceCloud,
+				APIKey:      key,
+				Model:       req.Model,
+				Concurrency: req.Concurrency,
+				Force:       req.Force,
+				Ctx:         ctx,
+				Log:         log,
 				Progress: func(p postprocess.VoiceIndexProgress) {
 					progress(p)
 				},
 			})
-			if err == nil {
-				s.pw.set(attempted)
-			}
 			return err
 		})
-
 	writeJSON(w, http.StatusOK, map[string]string{"job_id": jobID})
 }
 
@@ -1676,8 +1711,7 @@ type documentIndexRequest struct {
 // teardown between rows.
 //
 // No model-status pre-flight here — PDFKit + Vision are first-party
-// macOS frameworks always present on supported OS versions, unlike
-// the whisper model which is downloaded on first use.
+// macOS frameworks always present on supported OS versions.
 func (s *server) handleDocumentIndex(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {

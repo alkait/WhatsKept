@@ -52,15 +52,15 @@ agent-friendly workspace on disk.
   refresh the source without leaving the app.
 - **Decrypts** the WhatsApp `ChatStorage.sqlite` and the media/voice
   blobs from the encrypted iOS backup, using your backup password.
-- **Processes media locally**: voice-note transcription through
-  `whisper.cpp` with Metal, and PDF document text extraction through
-  Apple PDFKit (with Vision OCR fallback for scanned pages).
-- **Cloud image descriptions** (opt-in): images are read and described
-  by a cloud vision model through [OpenRouter](https://openrouter.ai),
-  using your own API key — producing OCR text plus a short description.
-  This is the **one feature that sends your data off the device** —
-  each described image is uploaded to OpenRouter. It is off by default
-  and lives behind its own button. See [Privacy](#privacy).
+- **Extracts PDF document text locally** through Apple PDFKit (with
+  Vision OCR fallback for scanned pages).
+- **Cloud enrichment** (opt-in): images are described and voice notes
+  transcribed by cloud AI models through
+  [OpenRouter](https://openrouter.ai), using your own API key — image
+  OCR + descriptions, and voice-note transcripts in any language. These
+  are the features that **send data off the device** (the images /
+  voice notes you choose to run). Both are off by default, behind their
+  own buttons. See [Privacy](#privacy).
 - **Normalizes** everything into a single SQLite database (with FTS5)
   alongside extracted `media/`, `voice/`, `documents/`, and
   `profiles/` folders, joined against your macOS Contacts so chats
@@ -72,23 +72,21 @@ agent-friendly workspace on disk.
 **What it does *not* do**
 
 - **No built-in chat, no built-in agent runtime.** WhatsKept never
-  sends your messages, transcripts, or contacts to a cloud LLM, and it
-  does not "summarize your chats" or answer questions on its own —
-  that is the agent's job (see below). The one exception is the
-  **opt-in cloud image-description** feature: if you turn it on and
-  supply an OpenRouter API key, your images (and only your images) are
-  uploaded to OpenRouter for OCR + captioning. It is off by default.
+  sends your messages or contacts to a cloud LLM, and it does not
+  "summarize your chats" or answer questions on its own — that is the
+  agent's job (see below). The exceptions are the **opt-in cloud
+  enrichment** features: if you turn them on and supply an OpenRouter
+  API key, your images and/or voice notes (and only those) are uploaded
+  to OpenRouter for description / transcription. Both are off by default.
 - **No cloud sync, no account, no telemetry.** WhatsKept makes only
   these outbound requests, all to well-known hosts:
   - a version check against the **GitHub** Releases API when the app
     window opens (so it can offer an Update button) — carries none of
     your data;
-  - only if you opt into voice transcription, a one-time HTTPS
-    download of the whisper model from **HuggingFace** — carries none
-    of your data;
-  - only if you opt into cloud image descriptions, an API-key
-    validation check and one chat-completion request per image to
-    **OpenRouter** — these **do** carry image content from your backup.
+  - only if you opt into cloud image descriptions or voice
+    transcription, an API-key validation check and one chat-completion
+    request per image / voice note to **OpenRouter** — these **do**
+    carry that image / audio content from your backup.
 
   Nothing else leaves the machine. There is no account, no analytics,
   and no background sync.
@@ -123,10 +121,10 @@ workspace your agent can `MATCH` against. The four side-car
 indexers (avatars/contacts, images, voice, documents) are all
 **opt-in** — each one lives behind its own button in the Database
 tab and can be skipped, re-run, or resumed independently. Decryption,
-contacts/avatars, voice transcription, and PDF extraction all run
-**on-device**. The one exception is the **opt-in cloud image
-descriptions** path — if you enable it, images are uploaded to
-OpenRouter to be read and described.
+contacts/avatars, media download, and PDF extraction all run
+**on-device**. The exceptions are the **opt-in cloud enrichment** paths
+— image descriptions and voice transcription — which upload the images
+/ voice notes you run to OpenRouter.
 
 ```mermaid
 %%{init: {'flowchart': {'subGraphTitleMargin': {'top': 32, 'bottom': 32}}}}%%
@@ -150,7 +148,7 @@ flowchart TD
         direction LR
         PS{{"Sync contacts &amp; avatars"}}:::proc
         MI{{"Image descriptions<br/>(opt-in cloud)"}}:::proc
-        VI{{"Voice-note transcription"}}:::proc
+        VI{{"Voice transcription<br/>(opt-in cloud)"}}:::proc
         XI{{"PDF text extraction"}}:::proc
     end
 
@@ -190,8 +188,7 @@ model embeds them, and they're clustered into people. Nothing is uploaded.
 The model (AdaFace, MIT — see
 [`build/faces-helper/convert/`](build/faces-helper/convert/)) is **not**
 bundled; it's downloaded once on first use (~120 MB) to
-`~/Library/Application Support/whatskept/models/` and SHA-256 verified, the
-same way the Whisper speech model is.
+`~/Library/Application Support/whatskept/models/` and SHA-256 verified.
 
 You then **name** the people you care about in the grid (type a name; the
 same name on two groups merges them; ✕ a stray photo to remove it). Naming
@@ -242,9 +239,8 @@ SHA-256 against the release's `SHA256SUMS`, drops it into
 ## System requirements
 
 - **macOS 13.0 Ventura or later** on **Apple Silicon (arm64)** — the
-  bundled Swift Vision helper is arm64-only, the embedded
-  libimobiledevice dylibs come from `/opt/homebrew/*`, and the bundled
-  `whisper-cli` is compiled with `GGML_METAL=ON`.
+  bundled Swift Vision helper is arm64-only and the embedded
+  libimobiledevice dylibs come from `/opt/homebrew/*`.
 - **Full Disk Access** for WhatsKept.app (or your Terminal, if you
   launched from a shell) — required to read
   `~/Library/Application Support/MobileSync/Backup/`. Grant under
@@ -269,25 +265,20 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
   well-known host and carry none of your WhatsApp data. The GUI's HTTP
   server binds to `127.0.0.1` only — it is not reachable from other
   devices on your network.
-- **Local processing stays on-device.** Voice transcription runs
-  through `whisper.cpp` with Metal acceleration; PDF text extraction
-  runs through Apple PDFKit + Vision OCR (`whatskept-vision`); **face
+- **Local processing stays on-device.** PDF text extraction runs
+  through Apple PDFKit + Vision OCR (`whatskept-vision`); **face
   detection + recognition** for the People feature run through Apple
-  Vision + a local CoreML model (`whatskept-faces`). None of them talk
-  to a cloud service — that data never leaves the Mac. (Image
-  *descriptions* are the exception: they're cloud-only and opt-in — see
-  below.)
+  Vision + a local CoreML model (`whatskept-faces`). Neither talks to a
+  cloud service — that data never leaves the Mac. (Image *descriptions*
+  and voice *transcription* are the exceptions: they're cloud-only and
+  opt-in — see below.)
 - **Backup password is never transmitted.** It's read from
   `$BACKUP_PASSWORD` or a `.env` file in the workspace, held in
   process memory for the lifetime of the app session, and cleared
   when you switch workspaces or quit. Not written anywhere by
   WhatsKept on its own.
-- **Whisper model: one opt-in download.** The first time you run voice
-  transcription, the ~574 MB whisper model is downloaded from
-  HuggingFace over HTTPS and SHA-256 verified. After that, that
-  feature is fully offline.
-- **Cloud image descriptions use your own key.** The opt-in OpenRouter
-  feature (below) uses an API key *you* supply, validated against
+- **Cloud enrichment uses your own key.** The opt-in image-description
+  and voice-transcription features (below) use an API key *you* supply, validated against
   `openrouter.ai`. By default it's held in memory for the session only.
   If you tick **"Remember on this computer"** it's saved to a private
   `0600` file in your user config dir (`~/Library/Application Support/whatskept/`
@@ -306,19 +297,18 @@ WhatsKept is designed to keep your WhatsApp history on your machine.
 
 **What to be cautious about**
 
-- **Cloud image descriptions send your images off the device.** This is
-  the one feature that breaks the on-device guarantee. When you enable
-  it, each described image is uploaded to OpenRouter
-  (`https://openrouter.ai/api/v1/chat/completions`) along with a fixed
-  OCR + caption prompt; OpenRouter (and the upstream model provider it
-  routes to) sees those image bytes, and they are subject to
-  OpenRouter's data-retention policy, not WhatsKept's. Only images are
-  sent — never your text messages, voice notes, or contacts — and only
-  for the images you choose to run. The feature is **off by default**;
-  if you never enter an API key and never start a cloud run, nothing is
-  ever uploaded. Image description is the only describer — there is no
-  on-device alternative — so skip it entirely if you want zero image
-  data to leave the machine (text search, voice, and PDFs still work).
+- **Cloud enrichment sends your images and voice notes off the device.**
+  These are the features that break the on-device guarantee. When you
+  enable them, each described image / transcribed voice note is uploaded
+  to OpenRouter (`https://openrouter.ai/api/v1/chat/completions`);
+  OpenRouter (and the upstream model provider it routes to) sees those
+  bytes, subject to OpenRouter's data-retention policy, not WhatsKept's.
+  Only the images / voice notes you run are sent — never your text
+  messages or contacts. Both are **off by default**; if you never enter
+  an API key and never start a run, nothing is ever uploaded. Cloud is
+  the only engine for both — there is no on-device alternative — so skip
+  them entirely if you want zero image/audio data to leave the machine
+  (text search and PDFs still work).
 - **The workspace contains *decrypted* WhatsApp data.** `ChatStorage.sqlite`,
   `media/`, `voice/`, `documents/`, and `profiles/` are plaintext on
   disk, and the Messages sync also joins your macOS Contacts (names + phone

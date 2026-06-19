@@ -11,16 +11,16 @@ import (
 )
 
 // This file owns the on-disk lifecycle of large ML model files that
-// are too big to embed into the Go binary. The Whisper speech model
-// is 574 MB; embedding it would inflate every dev build, every CI
+// are too big to embed into the Go binary. The AdaFace face model is
+// ~120 MB; embedding it would inflate every dev build, every CI
 // artifact, and every release ZIP by that much, while also forcing
 // users to re-download it on every app update. Instead the model
 // lives in ~/Library/Application Support/whatskept/models/ and is
-// fetched from HuggingFace on first use, persisting across upgrades.
+// fetched on first use, persisting across upgrades.
 //
-// The download itself is performed by internal/postprocess/voice.go;
-// this file only owns specs (URL, sha256, expected size) and path
-// resolution.
+// This file only owns specs (URL, sha256, expected size) and path
+// resolution; the download itself is driven by the feature that needs
+// the model (e.g. the People face card).
 
 // ModelSpec describes one downloadable ML model.
 //
@@ -35,21 +35,6 @@ type ModelSpec struct {
 	URL     string // HTTPS source
 	SHA256  string // lower-hex; used to verify post-download
 	Bytes   int64  // expected file size in bytes
-}
-
-// WhisperModel is the speech model used by `whatskept voice-index`.
-//
-// We default to the "large-v3-turbo" weights at q5_0 quantization,
-// which match the quality we measured in the Phase 0b POC at 13.9×
-// realtime on M-series Macs. Switching to a different size (medium,
-// large) is a one-constant change here plus a new `make fetch-model`
-// invocation; the caller code is model-agnostic.
-var WhisperModel = ModelSpec{
-	Name:    "ggml-large-v3-turbo-q5_0.bin",
-	Display: "Whisper Large-v3-Turbo (q5_0, multilingual)",
-	URL:     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
-	SHA256:  "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
-	Bytes:   574041195,
 }
 
 // AdaFaceModel is the on-device face-recognition model used by the

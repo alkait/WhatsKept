@@ -151,23 +151,31 @@ func (c *cloudDescriber) Describe(ctx context.Context, _ int64, _ string, data [
 	return Description{OCRText: ocr, Description: desc}, nil
 }
 
-// call POSTs one chat-completion request, retrying on 429/5xx with
-// exponential backoff that honours ctx cancellation. Returns the
-// decoded (validated, non-empty-choices) response.
+// call POSTs one chat-completion request via the shared OpenRouter
+// client (retry/backoff/FatalError handling lives in openRouterCall).
 func (c *cloudDescriber) call(ctx context.Context, body []byte) (*chatResponse, error) {
+	return openRouterCall(ctx, c.client, c.apiKey, body)
+}
+
+// openRouterCall POSTs one chat-completion request, retrying on 429/5xx
+// with exponential backoff that honours ctx cancellation. Auth/billing
+// failures (401/402/403) return a FatalError so a run aborts instead of
+// marking every row errored. Shared by the image describer and the voice
+// transcriber. Returns the decoded (validated, non-empty-choices) response.
+func openRouterCall(ctx context.Context, client *http.Client, apiKey string, body []byte) (*chatResponse, error) {
 	var lastErr error
 	for attempt := 0; attempt < cloudMaxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, openRouterURL, bytes.NewReader(body))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+		req.Header.Set("Authorization", "Bearer "+apiKey)
 		req.Header.Set("Content-Type", "application/json")
 		// OpenRouter attribution headers (optional, recommended).
 		req.Header.Set("HTTP-Referer", "https://github.com/whatskept")
 		req.Header.Set("X-Title", "whatskept")
 
-		resp, err := c.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
@@ -295,13 +303,21 @@ type chatMessage struct {
 }
 
 type contentPart struct {
-	Type     string        `json:"type"`
-	Text     string        `json:"text,omitempty"`
-	ImageURL *imageURLPart `json:"image_url,omitempty"`
+	Type       string          `json:"type"`
+	Text       string          `json:"text,omitempty"`
+	ImageURL   *imageURLPart   `json:"image_url,omitempty"`
+	InputAudio *inputAudioPart `json:"input_audio,omitempty"`
 }
 
 type imageURLPart struct {
 	URL string `json:"url"`
+}
+
+// inputAudioPart carries base64 audio for transcription models. `Format`
+// is the container hint (e.g. "ogg" for WhatsApp's Ogg/Opus voice notes).
+type inputAudioPart struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
 }
 
 type chatResponse struct {

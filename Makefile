@@ -5,7 +5,6 @@ VISION_HELPER  := internal/helpers/bundle/whatskept-vision
 VISION_SRC     := build/vision-helper/main.swift
 FACES_HELPER   := internal/helpers/bundle/whatskept-faces
 FACES_SRC      := build/faces-helper/main.swift
-WHISPER_HELPER := internal/helpers/bundle/whisper-cli
 VERSION        ?= 0.0.0-dev
 
 # Build tags enabled in dist/whatskept:
@@ -16,7 +15,7 @@ VERSION        ?= 0.0.0-dev
 #                  this tag. Required for the Database tab's sync.
 GO_TAGS := sqlite_fts5
 
-.PHONY: build bundle vision-helper faces-helper whisper-helper run list extract app clean tidy fmt vet test
+.PHONY: build bundle vision-helper faces-helper run list extract app clean tidy fmt vet test
 
 build: $(BIN)
 
@@ -65,20 +64,6 @@ $(FACES_HELPER): $(FACES_SRC)
 	swiftc -O -o $(FACES_HELPER) $(FACES_SRC)
 	@chmod +x build/sign.sh
 	@./build/sign.sh $(FACES_HELPER)
-
-# whisper-helper rebuilds internal/helpers/bundle/whisper-cli from
-# a fresh checkout of ggerganov/whisper.cpp. The binary is committed
-# to the repo (just like the vision helper), so a normal `make build`
-# does NOT trigger this — it's a maintainer/CI target you invoke
-# explicitly when bumping the upstream whisper.cpp ref or rebuilding
-# from a fresh clone. Building requires cmake + a C++ compiler.
-#
-# The companion model file (~574 MB) is NOT bundled; it's downloaded
-# at runtime on first voice-index use. See internal/helpers/model.go.
-whisper-helper:
-	@command -v cmake >/dev/null || { echo "cmake not found — brew install cmake"; exit 1; }
-	@chmod +x build/bundle-whisper.sh
-	./build/bundle-whisper.sh
 
 # Always re-sign, even on a no-op build. On Apple Silicon, ANY filesystem-side
 # byte modification of a Go-linker-signed Mach-O after build (including some

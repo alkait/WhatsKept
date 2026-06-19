@@ -40,6 +40,7 @@ in a separate repository.`,
 	root.AddCommand(newAppCmd())
 	root.AddCommand(newMediaDownloadCmd())
 	root.AddCommand(newMediaIndexCmd())
+	root.AddCommand(newVoiceDownloadCmd())
 	root.AddCommand(newVoiceIndexCmd())
 	root.AddCommand(newDocumentIndexCmd())
 

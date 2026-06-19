@@ -28,7 +28,7 @@ import (
 //
 // The heavy lifting lives in the bundled `whatskept-faces` Swift binary
 // (build/faces-helper/main.swift): it detects + aligns faces, embeds them
-// with the AdaFace CoreML model (fetched on first use, Whisper-style),
+// with the AdaFace CoreML model (fetched + cached on first use),
 // clusters them across all cores, writes crop thumbnails to
 // <ws>/faces/crops/, and emits <ws>/faces/clusters.json.
 //
@@ -223,8 +223,7 @@ func (s *server) handleFaceModelStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 // handleFaceModelDownload fetches + verifies the AdaFace archive and
-// unzips it, as an SSE job emitting helpers.DownloadProgress events —
-// the same shape and flow as the Whisper voice model download.
+// unzips it, as an SSE job emitting helpers.DownloadProgress events.
 func (s *server) handleFaceModelDownload(w http.ResponseWriter, _ *http.Request) {
 	jobID := s.jobs.startInProcessProgressCtx("face-model-download",
 		func(ctx context.Context, log func(string), progress func(any)) error {

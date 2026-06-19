@@ -14,7 +14,7 @@ user's questions by running SQL against the database.
                          # <ext> is the real format: jpg, png, heic, or gif.
                          # WhatsApp stores everything with a .jpg path on the
                          # phone, but the bytes are often something else.
-./voice/<rowid>.opus     # voice notes (Ogg/OPUS, if `whatskept voice-index` ran)
+./voice/<rowid>.opus     # voice notes (Ogg/OPUS, downloaded during the sync)
 ./documents/<rowid>.pdf  # PDF attachments (if `whatskept document-index` ran).
                          # Text already extracted into wa_document_text;
                          # the on-disk PDF is for `open ./documents/<rowid>.pdf`
@@ -363,24 +363,23 @@ LIMIT  20;
 
 ### `wa_voice_text` — voice-note transcripts
 
-Optional. Populated by `whatskept voice-index` (whisper.cpp with Metal
-acceleration on Apple Silicon; bundled `ggml-large-v3-turbo-q5_0` model,
-~574 MB, downloaded on first use to `~/Library/Application Support/whatskept/models/`).
+Optional. Populated by `whatskept voice-index`, which runs a **cloud**
+audio model (OpenRouter) over the voice notes downloaded during the sync.
 
 | column          | meaning                                                          |
 |-----------------|------------------------------------------------------------------|
 | `rowid`         | Joins to `v_messages.rowid`.                                     |
 | `transcript`    | Full transcript (may be empty for silent/noisy clips).           |
-| `language`      | ISO-639-1 code Whisper detected (e.g. `'ar'`, `'en'`).           |
+| `language`      | Best-effort language code; may be empty.                         |
 | `duration_sec`  | Clip length (from `ZWAMEDIAITEM.ZMOVIEDURATION`).                |
-| `segments_json` | JSON `[{start,end,text}, ...]` per Whisper segment.              |
+| `model`         | Cloud audio model slug (e.g. `google/gemini-2.5-flash`).        |
 | `generated_at`  | UTC ISO timestamp.                                               |
 
 Companion `voice_index(rowid, status)` tracks resume state; `status` ∈
-`transcribed | missing | error | skipped`. `'skipped'` means the clip
-exceeded the duration cap (default 10 min). `'missing'` means iOS didn't
-back up the blob (very common for voice notes the user hasn't replayed
-on the device since the last backup) — not an error, just unavailable.
+`downloaded | transcribed | missing | error`. `'downloaded'` means the
+.opus is on disk awaiting transcription; `'missing'` means iOS didn't
+back up the blob (common for voice notes the user hasn't replayed on the
+device since the last backup) — not an error, just unavailable.
 
 ### `v_person_photo` — named people in photos ⭐
 

@@ -499,15 +499,16 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
 // EOF'" doesn't render as 11 individual lines the user has to scan.
 // Missing rows aren't grouped — they all share the same (non-)reason
 // and the row count + sample paths are the useful signal there.
-function MediaIssuesModal({ onClose }) {
+function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issues" }) {
   const [data, setData] = useState(null);   // null = loading, {} = loaded
   const [error, setError] = useState("");
   const [tab, setTab] = useState("errors"); // "errors" | "missing"
 
   useEffect(() => {
-    api.get("/api/database/media-index/issues?limit=500")
+    api.get(endpoint + "?limit=500")
       .then(setData)
       .catch(e => setError(e.message || "Failed to load issues"));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Group error rows by message so "decrypt: EOF (x11)" collapses
@@ -997,7 +998,7 @@ function relativeTime(iso) {
   return `${Math.floor(sec/86400)} d ago`;
 }
 
-function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, modelJob, documentJob, faceJob, faceModelJob, onSync, onMediaDescribe, onVoiceIndex, onVoiceModelDownload, onDocumentIndex, onFaceIndex, onFaceModelDownload, hasSessionPassword, onForgetPassword, binding, onForgetBinding, onOpenAgents }) {
+function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, documentJob, faceJob, faceModelJob, onSync, onMediaDescribe, onVoiceIndex, onDocumentIndex, onFaceIndex, onFaceModelDownload, hasSessionPassword, onForgetPassword, binding, onForgetBinding, onOpenAgents }) {
   const [prompting, setPrompting] = useState(false);
   // Same UX rule as DeviceRow: if the server already has a cached
   // password for this session, skip the modal.
@@ -1187,10 +1188,7 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, modelJ
     <VoiceIndexCard
       dbStatus={dbStatus}
       job={voiceJob}
-      modelJob={modelJob}
       onVoiceIndex={onVoiceIndex}
-      onVoiceModelDownload={onVoiceModelDownload}
-      hasSessionPassword={hasSessionPassword}
       reloadDbStatus={reloadDbStatus}
     />
 
@@ -1270,7 +1268,7 @@ function FindPeopleCard({ job, modelJob, onFaceIndex, onFaceModelDownload }) {
     subtitle = "Download images above first — face grouping reads the photos in media/.";
     buttonLabel = "Find people";
   } else if (needsModel && !mjRunning) {
-    // One-time model download gate (the "whisper way").
+    // One-time model download gate.
     statusDot = "#f59e0b";
     title = "Download the face model";
     subtitle = `One-time, on-device face-recognition model (AdaFace, MIT · ~${modelMB} MB). Needed to tell people apart. Nothing is uploaded.`;
@@ -2157,127 +2155,107 @@ function fmtEta(secs) {
   return `${(secs/3600).toFixed(1)}h`;
 }
 
-// fmtMB formats a byte count to a "X MB" string. Used by the
-// voice-model download modal's progress line.
-function fmtMB(bytes) {
-  if (!bytes && bytes !== 0) return "—";
-  return `${(bytes / (1024*1024)).toFixed(0)} MB`;
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
-// VoiceIndexCard — "Sync voice notes" section under the Database tab
+// VoiceIndexCard — cloud voice transcription under the Database tab
 // ═══════════════════════════════════════════════════════════════════════════
-// Mirrors CloudDescribeCard's lifecycle except:
-//   - Reads dbStatus.voice_total / voice_transcribed counts.
-//   - Pre-flights /api/database/voice-index/model-status on mount;
-//     if the speech model isn't installed yet, the button opens the
-//     download modal instead of jumping into a transcription job.
-//   - Live progress driven by VoiceIndexProgress (transcribed,
-//     missing, errors, current_label).
-function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDownload, hasSessionPassword, reloadDbStatus }) {
-  const [prompting, setPrompting]       = useState(false); // password modal
-  const [showDownload, setShowDownload] = useState(false); // model-download modal
-  const [modelInstalled, setModelInstalled] = useState(null); // null = unknown
-  const [modelInfo, setModelInfo]       = useState(null);
+// Mirrors CloudDescribeCard: an OpenRouter audio model transcribes the
+// voice notes downloaded during the messages sync. Password-free (reads
+// voice/ off disk); needs the session OpenRouter key. Shows coverage, a
+// cost estimate, a live cost meter, an issues link, and key management.
+const VOICE_COST_PER_CLIP = 0.003; // measured ~$ / clip (POC), for estimates
 
-  const j  = job      || {};
-  const mj = modelJob || {};
-  const isRunning   = !!j.running;
-  const isDownloading = !!mj.running;
-  const hasDone     = j.done !== undefined && j.done !== null;
-  const progress    = j.progress || null;
+function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
+  const [status, setStatus]       = useState(null);
+  const [showKey, setShowKey]     = useState(false);
+  const [stopping, setStopping]   = useState(false);
+  const [showIssues, setShowIssues] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
+  const [pendingForce, setPendingForce] = useState(false);
+  const [keyModalMode, setKeyModalMode] = useState("run");
+  const CONCURRENCY = 48;
 
-  // Check model presence on mount, and again after every successful
-  // download (so the button label flips from "Set up voice…" → "Sync
-  // voice notes" without a page reload).
-  const reloadModelStatus = async () => {
-    try {
-      const m = await api.get("/api/database/voice-index/model-status");
-      setModelInfo(m);
-      setModelInstalled(!!m.installed);
-    } catch { /* leave modelInstalled as null — button will be a no-op */ }
-  };
-  useEffect(() => { reloadModelStatus(); }, []);
+  const j = job || {};
+  const isRunning = !!j.running;
+  const hasDone   = j.done !== undefined && j.done !== null;
+  const progress  = j.progress || null;
 
-  // After the download job finishes, refresh status + auto-close modal.
+  const reloadStatus = () =>
+    api.get("/api/database/voice-index/status").then(setStatus).catch(() => {});
+  useEffect(() => { reloadStatus(); }, []);
   useEffect(() => {
-    if (mj.done === true) {
-      reloadModelStatus();
-      setShowDownload(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mj.done]);
-
-  // Same DB-counts refresh dance as CloudDescribeCard.
-  useEffect(() => {
-    if (hasDone && j.done === true) reloadDbStatus();
+    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hasDone, j.done]);
+  useEffect(() => { if (!isRunning) setStopping(false); }, [isRunning]);
 
   if (!dbStatus) return null;
   const hasDB       = !!dbStatus.db_exists;
-  const total       = dbStatus.voice_total ?? null;
-  const transcribed = dbStatus.voice_transcribed ?? 0;
-  const remaining   = total != null ? Math.max(total - transcribed, 0) : null;
-  const allDone     = total != null && total > 0 && transcribed >= total;
+  const total       = (status && status.total_voice) || 0;
+  const transcribed = (status && status.transcribed) || 0;
+  const hasKey      = !!(status && status.has_key);
+  const persisted   = !!(status && status.persisted);
+  const model       = (status && status.default_model) || "";
+  const missing     = (status && status.missing) || 0;
+  const errorCount  = (status && status.errors) || 0;
+  const describable = (status && status.downloaded) || 0; // .opus on disk
+  const toProcess   = Math.max(describable - transcribed, 0);
+  const estCost     = toProcess * VOICE_COST_PER_CLIP;
+  const coveragePct = describable > 0 ? Math.min(100, Math.round((transcribed / describable) * 100)) : 0;
+  const allDone     = transcribed >= describable && describable > 0;
 
-  let title, subtitle, buttonLabel, buttonPrimary, statusDot;
-  if (!hasDB) {
-    title         = "Run a messages sync first";
-    subtitle      = "Voice transcription reads the message database — sync that above before transcribing voice notes.";
-    buttonLabel   = "Sync voice notes";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (total === 0) {
-    title         = "No voice notes on device";
-    subtitle      = "There's nothing to transcribe — your WhatsApp has no .opus voice messages.";
-    buttonLabel   = "Sync voice notes";
-    buttonPrimary = false;
-    statusDot     = "#9ca3af";
-  } else if (modelInstalled === false) {
-    title         = "Set up voice transcription";
-    subtitle      = total != null
-      ? `${total.toLocaleString()} voice notes on the device. One-time 574 MB speech-model download required.`
-      : "One-time 574 MB speech-model download required before transcribing.";
-    buttonLabel   = "Set up";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
-  } else if (allDone) {
-    title         = "All voice notes transcribed";
-    subtitle      = `${transcribed.toLocaleString()} of ${total.toLocaleString()} voice notes transcribed and indexed in wa_voice_text.`;
-    buttonLabel   = "Re-transcribe";
-    buttonPrimary = false;
-    statusDot     = "#25D366";
-  } else if (transcribed === 0) {
-    title         = "Voice notes not yet transcribed";
-    subtitle      = total != null
-      ? `${total.toLocaleString()} voice notes on the device. whisper.cpp runs at ~14× realtime on Apple Silicon (Metal-accelerated).`
-      : "whisper.cpp transcribes each clip on-device with auto language detection.";
-    buttonLabel   = "Sync voice notes";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
-  } else {
-    title         = "Resume voice transcription";
-    subtitle      = `${transcribed.toLocaleString()} / ${total.toLocaleString()} transcribed · ${remaining.toLocaleString()} remaining.`;
-    buttonLabel   = "Resume";
-    buttonPrimary = true;
-    statusDot     = "#f59e0b";
-  }
-
-  const pct = (total != null && total > 0)
-    ? Math.min(100, Math.round((transcribed / total) * 100))
-    : 0;
-
+  const proceed = (force) => onVoiceIndex({ model: "", concurrency: CONCURRENCY, force });
+  const beginRun = (force) => {
+    if (!hasKey) { setPendingForce(force); setKeyModalMode("run"); setShowKey(true); return; }
+    proceed(force);
+  };
+  const openChangeKey = () => { setKeyModalMode("manage"); setShowKey(true); };
   const launch = () => {
-    if (modelInstalled === false) {
-      setShowDownload(true);
-      return;
-    }
-    if (hasSessionPassword) onVoiceIndex("");
-    else setPrompting(true);
+    if (allDone) { setShowConfirm(true); return; }
+    beginRun(false);
+  };
+  const stop = async () => {
+    if (!j.jobId) return;
+    setStopping(true);
+    try { await api.del(`/api/jobs/${j.jobId}`); } catch {}
+  };
+  const forgetKey = async () => {
+    try { await api.del("/api/session/openrouter-key"); } catch {}
+    reloadStatus();
   };
 
-  const buttonDisabled = isRunning || isDownloading || !hasDB || total === 0 || modelInstalled === null;
+  let statusDot = "#9ca3af", title, subtitle, buttonLabel, buttonPrimary = true, buttonDisabled = isRunning;
+  if (!hasDB) {
+    title = "Run a messages sync first";
+    subtitle = "Voice transcription reads the message database — sync that above first.";
+    buttonLabel = "Transcribe with cloud"; buttonPrimary = false; buttonDisabled = true;
+  } else if (total === 0) {
+    title = "No voice notes on device";
+    subtitle = "There's nothing to transcribe."; buttonLabel = "Transcribe with cloud";
+    buttonPrimary = false; buttonDisabled = true;
+  } else {
+    const term = (n, label) => (
+      <button onClick={() => setShowIssues(true)}
+        className="underline decoration-dotted hover:text-gray-700">{n.toLocaleString()} {label}</button>
+    );
+    subtitle = (
+      <span>
+        {transcribed.toLocaleString()} transcribed · {toProcess.toLocaleString()} remaining
+        {missing > 0 && <> · {term(missing, "not in backup")}</>}
+        {" · "}Model: {model}.
+      </span>
+    );
+    if (allDone)         { statusDot = "#25D366"; title = "All available voice notes transcribed"; }
+    else if (transcribed){ statusDot = "#25D366"; title = "Voice transcription partially done"; }
+    else                 { statusDot = "#f59e0b"; title = "Not yet transcribed"; }
+    buttonPrimary = !allDone;
+    buttonLabel = allDone ? "Re-transcribe" : transcribed > 0 ? "Resume" : "Transcribe with cloud";
+  }
+
+  if (isRunning && progress) {
+    const live = (progress.baseline || 0) + (progress.transcribed || 0);
+    title = "Voice transcription in progress";
+    subtitle = `${live.toLocaleString()} of ${(progress.total || total).toLocaleString()} transcribed. Model: ${model}.`;
+  }
 
   return (
     <section className="mt-6">
@@ -2288,8 +2266,8 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
       <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with voice transcriptions so the agents can read the voice messages</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
-        <h3 className="text-sm font-semibold text-gray-900">Whisper · local</h3>
-        <p className="text-[11px] text-gray-400 mb-3">Transcribes each voice note on your Mac — auto-detects language (Arabic / English / mixed), free and private.</p>
+        <h3 className="text-sm font-semibold text-gray-900">AI voice transcription · cloud</h3>
+        <p className="text-[11px] text-gray-400 mb-3">Sends each voice note to a cloud AI for transcription, in any language (Arabic / English / mixed). Costs a little per clip.</p>
 
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
@@ -2299,37 +2277,72 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
 
-            {/* Static (non-running) progress bar. */}
-            {!isRunning && hasDB && total != null && total > 0 && modelInstalled && (
+            {hasDB && total > 0 && !isRunning && (
               <div className="mt-3">
                 <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
-                  <div className="h-full rounded-full" style={{width: `${pct}%`, background:'#25D366'}}></div>
+                  <div className="h-full rounded-full" style={{width: `${coveragePct}%`, background:'#25D366'}}></div>
                 </div>
-                <p className="text-[10px] text-gray-400 mt-1">{pct}% transcribed</p>
+                <p className="text-[10px] text-gray-400 mt-1">{coveragePct}% transcribed in cloud</p>
+              </div>
+            )}
+
+            {hasKey && hasDB && total > 0 && !isRunning && (
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-400">
+                  Transcribes any remaining clips and retries failures automatically.
+                  {toProcess > 0 && <> {toProcess.toLocaleString()} clip{toProcess === 1 ? "" : "s"} remaining · est. <span className="font-medium text-gray-600">≈ ${estCost.toFixed(2)}</span>.</>}
+                  {(errorCount > 0 || missing > 0) && <>
+                    <span className="mx-1.5">·</span>
+                    <button onClick={() => setShowIssues(true)} className="underline decoration-dotted hover:text-gray-700">view {(errorCount + missing).toLocaleString()} issue{(errorCount + missing) === 1 ? "" : "s"}</button>
+                  </>}
+                </p>
+              </div>
+            )}
+
+            {hasKey && !isRunning && (
+              <div className="mt-3">
+                <p className="text-[11px] text-gray-400">
+                  {persisted
+                    ? <>OpenRouter key <span className="font-medium text-gray-600">remembered on this computer</span>.</>
+                    : <>OpenRouter key set for <span className="font-medium text-gray-600">this session only</span>.</>}
+                  <span className="mx-1.5">·</span>
+                  <button onClick={openChangeKey} className="underline decoration-dotted hover:text-gray-700">change key</button>
+                  <span className="mx-1.5">·</span>
+                  <button onClick={forgetKey} className="underline decoration-dotted hover:text-gray-700">forget key</button>
+                </p>
               </div>
             )}
           </div>
 
-          <button onClick={launch} disabled={buttonDisabled}
-            className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
-            style={{background: isRunning ? '#128C7E' : buttonPrimary ? '#075E54' : '#6b7280'}}>
-            <RefreshIcon />
-            {isRunning ? "Transcribing…" : isDownloading ? "Downloading…" : buttonLabel}
-          </button>
+          {isRunning ? (
+            <button onClick={stop} disabled={stopping || !j.jobId}
+              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background: '#b91c1c'}}>
+              {stopping ? "Stopping…" : "Stop"}
+            </button>
+          ) : (
+            <button onClick={launch} disabled={buttonDisabled}
+              className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
+              style={{background: buttonPrimary ? '#075E54' : '#6b7280'}}>
+              <RefreshIcon />
+              {buttonLabel}
+            </button>
+          )}
         </div>
 
-        {j.error && j.error !== "model_required" && (
-          <p className="text-sm text-red-500 mt-3">{j.error}</p>
-        )}
+        {j.error && <p className="text-sm text-red-500 mt-3">{j.error}</p>}
 
-        {/* Live progress card while transcribing. */}
         {isRunning && (
           <div className="mt-4 rounded-lg p-4" style={{background:'#F0F7F0', border:'1px solid #DCF8C6'}}>
-            {progress ? (
+            {progress ? (() => {
+              const liveTotal = (progress.baseline || 0) + (progress.transcribed || 0);
+              const grandTotal = progress.total || 0;
+              const pct = grandTotal > 0 ? Math.min(100, Math.round((liveTotal / grandTotal) * 100)) : 0;
+              return (
               <>
                 <div className="flex items-baseline justify-between text-xs mb-2">
                   <span className="font-semibold text-gray-900">
-                    {progress.done.toLocaleString()} / {(progress.pending || 0).toLocaleString()} clips
+                    {liveTotal.toLocaleString()} / {grandTotal.toLocaleString()} transcribed
                   </span>
                   <span className="text-gray-500">
                     {progress.rate_per_sec ? `${progress.rate_per_sec.toFixed(1)} clips/s` : ""}
@@ -2337,62 +2350,59 @@ function VoiceIndexCard({ dbStatus, job, modelJob, onVoiceIndex, onVoiceModelDow
                   </span>
                 </div>
                 <div className="h-2 w-full bg-white rounded-full overflow-hidden border" style={{borderColor:'#DCF8C6'}}>
-                  <div className="h-full rounded-full transition-all duration-500" style={{
-                    width: `${Math.min(100, Math.round((progress.done / Math.max(progress.pending, 1)) * 100))}%`,
-                    background:'#25D366',
-                  }}></div>
+                  <div className="h-full rounded-full transition-all duration-500" style={{width: `${pct}%`, background:'#25D366'}}></div>
                 </div>
                 <div className="grid grid-cols-3 gap-2 mt-3 text-[11px] text-gray-600">
-                  <div title="Clips successfully transcribed and persisted to wa_voice_text.">
-                    <span className="font-semibold text-gray-900">{progress.transcribed.toLocaleString()}</span> transcribed
-                  </div>
-                  <div title="Chat references a voice note whose .opus file isn't in the backup. Not an error.">
-                    <span className="font-semibold text-gray-900">{progress.missing.toLocaleString()}</span> missing
-                  </div>
-                  <div title="Indexer found the file but couldn't transcribe (corrupted opus, decrypt failed, whisper crashed, etc).">
-                    <span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors
-                  </div>
+                  <div title="Transcribed this run (this session)."><span className="font-semibold text-gray-900">{(progress.transcribed||0).toLocaleString()}</span> this run</div>
+                  <div title="Spend so far this run, reported by OpenRouter."><span className="font-semibold text-gray-900">${(progress.cost_usd||0).toFixed(4)}</span> spent</div>
+                  <div title="Clips that failed this run (auto-retried next run)."><span className="font-semibold text-gray-900">{progress.errors.toLocaleString()}</span> errors</div>
                 </div>
-                {progress.current_label && (
-                  <p className="text-[10px] text-gray-400 mt-2 font-mono truncate">
-                    Now: {progress.current_label}
-                  </p>
+                {progress.errors > 0 && (
+                  <div className="mt-2">
+                    <button onClick={() => setShowIssues(true)}
+                      className="text-[11px] text-gray-500 hover:text-gray-900 underline decoration-dotted">
+                      View {progress.errors.toLocaleString()} error{progress.errors === 1 ? "" : "s"}
+                    </button>
+                  </div>
                 )}
               </>
-            ) : (
+              );
+            })() : (
               <p className="text-xs text-gray-500">Preparing…</p>
             )}
             {j.lines && j.lines.length > 0 && (
-              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">
-                {j.lines[j.lines.length - 1]}
-              </p>
+              <p className="text-[10px] text-gray-400 mt-3 font-mono truncate">{j.lines[j.lines.length - 1]}</p>
             )}
           </div>
         )}
 
         {hasDone && j.done === true && !isRunning && (
-          <p className="text-xs text-gray-500 mt-3">✓ Transcription complete. Agent queries can now MATCH on voice-note transcripts.</p>
+          <p className="text-xs text-gray-500 mt-3">✓ Done. Voice notes are now searchable by their transcripts.</p>
         )}
       </div>
 
-
-      {prompting && (
-        <PasswordPromptModal
-          device={{ name: "the latest iPhone backup" }}
-          onConfirm={pw => { setPrompting(false); onVoiceIndex(pw); }}
-          onCancel={() => setPrompting(false)}
-          confirmLabel="Sync voice notes"
+      {showKey && (
+        <OpenRouterKeyModal
+          onClose={() => setShowKey(false)}
+          onSaved={() => {
+            setShowKey(false);
+            reloadStatus();
+            if (keyModalMode === "run") proceed(pendingForce);
+          }}
         />
       )}
 
-      {showDownload && (
-        <VoiceModelDownloadModal
-          modelInfo={modelInfo}
-          modelJob={modelJob}
-          onStart={onVoiceModelDownload}
-          onClose={() => setShowDownload(false)}
+      {showConfirm && (
+        <ConfirmModal
+          title="Re-transcribe all voice notes?"
+          body={`This re-runs the model on all ${describable.toLocaleString()} voice notes on disk, overwriting existing transcripts. Estimated cost ≈ $${(describable * VOICE_COST_PER_CLIP).toFixed(2)}.`}
+          confirmLabel="Re-transcribe all"
+          onConfirm={() => { setShowConfirm(false); beginRun(true); }}
+          onCancel={() => setShowConfirm(false)}
         />
       )}
+
+      {showIssues && <MediaIssuesModal endpoint="/api/database/voice-index/issues" onClose={() => setShowIssues(false)} />}
     </section>
   );
 }
@@ -2605,120 +2615,6 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, hasSessionPassword,
         />
       )}
     </section>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// VoiceModelDownloadModal — first-run speech-model installer
-// ═══════════════════════════════════════════════════════════════════════════
-// Two visual states gated by modelJob.running:
-//   1. Idle (pre-click)        — shows model name, size, source URL,
-//                                cache path, and a [Cancel] / [Download]
-//                                button pair.
-//   2. In-progress (post-click) — shows MB / total · MB/s · ETA, with
-//                                a progress bar and a Close button. The
-//                                actual cancel-the-download mechanism
-//                                is deferred (would require sending
-//                                DELETE /api/jobs/{id}).
-function VoiceModelDownloadModal({ modelInfo, modelJob, onStart, onClose }) {
-  const mj = modelJob || {};
-  const running = !!mj.running;
-  const done    = mj.done === true;
-  const failed  = mj.done === false && !!mj.error;
-  const p       = mj.progress || null;
-  const stage   = p?.stage || (failed ? "error" : "idle");
-
-  const total   = modelInfo?.bytes_total ?? 0;
-  const got     = p?.bytes_read ?? 0;
-  const pct     = total > 0 ? Math.min(100, (got / total) * 100) : 0;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" style={{background:'rgba(0,0,0,0.45)'}}>
-      <div className="rounded-xl bg-white shadow-xl w-full max-w-md p-6" style={{border:'1px solid #DCF8C6'}}>
-        <h3 className="font-semibold text-gray-900 text-base mb-2">
-          {done ? "Speech model installed" : "Set up voice transcription"}
-        </h3>
-
-        {!running && !done && !failed && (
-          <>
-            <p className="text-sm text-gray-600 leading-relaxed mb-4">
-              WhatsKept needs to download a speech model before it can transcribe voice notes.
-              This is a one-time download — the model persists across all future app updates.
-            </p>
-            <dl className="text-xs text-gray-700 space-y-1.5 mb-5 rounded-lg p-3" style={{background:'#F8FAFC', border:'1px solid #E5E7EB'}}>
-              <div className="flex justify-between"><dt className="text-gray-500">Model</dt><dd className="font-medium">{modelInfo?.display || "Whisper Large-v3-Turbo"}</dd></div>
-              <div className="flex justify-between"><dt className="text-gray-500">Size</dt><dd className="font-medium">{fmtMB(total)}</dd></div>
-              <div className="flex justify-between"><dt className="text-gray-500">Source</dt><dd className="font-medium">HuggingFace</dd></div>
-              <div className="flex justify-between gap-3 min-w-0"><dt className="text-gray-500 shrink-0">Cache</dt><dd className="font-mono text-[10px] truncate text-right" title={modelInfo?.path}>~/Library/Application Support/whatskept/models/</dd></div>
-            </dl>
-            <div className="flex justify-end gap-2">
-              <button onClick={onClose}
-                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg">Cancel</button>
-              <button onClick={onStart}
-                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
-                Download &amp; install
-              </button>
-            </div>
-          </>
-        )}
-
-        {running && (
-          <>
-            <p className="text-xs text-gray-500 mb-3">
-              {stage === "verifying"
-                ? "Verifying integrity (sha256)…"
-                : `${fmtMB(got)} of ${fmtMB(total)}`}
-            </p>
-            <div className="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
-              <div className="h-full rounded-full transition-all" style={{width:`${pct}%`, background:'#25D366'}}></div>
-            </div>
-            {stage === "downloading" && p && (
-              <div className="flex justify-between text-[11px] text-gray-500 mt-2">
-                <span>{p.rate_bps ? `${(p.rate_bps / (1024*1024)).toFixed(1)} MB/s` : ""}</span>
-                <span>{p.eta_seconds > 0 ? `ETA ${fmtEta(p.eta_seconds)}` : ""}</span>
-              </div>
-            )}
-            <p className="text-[10px] text-gray-400 mt-4">
-              Downloading from HuggingFace · this window can stay open in the background.
-            </p>
-          </>
-        )}
-
-        {done && (
-          <>
-            <p className="text-sm text-gray-600 leading-relaxed mb-4">
-              ✓ The speech model is installed at <code className="font-mono text-[11px]">~/Library/Application Support/whatskept/models/</code>.
-              You can now transcribe your voice notes.
-            </p>
-            <div className="flex justify-end">
-              <button onClick={onClose}
-                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
-                Continue
-              </button>
-            </div>
-          </>
-        )}
-
-        {failed && (
-          <>
-            <p className="text-sm text-red-600 leading-relaxed mb-3">
-              Download failed: {mj.error}
-            </p>
-            <p className="text-xs text-gray-500 mb-4">
-              The partial file is preserved — clicking <strong>Retry</strong> resumes from where it stopped (HTTP Range).
-            </p>
-            <div className="flex justify-end gap-2">
-              <button onClick={onClose}
-                className="px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 rounded-lg">Close</button>
-              <button onClick={onStart}
-                className="px-4 py-2 text-sm font-semibold text-white rounded-lg" style={{background:'#075E54'}}>
-                Retry
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
   );
 }
 
@@ -3490,12 +3386,11 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
     }
   };
 
-  // ── start voice transcription (voice-index) ───────────────────────────
-  // Same shape as startMediaDescribe. The server returns 412 with
-  // {error: "model_required"} if the speech model isn't installed —
-  // we surface that as an error string so the card can render a
-  // distinguishable "Download model first" affordance.
-  const startVoiceIndex = async (password) => {
+  // ── start cloud voice transcription (voice-index) ─────────────────────
+  // Same shape as startMediaDescribe. opts = { model, concurrency, force }.
+  // Cloud transcribe reads the already-downloaded voice notes off disk, so
+  // no backup password; the OpenRouter key lives in the server session.
+  const startVoiceIndex = async (opts) => {
     const key = "db:voice-index";
     patchJob(key, {
       running: true, done: null,
@@ -3504,34 +3399,12 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
       startedAt: new Date().toISOString(), error: "",
     });
     try {
-      const { job_id } = await api.post("/api/database/voice-index", { password });
-      streamJob(job_id, key, true);
-    } catch(ex) {
-      // If the server rejected with 412/model_required, normalise the
-      // error string so the card knows to open the download modal
-      // instead of showing a generic failure.
-      const isModelRequired = (ex.message || "").includes("model_required");
-      patchJob(key, {
-        running: false,
-        done: false,
-        error: isModelRequired ? "model_required" : ex.message,
+      const { job_id } = await api.post("/api/database/voice-index", {
+        model: (opts && opts.model) || "",
+        concurrency: (opts && opts.concurrency) || 0,
+        force: !!(opts && opts.force),
       });
-    }
-  };
-
-  // ── start voice-model download (one-time, ~574 MB) ────────────────────
-  // Tracked under its own job key so the UI can show progress simultaneously
-  // with whatever the user was about to do (voice-index, in practice).
-  const startVoiceModelDownload = async () => {
-    const key = "db:voice-model-download";
-    patchJob(key, {
-      running: true, done: null,
-      lines: [], progress: null,
-      adopted: false, pid: null,
-      startedAt: new Date().toISOString(), error: "",
-    });
-    try {
-      const { job_id } = await api.post("/api/database/voice-index/model-download", {});
+      patchJob(key, { jobId: job_id });
       streamJob(job_id, key, true);
     } catch(ex) {
       patchJob(key, { running: false, done: false, error: ex.message });
@@ -3580,8 +3453,8 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   // ── download the face-recognition model (one-time, ~44 MB) ────────────
-  // Mirrors startVoiceModelDownload: its own job key so progress can show
-  // independently, AdaFace IR-18 fetched + verified + unzipped server-side.
+  // Its own job key so progress can show independently; AdaFace IR-18
+  // fetched + verified + unzipped server-side.
   const startFaceModelDownload = async () => {
     const key = "db:face-model-download";
     patchJob(key, {
@@ -3764,14 +3637,12 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
             job={jobs["db:sync"]}
             cloudJob={jobs["db:media-describe"]}
             voiceJob={jobs["db:voice-index"]}
-            modelJob={jobs["db:voice-model-download"]}
             documentJob={jobs["db:document-index"]}
             faceJob={jobs["db:face-index"]}
             faceModelJob={jobs["db:face-model-download"]}
             onSync={startSync}
             onMediaDescribe={startMediaDescribe}
             onVoiceIndex={startVoiceIndex}
-            onVoiceModelDownload={startVoiceModelDownload}
             onDocumentIndex={startDocumentIndex}
             onFaceIndex={startFaceIndex}
             onFaceModelDownload={startFaceModelDownload}

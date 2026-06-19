@@ -66,6 +66,7 @@ type SyncResult struct {
 	ProfileSync    *ProfileSyncStats  `json:"profile_sync,omitempty"`
 	ContactSync    *ContactSyncStats  `json:"contact_sync,omitempty"`
 	ImageDownload  *MediaIndexResult  `json:"image_download,omitempty"`
+	VoiceDownload  *VoiceIndexResult  `json:"voice_download,omitempty"`
 	SidecarMerge   *SidecarMergeStats `json:"sidecar_merge,omitempty"`
 	OrphanPrune    *OrphanPruneStats  `json:"orphan_prune,omitempty"`
 }
@@ -432,6 +433,18 @@ func SyncMessages(
 			imageStats.Downloaded, imageStats.Missing, imageStats.Errors))
 	}
 
+	// Voice-note download. Same rationale as images: decrypt the .opus
+	// blobs here (cheap), so the cloud transcribe step is a password-free
+	// consumer of voice/. Non-fatal.
+	log("Downloading WhatsApp voice notes…")
+	voiceStats, voiceErr := downloadVoiceDuringSync(bundle, workspace, livePath, log)
+	if voiceErr != nil {
+		log(fmt.Sprintf("Voice download failed: %v", voiceErr))
+	} else if voiceStats != nil {
+		log(fmt.Sprintf("Voice notes: %d downloaded this sync (%d missing, %d errors).",
+			voiceStats.Downloaded, voiceStats.Missing, voiceStats.Errors))
+	}
+
 	log("Writing AGENTS.md, CLAUDE.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err
@@ -457,6 +470,7 @@ func SyncMessages(
 		ProfileSync:    profileStats,
 		ContactSync:    contactStats,
 		ImageDownload:  imageStats,
+		VoiceDownload:  voiceStats,
 		SidecarMerge:   mergeStats,
 		OrphanPrune:    pruneStats,
 	}, nil

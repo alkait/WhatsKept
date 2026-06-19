@@ -223,11 +223,17 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 		if _, err := db.Exec(createVoiceSidecarsSQL); err != nil {
 			return nil, fmt.Errorf("create voice sidecar tables: %w", err)
 		}
-		res, err := db.Exec(
-			`INSERT OR REPLACE INTO main.wa_voice_text
-			 SELECT * FROM old.wa_voice_text
-			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
-		)
+		// Copy by the old↔new column intersection rather than SELECT *,
+		// so a schema change (segments_json dropped, model/transcribe_error
+		// added) can't shift values into the wrong columns.
+		vtCols, err := copyColumnsFor(db, "wa_voice_text", voiceSidecarColumns)
+		if err != nil {
+			return nil, fmt.Errorf("plan wa_voice_text copy: %w", err)
+		}
+		res, err := db.Exec(fmt.Sprintf(
+			`INSERT OR REPLACE INTO main.wa_voice_text (%[1]s)
+			 SELECT %[1]s FROM old.wa_voice_text
+			 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`, vtCols))
 		if err != nil {
 			return nil, fmt.Errorf("preserve wa_voice_text: %w", err)
 		}
@@ -241,11 +247,14 @@ func mergeSidecarsForward(oldDB, newDB string) (*SidecarMergeStats, error) {
 			return nil, fmt.Errorf("count dropped voice rows: %w", err)
 		}
 		if had, _ := attachedTableExists(db, "old", "voice_index"); had {
-			res, err := db.Exec(
-				`INSERT OR REPLACE INTO main.voice_index
-				 SELECT * FROM old.voice_index
-				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`,
-			)
+			viCols, err := copyColumnsFor(db, "voice_index", voiceIndexColumns)
+			if err != nil {
+				return nil, fmt.Errorf("plan voice_index copy: %w", err)
+			}
+			res, err := db.Exec(fmt.Sprintf(
+				`INSERT OR REPLACE INTO main.voice_index (%[1]s)
+				 SELECT %[1]s FROM old.voice_index
+				 WHERE rowid IN (SELECT Z_PK FROM main.ZWAMESSAGE)`, viCols))
 			if err != nil {
 				return nil, fmt.Errorf("preserve voice_index: %w", err)
 			}
@@ -509,30 +518,110 @@ type dbExecQuerier interface {
 	Query(query string, args ...any) (*sql.Rows, error)
 }
 
-// createVoiceSidecarsSQL — placeholder for the voice-index port.
-// Mirrors the Python schema so a future voice-index command can
-// re-use it. Kept here so merge-forward can recreate the tables in
-// staging without depending on a not-yet-written voice.go.
+// createVoiceSidecarsSQL is the canonical schema for the voice-index
+// output tables. Co-created here so merge-forward can recreate them in a
+// fresh staging DB before copying rows across.
+//
+//   - voice_index mirrors media_index: download writes a 'downloaded' /
+//     'missing' / 'error' row; the cloud transcribe step flips it to
+//     'transcribed' or records a per-clip failure in transcribe_error
+//     (leaving status='downloaded' so the file isn't re-downloaded).
+//   - wa_voice_text.model records the cloud model slug. (The old
+//     segments_json column is gone — the cloud transcriber returns plain
+//     text with no per-segment timestamps.)
 const createVoiceSidecarsSQL = `
 CREATE TABLE IF NOT EXISTS wa_voice_text (
     rowid         INTEGER PRIMARY KEY,
     transcript    TEXT NOT NULL DEFAULT '',
     language      TEXT NOT NULL DEFAULT '',
     duration_sec  REAL,
-    segments_json TEXT,
+    model         TEXT NOT NULL DEFAULT '',
     generated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS voice_index (
-    rowid         INTEGER PRIMARY KEY,
-    manifest_path TEXT    NOT NULL,
-    status        TEXT    NOT NULL,
-    bytes         INTEGER,
-    duration_sec  REAL,
-    error         TEXT,
-    attempted_at  TEXT    NOT NULL
+    rowid            INTEGER PRIMARY KEY,
+    manifest_path    TEXT    NOT NULL,
+    status           TEXT    NOT NULL,
+    bytes            INTEGER,
+    duration_sec     REAL,
+    error            TEXT,
+    transcribe_error TEXT,
+    attempted_at     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS voice_index_status_idx ON voice_index(status);
 `
+
+// voiceSidecarColumns / voiceIndexColumns are the canonical column sets
+// in schema order, used by migrateVoiceSidecar and by the merge-forward
+// copy (to intersect old↔new so a schema change can't corrupt a copy).
+var voiceSidecarColumns = []string{
+	"rowid", "transcript", "language", "duration_sec", "model", "generated_at",
+}
+var voiceIndexColumns = []string{
+	"rowid", "manifest_path", "status", "bytes", "duration_sec", "error", "transcribe_error", "attempted_at",
+}
+
+// ensureVoiceSidecarSchema creates the voice tables if absent, then
+// migrates an older (narrower) schema up to the current column set.
+// The single entry point callers use instead of createVoiceSidecarsSQL.
+func ensureVoiceSidecarSchema(db dbExecQuerier) error {
+	if _, err := db.Exec(createVoiceSidecarsSQL); err != nil {
+		return fmt.Errorf("create voice sidecar tables: %w", err)
+	}
+	return migrateVoiceSidecar(db)
+}
+
+// migrateVoiceSidecar ADD COLUMNs fields introduced after the voice
+// tables were first created by an older whatskept (wa_voice_text.model,
+// voice_index.transcribe_error). The legacy segments_json column, if
+// present, is left in place (SQLite can't drop a column without a table
+// rebuild) — it's simply never read or copied forward.
+func migrateVoiceSidecar(db dbExecQuerier) error {
+	adds := []struct{ table, col, ddl string }{
+		{"wa_voice_text", "model", `ALTER TABLE wa_voice_text ADD COLUMN model TEXT NOT NULL DEFAULT ''`},
+		{"voice_index", "transcribe_error", `ALTER TABLE voice_index ADD COLUMN transcribe_error TEXT`},
+	}
+	cols := map[string]map[string]bool{}
+	for _, a := range adds {
+		have, ok := cols[a.table]
+		if !ok {
+			var err error
+			have, err = tableColumns(db, "main", a.table)
+			if err != nil {
+				return fmt.Errorf("inspect %s: %w", a.table, err)
+			}
+			cols[a.table] = have
+		}
+		if len(have) == 0 || have[a.col] {
+			continue
+		}
+		if _, err := db.Exec(a.ddl); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", a.table, a.col, err)
+		}
+	}
+	return nil
+}
+
+// copyColumnsFor returns the comma-joined columns of `table` present in
+// BOTH the attached `old` DB and `main`, in canonical order — the safe
+// column list for a merge-forward copy across a possible schema change.
+func copyColumnsFor(db dbExecQuerier, table string, canonical []string) (string, error) {
+	mainCols, err := tableColumns(db, "main", table)
+	if err != nil {
+		return "", err
+	}
+	oldCols, err := tableColumns(db, "old", table)
+	if err != nil {
+		return "", err
+	}
+	keep := make([]string, 0, len(canonical))
+	for _, c := range canonical {
+		if mainCols[c] && oldCols[c] {
+			keep = append(keep, c)
+		}
+	}
+	return strings.Join(keep, ", "), nil
+}
 
 // createDocumentSidecarsSQL is the schema for the document-index
 // output tables. Shared by document.go's setup and the merge-

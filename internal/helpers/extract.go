@@ -23,7 +23,6 @@ const (
 	IdeviceBackup   = "idevicebackup2"
 	WhatskeptVision = "whatskept-vision" // Swift wrapper over Vision.framework (OCR + classify)
 	WhatskeptFaces  = "whatskept-faces"  // Swift face detector + clusterer over media/ (people MVP)
-	WhisperCli      = "whisper-cli"      // ggerganov/whisper.cpp CLI (Metal-accelerated)
 )
 
 // extractMu serialises Path() callers across goroutines so concurrent
