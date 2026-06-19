@@ -1276,8 +1276,18 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   // A run is parameterised by { force, retryErrors }. proceed sends it;
   // beginRun gates on the key first (stashing the opts for after save).
   const proceed = (opts) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, ...opts });
-  const beginRun = (opts) => {
-    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+  const beginRun = async (opts) => {
+    // The OpenRouter key is a single session-wide credential shared by the
+    // image, voice, and document cloud features. This card's status.has_key
+    // is fetched on mount, so it can be stale if the key was set from another
+    // card or from Settings since. Re-check the live shared key before
+    // prompting, so we never ask again once any feature has set it.
+    let keyPresent = hasKey;
+    if (!keyPresent) {
+      try { const k = await api.get("/api/session/openrouter-key"); keyPresent = !!(k && k.has); } catch {}
+      if (keyPresent) reloadStatus(); // sync this card's UI to the shared key
+    }
+    if (!keyPresent) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(opts);
   };
   // launch is the single button action, by precedence:
@@ -1820,8 +1830,18 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   // A run is parameterised by { force, retryErrors }. proceed sends it;
   // beginRun gates on the key first (stashing opts for after save).
   const proceed = (opts) => onVoiceIndex({ model: "", concurrency: CONCURRENCY, ...opts });
-  const beginRun = (opts) => {
-    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+  const beginRun = async (opts) => {
+    // The OpenRouter key is a single session-wide credential shared by the
+    // image, voice, and document cloud features. This card's status.has_key
+    // is fetched on mount, so it can be stale if the key was set from another
+    // card or from Settings since. Re-check the live shared key before
+    // prompting, so we never ask again once any feature has set it.
+    let keyPresent = hasKey;
+    if (!keyPresent) {
+      try { const k = await api.get("/api/session/openrouter-key"); keyPresent = !!(k && k.has); } catch {}
+      if (keyPresent) reloadStatus(); // sync this card's UI to the shared key
+    }
+    if (!keyPresent) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(opts);
   };
   // launch precedence: fresh work → Resume; else failures → Retry failures
@@ -2079,8 +2099,18 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   const estCost     = actionCount * DOC_COST_PER_DOC;
 
   const proceed = (opts) => onDocumentIndex({ model: "", concurrency: CONCURRENCY, ...opts });
-  const beginRun = (opts) => {
-    if (!hasKey) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
+  const beginRun = async (opts) => {
+    // The OpenRouter key is a single session-wide credential shared by the
+    // image, voice, and document cloud features. This card's status.has_key
+    // is fetched on mount, so it can be stale if the key was set from another
+    // card or from Settings since. Re-check the live shared key before
+    // prompting, so we never ask again once any feature has set it.
+    let keyPresent = hasKey;
+    if (!keyPresent) {
+      try { const k = await api.get("/api/session/openrouter-key"); keyPresent = !!(k && k.has); } catch {}
+      if (keyPresent) reloadStatus(); // sync this card's UI to the shared key
+    }
+    if (!keyPresent) { setPendingRun(opts); setKeyModalMode("run"); setShowKey(true); return; }
     proceed(opts);
   };
   const launch = () => {
