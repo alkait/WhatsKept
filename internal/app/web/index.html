@@ -2791,26 +2791,29 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
 // (see build/install.sh). A plain local dev build (0.0.0-dev) is never
 // prompted — the backend short-circuits the check for it.
 function UpdateBadge() {
-  const [version, setVersion] = useState("");
-  const [info, setInfo]       = useState(null); // /api/update/check result
-  const [open, setOpen]       = useState(false);
-  const [busy, setBusy]       = useState(false);
+  const [version, setVersion]   = useState("");
+  const [platform, setPlatform] = useState("");
+  const [info, setInfo]         = useState(null); // /api/update/check result
+  const [open, setOpen]         = useState(false);
+  const [busy, setBusy]         = useState(false);
 
   useEffect(() => {
-    api.get("/api/meta").then(m => setVersion(m.version || "")).catch(() => {});
+    api.get("/api/meta").then(m => { setVersion(m.version || ""); setPlatform(m.platform || ""); }).catch(() => {});
     api.get("/api/update/check").then(setInfo).catch(() => {});
   }, []);
 
   // One leading "v" regardless of how the build string was tagged.
   const showVer = v => "v" + (v || "").replace(/^v/, "");
   const available = info && info.update_available;
+  const isMac = platform === "darwin";
 
   const runUpdate = async () => {
     setBusy(true);
     try {
       await api.post("/api/update/run", {});
-      // Installer takes over (quit → replace → relaunch). Quit ourselves
-      // so we don't hold the binary's file descriptor open against it.
+      // The updater has taken over: macOS hands off to the Terminal installer;
+      // Windows has already swapped the exe and scheduled a relauncher. Quit so
+      // we release the binary + localhost port for the relaunch.
       if (typeof window._wkpQuit === "function") window._wkpQuit();
     } catch (e) {
       setBusy(false);
@@ -2855,9 +2858,9 @@ function UpdateBadge() {
               )}
             </p>
             <p className="text-sm text-gray-600 leading-relaxed mb-5">
-              WhatsKept will close and the installer will finish in a Terminal
-              window, then reopen automatically. Your workspaces and backups
-              are untouched.
+              {isMac
+                ? "WhatsKept will close and the installer will finish in a Terminal window, then reopen automatically. Your workspaces and backups are untouched."
+                : "WhatsKept will download the new version, replace itself, and reopen automatically. This takes a moment. Your workspaces and backups are untouched."}
             </p>
             <div className="flex gap-2">
               <button onClick={() => setOpen(false)} disabled={busy}

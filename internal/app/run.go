@@ -32,6 +32,10 @@ type RunOptions struct {
 //
 // MUST be called from the OS main thread on macOS — see runWindow().
 func Run(opts RunOptions) error {
+	// Sweep the <exe>.old left behind by a prior in-place self-update (Windows;
+	// no-op elsewhere). Best-effort and cheap.
+	cleanupStaleUpdate()
+
 	if opts.Title == "" {
 		opts.Title = "WhatsKept"
 	}
