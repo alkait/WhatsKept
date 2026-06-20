@@ -50,6 +50,14 @@ in a separate repository.`,
 }
 
 func main() {
+	// Disable Cobra's Windows "mousetrap": by default, when a Cobra program is
+	// double-clicked in Explorer, Cobra prints "This is a command line tool.
+	// You need to open cmd.exe and run it from there." and exits — BEFORE our
+	// app-subcommand injection below can run. Clearing the text disables that
+	// interception so a double-click falls through to the GUI. No-op off
+	// Windows (the hook only exists there).
+	cobra.MousetrapHelpText = ""
+
 	// GUI-launch path: inject the `app` subcommand so the window opens
 	// instead of Cobra dumping help text into a console the user can't see.
 	//   - macOS: a Finder/Dock/`open` launch comes through the .app wrapper,
