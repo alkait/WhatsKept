@@ -2786,10 +2786,14 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
             );
           })()}
 
+          {/* Explore workspace — hidden in the UI for now; the WorkspaceSizes
+              component and its backend (/api/workspace/sizes, reveal) are kept
+              intact. Remove this comment wrapper to bring the section back.
           <div>
             <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Explore workspace</h2>
             <WorkspaceSizes />
           </div>
+          */}
         </>
       )}
 
