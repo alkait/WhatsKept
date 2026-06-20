@@ -496,7 +496,40 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
 // EOF'" doesn't render as 11 individual lines the user has to scan.
 // Missing rows aren't grouped — they all share the same (non-)reason
 // and the row count + sample paths are the useful signal there.
-function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issues" }) {
+// Per-modality copy for MediaIssuesModal — one shared modal serves image,
+// voice, and document indexing, so the title/table/nouns/explainers come from
+// here instead of being hardcoded to images.
+const ISSUE_KINDS = {
+  image: {
+    title: "Image indexing issues",
+    source: "media_index",
+    one: "image", many: "images",
+    errorsEmpty: "No errors recorded. Every image that the indexer could read was successfully described.",
+    errorsHelp: <>An <strong>error</strong> means the file was present but couldn't be processed — either the download failed (corrupted/truncated JPEG, decrypt error) or the cloud describer rejected the image or hit a transient API failure. Describe errors are auto-retried on the next run.</>,
+    missingEmpty: "No missing files. Every image referenced by a message exists in the backup.",
+    missingHelp: <><strong>Missing</strong> means the chat references an image but the file is not present in the iOS backup. This is almost always because the image was never downloaded on the phone (you saw a thumbnail in chat but never tapped to fetch the full image), or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to OCR.</>,
+  },
+  voice: {
+    title: "Voice transcription issues",
+    source: "voice_index",
+    one: "voice note", many: "voice notes",
+    errorsEmpty: "No errors recorded. Every voice note that the indexer could read was successfully transcribed.",
+    errorsHelp: <>An <strong>error</strong> means the clip was present but couldn't be processed — either the download failed (corrupted/truncated audio, decrypt error) or the cloud transcriber rejected it or hit a transient API failure. Errors are auto-retried on the next run.</>,
+    missingEmpty: "No missing files. Every voice note referenced by a message exists in the backup.",
+    missingHelp: <><strong>Missing</strong> means the chat references a voice note but the file is not present in the iOS backup — usually because it was never downloaded/played on the phone, or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to transcribe.</>,
+  },
+  document: {
+    title: "Document extraction issues",
+    source: "document_index",
+    one: "document", many: "documents",
+    errorsEmpty: "No errors recorded. Every PDF that the indexer could read had its text extracted.",
+    errorsHelp: <>An <strong>error</strong> means the file was present but couldn't be processed — either the download failed (corrupted/truncated file, decrypt error) or the PDF couldn't be parsed. Errors are auto-retried on the next run.</>,
+    missingEmpty: "No missing files. Every document referenced by a message exists in the backup.",
+    missingHelp: <><strong>Missing</strong> means the chat references a document but the file is not present in the iOS backup — usually because it was never downloaded on the phone, or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to extract.</>,
+  },
+};
+
+function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issues", kind = ISSUE_KINDS.image }) {
   const [data, setData] = useState(null);   // null = loading, {} = loaded
   const [error, setError] = useState("");
   const [tab, setTab] = useState("errors"); // "errors" | "missing"
@@ -535,9 +568,9 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
 
         <header className="px-6 py-4 border-b flex items-center justify-between" style={{borderColor:'#ECE5DD'}}>
           <div>
-            <h2 className="text-base font-semibold text-gray-900">Image indexing issues</h2>
+            <h2 className="text-base font-semibold text-gray-900">{kind.title}</h2>
             <p className="text-xs text-gray-500 mt-0.5">
-              From <code>media_index</code> · most recent first
+              From <code>{kind.source}</code> · most recent first
             </p>
           </div>
           <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none px-2">×</button>
@@ -567,20 +600,16 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
 
           {data && tab === "errors" && (
             errorsTotal === 0 ? (
-              <p className="text-sm text-gray-500">
-                No errors recorded. Every image that the indexer could read was successfully described.
-              </p>
+              <p className="text-sm text-gray-500">{kind.errorsEmpty}</p>
             ) : (
               <>
                 <p className="text-[11px] text-gray-500 mb-3">
-                  An <strong>error</strong> means the file was present but couldn't be processed — either the
-                  download failed (corrupted/truncated JPEG, decrypt error) or the cloud describer rejected the
-                  image or hit a transient API failure. Describe errors are auto-retried on the next run.
+                  {kind.errorsHelp}{" "}
                   Showing {data.errors.length.toLocaleString()} of {errorsTotal.toLocaleString()}.
                 </p>
                 <div className="space-y-3">
                   {grouped.map(g => (
-                    <ErrorGroup key={g.msg} msg={g.msg} rows={g.rows} />
+                    <ErrorGroup key={g.msg} msg={g.msg} rows={g.rows} one={kind.one} many={kind.many} />
                   ))}
                 </div>
               </>
@@ -589,17 +618,12 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
 
           {data && tab === "missing" && (
             missingTotal === 0 ? (
-              <p className="text-sm text-gray-500">
-                No missing files. Every image referenced by a message exists in the backup.
-              </p>
+              <p className="text-sm text-gray-500">{kind.missingEmpty}</p>
             ) : (
               <>
                 <p className="text-[11px] text-gray-500 mb-3">
-                  <strong>Missing</strong> means the chat references an image but the file is not present
-                  in the iOS backup. This is almost always because the image was never downloaded on the
-                  phone (you saw a thumbnail in chat but never tapped to fetch the full image), or WhatsApp's
-                  local media cache evicted it before the backup ran. Not an error — there's simply no file
-                  to OCR. Showing {data.missing.length.toLocaleString()} of {missingTotal.toLocaleString()}.
+                  {kind.missingHelp}{" "}
+                  Showing {data.missing.length.toLocaleString()} of {missingTotal.toLocaleString()}.
                 </p>
                 <ul className="space-y-1">
                   {data.missing.map(row => (
@@ -628,7 +652,7 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
 // ErrorGroup — collapsible folder for N rows that share an error message.
 // Default-collapsed; expand to see rowids + manifest paths. Keeps the
 // modal scannable even when there are hundreds of errors.
-function ErrorGroup({ msg, rows }) {
+function ErrorGroup({ msg, rows, one = "image", many = "images" }) {
   const [open, setOpen] = useState(rows.length <= 3); // small groups: expand by default
 
   return (
@@ -640,7 +664,7 @@ function ErrorGroup({ msg, rows }) {
         </div>
         <div className="flex items-center gap-2 shrink-0 ml-3">
           <span className="text-[10px] uppercase tracking-wider text-gray-500 font-semibold">
-            {rows.length} {rows.length === 1 ? "image" : "images"}
+            {rows.length} {rows.length === 1 ? one : many}
           </span>
           <span className="text-gray-400 text-xs">{open ? "▾" : "▸"}</span>
         </div>
@@ -2116,7 +2140,7 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
         />
       )}
 
-      {showIssues && <MediaIssuesModal endpoint="/api/database/voice-index/issues" onClose={() => setShowIssues(false)} />}
+      {showIssues && <MediaIssuesModal endpoint="/api/database/voice-index/issues" kind={ISSUE_KINDS.voice} onClose={() => setShowIssues(false)} />}
     </section>
   );
 }
@@ -2375,7 +2399,7 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
         />
       )}
 
-      {showIssues && <MediaIssuesModal endpoint="/api/database/document-index/issues" onClose={() => setShowIssues(false)} />}
+      {showIssues && <MediaIssuesModal endpoint="/api/database/document-index/issues" kind={ISSUE_KINDS.document} onClose={() => setShowIssues(false)} />}
     </section>
   );
 }
