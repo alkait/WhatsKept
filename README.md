@@ -92,9 +92,9 @@ does the asking.
 /bin/bash -c "$(curl -fsSL https://github.com/alkait/WhatsKept/releases/latest/download/install.sh)"
 ```
 
-Or [download `WhatsKept-darwin-arm64.app.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip), unzip, and double-click `Install WhatsKept.command`.
+Or [download the app](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-darwin-arm64.app.zip), unzip, and double-click `Install WhatsKept.command`.
 
-**Windows** (10/11, x64) — [download `WhatsKept-windows-amd64.zip`](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-windows-amd64.zip), unzip, and run `whatskept.exe`.
+**Windows** (10/11, x64) — [download the app](https://github.com/alkait/WhatsKept/releases/latest/download/WhatsKept-windows-amd64.zip), unzip, and run `whatskept.exe`.
 
 ## How this was built
 
