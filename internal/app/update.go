@@ -24,11 +24,23 @@ const repoSlug = "alkait/WhatsKept"
 const installerURL = "https://github.com/" + repoSlug + "/releases/latest/download/install.sh"
 
 // localDevVersion is the ldflags default baked into a plain `make build`
-// with no VERSION= override. We treat it as "not a distributed build"
-// and never nag it about updates — a developer running their own build
-// shouldn't see an "update available" pill for every published release.
-// CI dev builds differ (0.0.0-dev.<run>+<sha>) and do get prompted.
+// with no VERSION= override. We treat any build carrying this prefix as
+// "not a distributed release" and never nag it about updates — a developer
+// running their own build shouldn't see an "update available" pill for
+// every published release.
 const localDevVersion = "0.0.0-dev"
+
+// isLocalDevBuild reports whether v is an untagged local/dev build that we
+// should keep quiet about updates. It matches the plain `make build`
+// default ("0.0.0-dev") and any suffixed variant the build tooling may
+// stamp on — e.g. a Windows test build versioned "0.0.0-dev-<shortsha>",
+// or the CI "0.0.0-dev.<run>+<sha>" form. We don't ship dev pre-releases,
+// so anything resolving to semver core 0.0.0 is a local build with no real
+// release to update to. A leading "v" is tolerated.
+func isLocalDevBuild(v string) bool {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	return v == "" || strings.HasPrefix(v, localDevVersion)
+}
 
 // handleMeta returns the running build's version and source repo. No
 // network access — the UI calls this on mount to render the version
@@ -64,9 +76,9 @@ func (s *server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	// want the same "is there a newer tag" signal, so we run the check on every
 	// platform.
 	//
-	// A plain local build never resolves to a distributable artifact, so
+	// A local/dev build never resolves to a distributable artifact, so
 	// there's nothing to update it to. Skip the network call entirely.
-	if s.version == localDevVersion || s.version == "" {
+	if isLocalDevBuild(s.version) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}

@@ -1,11 +1,15 @@
 package app
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 )
 
 // agentSpec is the static catalogue entry for one supported agent.
@@ -37,24 +41,53 @@ type agentSpec struct {
 	// use Binary cross-platform) and for GUI agents with no Windows shim.
 	WinLauncher string
 
+	// URLLaunch is a deep-link template used to open a GUI app that exposes a
+	// custom URL scheme instead of a folder-argument launch (the Claude
+	// desktop app: "claude://code/new?folder={folder}"). When set, the agent
+	// is opened by handing the OS this URL (via openURLCmd) with {folder}
+	// replaced by the url-encoded workspace path — not via `open -a`/Terminal.
+	// Detection still keys off AppName (the .app bundle). Empty for agents
+	// launched the ordinary way.
+	URLLaunch string
+
 	// IgnoreFile is the dotfile name this agent (or its inline assistant)
 	// reads to know which workspace paths NOT to feed to a model. Written
 	// into the workspace by postprocess.WriteAssets to keep multi-MB
 	// `media/`, `voice/`, and `profiles/` trees out of token budgets.
 	// Empty if the agent has no documented ignore mechanism.
 	IgnoreFile string
+
+	// InstallURL is the official download/install page, surfaced as a link
+	// under the Agents-tab dropdown when the agent isn't installed.
+	InstallURL string
 }
 
 // agentRegistry is the single source of truth for which agents the
 // GUI knows about. Order is render order in the Agents tab.
 var agentRegistry = []agentSpec{
 	{
-		ID:          "windsurf",
-		Name:        "Windsurf",
-		Description: "Cascade-powered IDE that reads AGENTS.md natively.",
-		AppName:     "Windsurf",
-		WinLauncher: "windsurf",
-		IgnoreFile:  ".windsurfignore",
+		ID:          "claude-desktop",
+		Name:        "Claude",
+		Description: "Anthropic's desktop app — opens this workspace in Claude Code.",
+		AppName:     "Claude", // detect /Applications/Claude.app
+		URLLaunch:   "claude://code/new?folder={folder}",
+		InstallURL:  "https://claude.ai/download",
+		// The read-only query workflow is pre-approved via the workspace's
+		// .claude/settings.json permissions.allow list (written by
+		// postprocess.WriteAssets) so the app doesn't prompt on every sqlite3
+		// call — the desktop app ignores bypassPermissions from a project file.
+		// Respects .gitignore.
+	},
+	{
+		ID:          "codex",
+		Name:        "Codex",
+		Description: "OpenAI's coding agent — opens this workspace via the codex:// app.",
+		AppName:     "Codex", // detect /Applications/Codex.app — confirm the bundle name
+		URLLaunch:   "codex://new?path={folder}",
+		InstallURL:  "https://developers.openai.com/codex/",
+		// Approval prompts are pre-cleared via ~/.codex/config.toml
+		// (approval_policy = "never", sandbox_mode), refreshed on every Sync by
+		// postprocess.writeCodexConfig. That file is GLOBAL, not per-workspace.
 	},
 	{
 		ID:          "vscode",
@@ -63,6 +96,7 @@ var agentRegistry = []agentSpec{
 		AppName:     "Visual Studio Code",
 		WinLauncher: "code",
 		IgnoreFile:  ".copilotignore", // honoured by GitHub Copilot's content-exclusion plumbing
+		InstallURL:  "https://code.visualstudio.com/Download",
 	},
 	{
 		ID:          "cursor",
@@ -71,20 +105,7 @@ var agentRegistry = []agentSpec{
 		AppName:     "Cursor",
 		WinLauncher: "cursor",
 		IgnoreFile:  ".cursorignore",
-	},
-	{
-		ID:          "claude-code",
-		Name:        "Claude Code",
-		Description: "Anthropic's terminal-native coding agent — reads CLAUDE.md from the workspace root.",
-		Binary:      "claude",
-		// No documented ignore-file convention; Claude Code respects .gitignore by default.
-	},
-	{
-		ID:          "opencode",
-		Name:        "opencode",
-		Description: "Open-source terminal coding agent — reads AGENTS.md natively, BYO model provider.",
-		Binary:      "opencode",
-		// No documented ignore-file convention; opencode honours .gitignore by default.
+		InstallURL:  "https://cursor.com/download",
 	},
 }
 
@@ -115,8 +136,7 @@ type agentInfo struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Installed   bool   `json:"installed"`
-	AppPath     string `json:"app_path,omitempty"`
+	InstallURL  string `json:"install_url,omitempty"`
 }
 
 // findAgent looks up a registry entry by ID.
@@ -129,35 +149,20 @@ func findAgent(id string) *agentSpec {
 	return nil
 }
 
-// detectAgent returns (true, path) if the agent is installed. For GUI
-// agents, path is the launch target (the .app bundle on macOS, the resolved
-// CLI shim on Windows); for CLI agents, the resolved executable. Returns
-// (false, "") if neither AppName nor Binary is set, or nothing was found.
-//
-// detectGUIAgent / detectCLIAgent are platform-specific (agents_<os>.go):
-// where an agent lives and how it's launched differs by OS.
-func detectAgent(spec agentSpec) (bool, string) {
-	if spec.AppName != "" || spec.WinLauncher != "" {
-		return detectGUIAgent(spec)
-	}
-	if spec.Binary != "" {
-		return detectCLIAgent(spec)
-	}
-	return false, ""
-}
-
-// describeAgents returns the JSON-ready view of the registry with
-// live detection status filled in.
+// describeAgents returns the JSON-ready view of the registry. We deliberately
+// do NOT probe for installation: detection across install methods (Spotlight
+// apps, Microsoft Store / MSIX packages, npm shims, custom URL schemes) is
+// unreliable and produced both false negatives and stale false positives.
+// Instead every agent is always offered, and handleOpenAgent surfaces a clear
+// error (paired with the agent's install link in the UI) if the launch fails.
 func describeAgents() []agentInfo {
 	out := make([]agentInfo, 0, len(agentRegistry))
 	for _, spec := range agentRegistry {
-		installed, path := detectAgent(spec)
 		out = append(out, agentInfo{
 			ID:          spec.ID,
 			Name:        spec.Name,
 			Description: spec.Description,
-			Installed:   installed,
-			AppPath:     path,
+			InstallURL:  spec.InstallURL,
 		})
 	}
 	return out
@@ -175,42 +180,26 @@ type openAgentRequest struct {
 	Path string `json:"path"`
 }
 
-// handleOpenAgent launches the requested agent with the given path
-// as its working folder. The launch mechanism depends on the agent
-// kind (see agentSpec):
+// handleOpenAgent launches the requested agent with the given path as its
+// working folder. There is no install pre-check: every agent is offered and we
+// report a clear error if the launch fails. Two launch shapes:
 //
-//   - GUI agents are launched via `/usr/bin/open -a <app> <path>` so
-//     LaunchServices handles focus + single-instance semantics; a
-//     bare exec on the bundle's MacOS binary would spawn a duplicate
-//     instance and inherit our minimal environment.
-//   - CLI agents are launched in a fresh Terminal window via
-//     `/usr/bin/osascript` running a `tell application "Terminal"`
-//     block that `cd`s into the workspace and `exec`s the binary.
-//     We can't use `open -a Terminal <path>` because that only opens
-//     the directory — it doesn't run the agent.
+//   - URL-scheme apps (Claude, Codex) are opened by handing the OS a deep link
+//     carrying the workspace folder; openURLCmd routes custom schemes per
+//     platform. (Note: on Windows the URL opener can't report a missing
+//     handler — Windows shows its own "choose an app" dialog instead.)
+//   - GUI editors (VS Code, Cursor) go through buildAgentCmd (agents_<os>.go):
+//     `open -a <app>` on macOS, the editor's PATH shim on Windows.
 //
-// In both cases the launched process is detached so the agent
-// outlives whatskept.
+// The launcher (open / rundll32 / cmd) hands off to the OS and exits promptly;
+// the agent itself is detached and outlives whatskept. We wait briefly for the
+// launcher and treat a non-zero exit as "app not found", echoing its stderr so
+// the UI can pair the failure with the agent's install link.
 func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	spec := findAgent(id)
 	if spec == nil {
 		httpError(w, http.StatusNotFound, fmt.Sprintf("unknown agent %q", id))
-		return
-	}
-
-	installed, resolved := detectAgent(*spec)
-	if !installed {
-		var where string
-		switch {
-		case spec.AppName != "":
-			where = "/Applications and ~/Applications"
-		case spec.Binary != "":
-			where = "$PATH and the standard CLI install locations"
-		default:
-			where = "the standard install locations"
-		}
-		httpError(w, http.StatusNotFound, fmt.Sprintf("%s is not installed (looked under %s)", spec.Name, where))
 		return
 	}
 
@@ -234,28 +223,71 @@ func (s *server) handleOpenAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build the platform-specific launch command (GUI editor vs CLI agent
-	// in a terminal). buildAgentCmd lives in agents_<os>.go because the
-	// mechanics differ entirely per OS (LaunchServices + AppleScript on
-	// macOS; the editor's CLI shim + Windows Terminal/cmd on Windows). The
-	// launched process is detached so the agent outlives whatskept.
-	cmd, err := buildAgentCmd(*spec, resolved, target)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch %s: %v", spec.Name, err))
-		return
+	var cmd *exec.Cmd
+	if spec.URLLaunch != "" {
+		// The deep-link opener can't report a missing handler on every platform
+		// (Windows rundll32 always exits 0), so check availability up front
+		// there. Platforms whose opener DOES report failure (macOS `open`)
+		// return true and we rely on the exit code below.
+		scheme, _, _ := strings.Cut(spec.URLLaunch, "://")
+		if !deepLinkAvailable(scheme) {
+			httpError(w, http.StatusBadGateway, openFailMsg(spec.Name, ""))
+			return
+		}
+		launchURL := strings.ReplaceAll(spec.URLLaunch, "{folder}", url.QueryEscape(target))
+		cmd = openURLCmd(launchURL)
+	} else {
+		c, err := buildAgentCmd(*spec, target)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, openFailMsg(spec.Name, err.Error()))
+			return
+		}
+		cmd = c
 	}
+
+	// Capture the launcher's stderr so a failure carries a useful reason
+	// (e.g. macOS `open` prints "Unable to find application named 'Cursor'").
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		httpError(w, http.StatusInternalServerError, fmt.Sprintf("failed to launch %s: %v", spec.Name, err))
+		httpError(w, http.StatusInternalServerError, openFailMsg(spec.Name, err.Error()))
 		return
 	}
-	go cmd.Wait() // reap the child; ignore result
+
+	// Wait briefly: a non-zero exit means the app / URL handler wasn't found.
+	// If the launcher is still alive after the grace period (rare), assume
+	// success and reap it in the background so we don't leak the process.
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			reason := strings.TrimSpace(stderr.String())
+			if reason == "" {
+				reason = err.Error()
+			}
+			httpError(w, http.StatusBadGateway, openFailMsg(spec.Name, reason))
+			return
+		}
+	case <-time.After(3 * time.Second):
+		go func() { <-done }()
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"agent":    spec.ID,
-		"app_path": resolved,
-		"opened":   target,
+		"ok":     true,
+		"agent":  spec.ID,
+		"opened": target,
 	})
+}
+
+// openFailMsg builds the user-facing error shown when an agent launch fails.
+// The UI pairs this with the agent's "Install …" link.
+func openFailMsg(name, reason string) string {
+	msg := fmt.Sprintf("Couldn't open %s — it may not be installed.", name)
+	if reason != "" {
+		msg += " (" + reason + ")"
+	}
+	return msg
 }
 
 

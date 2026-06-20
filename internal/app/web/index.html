@@ -2630,10 +2630,15 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
   const [selectedId, setSelectedId] = useState("");
   const [prefsLoaded, setPrefsLoaded] = useState(false);
   const [error, setError] = useState("");
+  // { name, installUrl } of the agent whose last open attempt failed — drives
+  // the small inline hint under the dropdown. Cleared on a new attempt or when
+  // the selection changes.
+  const [openError, setOpenError] = useState(null);
 
   // Persist every change so the next launch reopens with the same agent.
   const chooseAgent = (id) => {
     setSelectedId(id);
+    setOpenError(null);
     api.post("/api/prefs/ui", { agent_choice: id }).catch(() => {});
   };
 
@@ -2648,23 +2653,21 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
       .finally(() => setPrefsLoaded(true));
   }, []);
 
-  // Default the dropdown to the first installed agent when there's no
-  // stored choice, or when the stored agent no longer exists. Terminal
-  // is no longer a dropdown entry (it's its own always-visible button),
-  // so fall back to the first known agent rather than "__terminal__".
+  // Default the dropdown to the first agent when there's no stored choice, or
+  // when the stored agent no longer exists. We no longer detect installs, so
+  // there's nothing to prefer — just fall back to the first known agent.
   useEffect(() => {
     if (!agents || !prefsLoaded) return;
     const valid = agents.some(a => a.id === selectedId);
     if (!valid) {
-      const firstInstalled = agents.find(a => a.installed);
-      setSelectedId(firstInstalled ? firstInstalled.id : (agents[0] ? agents[0].id : ""));
+      setSelectedId(agents[0] ? agents[0].id : "");
     }
   }, [agents, selectedId, prefsLoaded]);
 
   const launch = async (agent) => {
-    setOpeningId(agent.id); setError("");
+    setOpeningId(agent.id); setError(""); setOpenError(null);
     try { await api.post(`/api/agents/${agent.id}/open`, { path: workspace.path }); }
-    catch(e) { setError(e.message); }
+    catch (e) { setOpenError({ name: agent.name, installUrl: agent.install_url }); }
     finally { setOpeningId(null); }
   };
 
@@ -2715,8 +2718,6 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
             const selectedAgent  = agents.find(a => a.id === selectedId) || null;
             const agentOpening   = openingId === selectedId;
             const terminalOpening = openingId === "__terminal__";
-            const canOpen        = selectedAgent && selectedAgent.installed;
-            const description    = selectedAgent ? selectedAgent.description : "";
             const openSelected   = () => { if (selectedAgent) launch(selectedAgent); };
             const agentLabel     = agentOpening ? "Opening…" : `Open in ${selectedAgent ? selectedAgent.name : "agent"}`;
             return (
@@ -2726,17 +2727,22 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
                   <div className="flex items-center gap-3">
                     <NiceSelect value={selectedId} onChange={chooseAgent} className="flex-1 min-w-0"
                       ariaLabel="Choose agent"
-                      options={agents.map(a => ({ value: a.id, label: a.name, tag: a.installed ? null : "not installed" }))} />
-                    <button onClick={openSelected} disabled={!canOpen || agentOpening}
+                      options={agents.map(a => ({ value: a.id, label: a.name }))} />
+                    <button onClick={openSelected} disabled={!selectedAgent || agentOpening}
                       className="shrink-0 rounded-lg border disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold hover:bg-gray-50 transition-colors"
                       style={{borderColor:'#075E54', color:'#075E54', background:'white'}}
-                      title={canOpen ? "Open this workspace" : `${selectedAgent ? selectedAgent.name : "This agent"} is not installed in /Applications`}>
+                      title="Open this workspace">
                       {agentLabel}
                     </button>
                   </div>
-                  {description && <p className="text-xs text-gray-500 mt-3">{description}</p>}
-                  {selectedAgent && selectedAgent.installed && selectedAgent.app_path && (
-                    <p className="text-[11px] text-gray-400 mt-1 font-mono truncate">{selectedAgent.app_path}</p>
+                  {openError && (
+                    <p className="text-xs text-red-500 mt-2">
+                      Couldn't open {openError.name} — is it installed?{" "}
+                      {openError.installUrl && (
+                        <a href="#" onClick={e => { e.preventDefault(); api.post("/api/open-url", { url: openError.installUrl }).catch(() => {}); }}
+                          className="font-medium underline">Get it</a>
+                      )}
+                    </p>
                   )}
 
                   {/* Terminal is always available — its own button so the

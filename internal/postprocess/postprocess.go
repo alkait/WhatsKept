@@ -14,10 +14,12 @@ package postprocess
 import (
 	"database/sql"
 	_ "embed" // for //go:embed directives below
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -153,7 +155,175 @@ func WriteAssets(workspace string, agentIgnoreFiles []string) error {
 			return fmt.Errorf("write %s: %w", name, err)
 		}
 	}
+
+	// 4. .claude/settings.json — pre-approve the read-only query workflow so
+	// Claude Code (CLI and desktop app alike) doesn't prompt on every step.
+	// Merged, not clobbered: a user's own allow/deny rules survive a refresh.
+	if err := writeClaudeSettings(workspace); err != nil {
+		return fmt.Errorf("write .claude/settings.json: %w", err)
+	}
 	return nil
+}
+
+// claudeAllowRules are the permission allow-rules WhatsKept seeds into the
+// workspace's .claude/settings.json so Claude Code can run the AGENTS.md
+// workflow without a prompt on every step:
+//
+//   - sqlite3 is NOT in Claude Code's built-in read-only command set (ls, cat,
+//     grep, find, … are; sqlite3 is not), so every query otherwise prompts.
+//   - `open` hands a media file / PDF to the OS for the user to view.
+//
+// An allow-list is the right mechanism because it's honoured from project
+// settings everywhere, including the desktop app — which (unlike the terminal
+// CLI) does NOT honour permissions.defaultMode = "bypassPermissions" from a
+// checked-in project file, since bypass mode is meant only for isolated
+// containers/VMs. We still set defaultMode for the CLI path; the allow-list is
+// what actually clears the desktop app's per-command prompts.
+var claudeAllowRules = []string{
+	"Bash(sqlite3 *)", // run queries against ./ChatStorage.sqlite
+	"Bash(open *)",     // hand a media file / PDF to the OS to display
+}
+
+// writeClaudeSettings creates or updates <workspace>/.claude/settings.json,
+// ensuring permissions.defaultMode = "bypassPermissions" and that the
+// claudeAllowRules are present. Unlike the other WriteAssets files (which are
+// wholly owned and overwritten), this one is merged into any existing settings
+// so a user's hand-added allow/deny rules aren't lost on the next
+// workspace-open refresh. A corrupt/unparseable existing file is treated as
+// empty rather than failing the whole sync.
+func writeClaudeSettings(workspace string) error {
+	dir := filepath.Join(workspace, ".claude")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir .claude: %w", err)
+	}
+	path := filepath.Join(dir, "settings.json")
+
+	settings := map[string]any{}
+	if b, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(b, &settings) // tolerate a corrupt file by starting fresh
+	}
+	perms, _ := settings["permissions"].(map[string]any)
+	if perms == nil {
+		perms = map[string]any{}
+	}
+	perms["defaultMode"] = "bypassPermissions"
+
+	// Union our required rules into any the user already added (preserve order:
+	// existing first, then any of ours not yet present).
+	allow := jsonStrings(perms["allow"])
+	for _, r := range claudeAllowRules {
+		if !slices.Contains(allow, r) {
+			allow = append(allow, r)
+		}
+	}
+	perms["allow"] = allow
+	settings["permissions"] = perms
+
+	out, err := json.MarshalIndent(settings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode settings.json: %w", err)
+	}
+	return writeFileAtomic(path, append(out, '\n'))
+}
+
+// writeCodexConfig creates or updates ~/.codex/config.toml so the Codex agent
+// can work the read-only workspace without an approval prompt on every action.
+//
+// ⚠️ SCOPE: unlike .claude/settings.json (per-workspace), ~/.codex/config.toml
+// is GLOBAL — these settings apply to every Codex session on this machine, not
+// just this workspace. We only ever touch the two top-level keys below and
+// preserve the rest of the file, so a user's own Codex config (model,
+// providers, profiles, …) survives.
+func writeCodexConfig() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("home dir: %w", err)
+	}
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("mkdir .codex: %w", err)
+	}
+	path := filepath.Join(dir, "config.toml")
+
+	existing := ""
+	if b, err := os.ReadFile(path); err == nil {
+		existing = string(b)
+	}
+	return writeFileAtomic(path, []byte(upsertCodexTopLevel(existing)))
+}
+
+// codexConfigLines are the exact top-level TOML lines WhatsKept maintains in
+// ~/.codex/config.toml. Keyed by the bare TOML key so upsertCodexTopLevel can
+// find-and-replace an existing assignment in place.
+var codexConfigLines = []struct{ key, line string }{
+	{"approval_policy", `approval_policy = "never"`},
+	{"sandbox_mode", `sandbox_mode = "danger-full-access"   # or "workspace-write" for safer option`},
+}
+
+// upsertCodexTopLevel returns content with each codexConfigLines entry set as a
+// top-level key. An existing top-level assignment is replaced in place; a
+// missing one is prepended (TOML requires top-level keys to precede any
+// [table] header, so we only ever scan/insert in the region before the first
+// table, and prepend to be safe). All other lines — including the user's
+// tables and comments — are preserved verbatim.
+func upsertCodexTopLevel(content string) string {
+	lines := strings.Split(content, "\n")
+
+	// Top-level keys live before the first table header ("[...]" / "[[...]]").
+	firstTable := len(lines)
+	for i, ln := range lines {
+		if strings.HasPrefix(strings.TrimSpace(ln), "[") {
+			firstTable = i
+			break
+		}
+	}
+
+	set := map[string]bool{}
+	for i := 0; i < firstTable; i++ {
+		t := strings.TrimSpace(lines[i])
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		for _, w := range codexConfigLines {
+			if rest, ok := strings.CutPrefix(t, w.key); ok && strings.HasPrefix(strings.TrimSpace(rest), "=") {
+				lines[i] = w.line
+				set[w.key] = true
+			}
+		}
+	}
+
+	var prefix []string
+	for _, w := range codexConfigLines {
+		if !set[w.key] {
+			prefix = append(prefix, w.line)
+		}
+	}
+	if len(prefix) > 0 {
+		lines = append(prefix, lines...)
+	}
+
+	out := strings.Join(lines, "\n")
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	return out
+}
+
+// jsonStrings coerces a value decoded from JSON (a []any of strings, or nil)
+// into a []string, dropping any non-string elements. Used to read back an
+// existing permissions.allow array for the merge in writeClaudeSettings.
+func jsonStrings(v any) []string {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // SyncMessages is the high-level "Sync messages" pipeline:
@@ -460,6 +630,14 @@ func SyncMessages(
 	log("Writing AGENTS.md, CLAUDE.md, views.sql, and agent ignore files…")
 	if err := WriteAssets(workspace, agentIgnoreFiles); err != nil {
 		return nil, err
+	}
+
+	// Refresh the global Codex config so the Codex agent runs the workspace
+	// without approval prompts. Best-effort and non-fatal: this writes to the
+	// user's home dir (~/.codex/config.toml), not the workspace, so a failure
+	// must not unwind a sync whose DB is already on disk and applied.
+	if err := writeCodexConfig(); err != nil {
+		log(fmt.Sprintf("Codex config refresh failed (continuing): %v", err))
 	}
 
 	// Final counts — best-effort. A failure here doesn't unwind the

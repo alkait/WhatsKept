@@ -34,3 +34,26 @@ func TestSemverLess(t *testing.T) {
 		}
 	}
 }
+
+func TestIsLocalDevBuild(t *testing.T) {
+	cases := []struct {
+		v    string
+		want bool
+	}{
+		// Untagged local/dev builds — stay quiet (no update pill).
+		{"", true},
+		{"0.0.0-dev", true},              // plain `make build` default
+		{"v0.0.0-dev", true},             // tolerated leading "v"
+		{"0.0.0-dev-c31fa82", true},      // Windows test build with short sha
+		{"0.0.0-dev.67+c31fa82", true},   // CI dev form
+		// Real tagged releases — prompt for updates.
+		{"0.1.0", false},
+		{"v2.1.2", false},
+		{"1.0.0-rc.1", false},
+	}
+	for _, c := range cases {
+		if got := isLocalDevBuild(c.v); got != c.want {
+			t.Errorf("isLocalDevBuild(%q) = %v, want %v", c.v, got, c.want)
+		}
+	}
+}
