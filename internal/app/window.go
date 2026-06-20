@@ -53,6 +53,11 @@ func runWindow(opts windowOptions, pickFolder pickFolderFunc) error {
 	}
 	w.SetSize(opts.Width, opts.Height, hint)
 
+	// Give the window/taskbar the app icon from the exe resources (Windows;
+	// no-op elsewhere). webview doesn't assign one, so the taskbar would
+	// otherwise show a generic glyph.
+	applyWindowIcon(w.Window())
+
 	// Bind the native folder picker. Returning an error from the bound
 	// function surfaces it as a rejected promise on the JS side, which
 	// the existing React code already handles (it just leaves the

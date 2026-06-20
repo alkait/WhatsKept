@@ -23,6 +23,20 @@ GO_TAGS := sqlite_fts5
 
 build: $(BIN)
 
+# winicon regenerates the embedded Windows app-icon resource from the source
+# logo. Run it after changing internal/app/web/logo.png. Needs ImageMagick +
+# mingw-w64 (brew install imagemagick mingw-w64). The resulting .syso is
+# committed and auto-linked by `go build` for windows/amd64 (the
+# _windows_amd64 filename suffix scopes it to Windows), so build-windows and CI
+# don't need windres themselves.
+.PHONY: winicon
+winicon:
+	magick internal/app/web/logo.png -background none \
+	  -define icon:auto-resize=256,128,64,48,32,16 build/whatskept.ico
+	cd build && x86_64-w64-mingw32-windres -i icon.rc -O coff \
+	  -o ../cmd/whatskept/rsrc_windows_amd64.syso
+	@echo "regenerated cmd/whatskept/rsrc_windows_amd64.syso"
+
 # build-windows cross-compiles the Windows x64 .exe from this Mac for the
 # Parallels test loop — no native build inside the VM required.
 #
