@@ -2604,6 +2604,9 @@ function NiceSelect({ value, onChange, options, className, ariaLabel }) {
         onClick={() => setOpen(o => !o)}
         className="w-full flex items-center gap-2 rounded-lg border bg-white px-3 py-2 text-sm font-semibold text-left transition hover:border-[#128C7E]"
         style={{borderColor: open ? '#128C7E' : '#8FCBA6', color:'#075E54'}}>
+        {selected && selected.icon && (
+          <img src={selected.icon} alt="" aria-hidden="true" className="w-5 h-5 shrink-0 object-contain" />
+        )}
         <span className="flex-1 min-w-0 truncate">
           {selected ? selected.label : "Select…"}
           {selected && selected.tag && (
@@ -2628,6 +2631,9 @@ function NiceSelect({ value, onChange, options, className, ariaLabel }) {
                 onClick={() => pick(o.value)}
                 className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left transition ${active ? "" : "hover:bg-[#F2FBF5]"}`}
                 style={active ? {background:'#DCF8C6', color:'#075E54'} : {color:'#374151'}}>
+                {o.icon && (
+                  <img src={o.icon} alt="" aria-hidden="true" className="w-5 h-5 shrink-0 object-contain" />
+                )}
                 <span className="flex-1 min-w-0 truncate font-medium">{o.label}</span>
                 {o.tag && (
                   <span className="text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 font-medium shrink-0">{o.tag}</span>
@@ -2751,7 +2757,7 @@ function AgentsPanel({ workspace, dbStatus, onOpenDatabase }) {
                   <div className="flex items-center gap-3">
                     <NiceSelect value={selectedId} onChange={chooseAgent} className="flex-1 min-w-0"
                       ariaLabel="Choose agent"
-                      options={agents.map(a => ({ value: a.id, label: a.name }))} />
+                      options={agents.map(a => ({ value: a.id, label: a.name, icon: a.icon }))} />
                     <button onClick={openSelected} disabled={!selectedAgent || agentOpening}
                       className="shrink-0 rounded-lg border disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold hover:bg-gray-50 transition-colors"
                       style={{borderColor:'#075E54', color:'#075E54', background:'white'}}

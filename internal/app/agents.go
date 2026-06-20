@@ -60,6 +60,11 @@ type agentSpec struct {
 	// InstallURL is the official download/install page, surfaced as a link
 	// under the Agents-tab dropdown when the agent isn't installed.
 	InstallURL string
+
+	// Icon is the URL path to the agent's logo, served from the embedded
+	// internal/app/web/icons/ directory and shown beside the name in the
+	// Agents-tab dropdown. Empty renders no icon (name only).
+	Icon string
 }
 
 // agentRegistry is the single source of truth for which agents the
@@ -72,6 +77,7 @@ var agentRegistry = []agentSpec{
 		AppName:     "Claude", // detect /Applications/Claude.app
 		URLLaunch:   "claude://code/new?folder={folder}",
 		InstallURL:  "https://claude.ai/download",
+		Icon:        "/icons/claude.svg",
 		// The read-only query workflow is pre-approved via the workspace's
 		// .claude/settings.json permissions.allow list (written by
 		// postprocess.WriteAssets) so the app doesn't prompt on every sqlite3
@@ -85,6 +91,7 @@ var agentRegistry = []agentSpec{
 		AppName:     "Codex", // detect /Applications/Codex.app — confirm the bundle name
 		URLLaunch:   "codex://new?path={folder}",
 		InstallURL:  "https://developers.openai.com/codex/",
+		Icon:        "/icons/codex.svg",
 		// Approval prompts are pre-cleared via ~/.codex/config.toml
 		// (approval_policy = "never", sandbox_mode), refreshed on every Sync by
 		// postprocess.writeCodexConfig. That file is GLOBAL, not per-workspace.
@@ -97,6 +104,7 @@ var agentRegistry = []agentSpec{
 		WinLauncher: "code",
 		IgnoreFile:  ".copilotignore", // honoured by GitHub Copilot's content-exclusion plumbing
 		InstallURL:  "https://code.visualstudio.com/Download",
+		Icon:        "/icons/vscode.svg",
 	},
 	{
 		ID:          "cursor",
@@ -106,6 +114,7 @@ var agentRegistry = []agentSpec{
 		WinLauncher: "cursor",
 		IgnoreFile:  ".cursorignore",
 		InstallURL:  "https://cursor.com/download",
+		Icon:        "/icons/cursor.svg",
 	},
 }
 
@@ -137,6 +146,7 @@ type agentInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	InstallURL  string `json:"install_url,omitempty"`
+	Icon        string `json:"icon,omitempty"`
 }
 
 // findAgent looks up a registry entry by ID.
@@ -163,6 +173,7 @@ func describeAgents() []agentInfo {
 			Name:        spec.Name,
 			Description: spec.Description,
 			InstallURL:  spec.InstallURL,
+			Icon:        spec.Icon,
 		})
 	}
 	return out
