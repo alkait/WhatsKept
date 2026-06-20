@@ -1076,10 +1076,9 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
     <section>
       <div className="mb-3">
         <div className="flex items-center gap-2">
-          <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Core database</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Core</h2>
           <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Required</span>
         </div>
-        <p className="text-[11px] text-gray-400 mt-1">Setup database and foundational files, text messages, iOS contacts, WhatsApp avatars and image files</p>
       </div>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
@@ -1151,10 +1150,10 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
     {dbExists && (<>
     <section className="mt-6">
       <div className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Image enrichment</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>AI image descriptions · cloud</h2>
         <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
       </div>
-      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with image descriptions so agents can see the description of the images too</p>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Sends each photo to a cloud AI for a fuller description and more accurate text reading, in any language. Costs a little per image.</p>
       <div className="rounded-xl bg-white border overflow-hidden" style={{borderColor:'#DCF8C6'}}>
         {/* Image FILES are downloaded as part of the messages sync (like
             avatars/contacts), so these enrichment cards — all password-free
@@ -1363,9 +1362,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
 
   return (
     <div className="p-5 border-t" style={{borderColor:'#DCF8C6'}}>
-      <h3 className="text-sm font-semibold text-gray-900">AI image descriptions · cloud</h3>
-      <p className="text-[11px] text-gray-400 mb-3">Sends each photo to a cloud AI for a fuller description and more accurate text reading, in any language. Costs a little per image.</p>
-
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -1993,15 +1989,12 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   return (
     <section className="mt-6">
       <div className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Voice messages enrichment</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>AI voice transcription · cloud</h2>
         <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
       </div>
-      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with voice transcriptions so the agents can read the voice messages</p>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Sends each voice note to a cloud AI for transcription, in any language (Arabic / English / mixed). Costs a little per clip.</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
-        <h3 className="text-sm font-semibold text-gray-900">AI voice transcription · cloud</h3>
-        <p className="text-[11px] text-gray-400 mb-3">Sends each voice note to a cloud AI for transcription, in any language (Arabic / English / mixed). Costs a little per clip.</p>
-
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -2258,14 +2251,12 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   return (
     <section className="mt-6">
       <div className="flex items-center gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>Document enrichment</h2>
+        <h2 className="text-xs font-semibold uppercase tracking-wider" style={{color:'#075E54'}}>AI document extraction · cloud</h2>
         <span className="text-[10px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-gray-100 text-gray-500">Optional</span>
       </div>
-      <p className="text-[11px] text-gray-400 mb-3 mt-1">Enrich database with document text so the agents can read the documents too</p>
+      <p className="text-[11px] text-gray-400 mb-3 mt-1">Sends each PDF to a cloud parser — free native-text extraction, with OCR for scanned pages. Costs a little per scanned document.</p>
 
       <div className="rounded-xl bg-white border p-5" style={{borderColor:'#DCF8C6'}}>
-        <h3 className="text-sm font-semibold text-gray-900">AI document extraction · cloud</h3>
-        <p className="text-[11px] text-gray-400 mb-3">Sends each PDF to a cloud parser — free native-text extraction, with OCR for scanned pages. Costs a little per scanned document.</p>
 
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0 flex-1">
@@ -3223,9 +3214,9 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
   };
 
   const tabs = [
-    { id: "backups",  label: "Backups"  },
-    { id: "database", label: "Database" },
-    { id: "agents",   label: "Agents"   },
+    { id: "backups",  label: "iOS Backups"    },
+    { id: "database", label: "Local Database" },
+    { id: "agents",   label: "Agents"         },
   ];
 
   return (
@@ -3318,7 +3309,7 @@ function BackupManagerScreen({ workspace, onSwitchWorkspace, reloadWorkspace }) 
         {tab === "backups" && (<>
           {/* ── Available Backups ── */}
           <section>
-            <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Available Backups</h2>
+            <h2 className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#075E54'}}>Available iOS Backups</h2>
             {loading ? (
               <div className="text-sm text-gray-400 py-8 text-center">Loading…</div>
             ) : backupsError ? (
