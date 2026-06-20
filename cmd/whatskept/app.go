@@ -39,6 +39,13 @@ machine. Closing the window terminates the server.`,
 			// happen before the window opens.
 			hideConsoleIfOwned()
 
+			// Single-instance (Windows): if a copy is already running, bring
+			// its window to the front and exit instead of opening a duplicate.
+			// No-op elsewhere (macOS uses LaunchServices).
+			if !ensureSingleInstance() {
+				return nil
+			}
+
 			// Title shows the running version so a user with two
 			// builds open (e.g. a tag release alongside a fresh dev
 			// preview) can tell them apart at a glance. Em dash so
