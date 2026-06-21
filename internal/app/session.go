@@ -128,31 +128,26 @@ func (p *passwordStore) device() string {
 	return p.udid
 }
 
-// apiKeyStore holds the OpenRouter API key for the cloud media describer.
-// Unlike the backup password, the key is a GLOBAL account credential (not
-// workspace-specific), so it is NOT cleared on workspace switches.
+// apiKeyStore holds the OpenRouter API key for the active workspace's cloud
+// media describer. Like the backup password (and unlike older versions,
+// which kept one global key), the key is per workspace: each workspace has
+// its own credential, persisted keyed by workspace path in the cross-platform
+// credentials file (internal/secrets).
 //
-// It can optionally be persisted across restarts via the cross-platform
-// credentials file (internal/secrets): on construction the store loads any
-// persisted key into RAM; set(persist=true) writes it; clear() (the "forget
-// key" affordance) removes it from both RAM and disk. set(persist=false)
-// keeps the key session-only and removes any previously persisted copy.
+// On opening a workspace the store loads that workspace's persisted key (if
+// any) via loadForWorkspace; set(persist=true) writes it; set(persist=false)
+// keeps it session-only and removes any persisted copy; clear() (the "forget
+// key" affordance, also used when a workspace is deleted) removes it from
+// both RAM and disk. The in-RAM copy is reset whenever the active workspace
+// changes — loadForWorkspace repopulates it for the new workspace.
 type apiKeyStore struct {
 	mu        sync.RWMutex
 	v         string
+	path      string // workspace the cached key belongs to ("" = none active)
 	persisted bool
 }
 
-// newAPIKeyStore loads any persisted key so the cloud describer works
-// immediately after a restart.
-func newAPIKeyStore() *apiKeyStore {
-	a := &apiKeyStore{}
-	if k, ok := secrets.LoadOpenRouterKey(); ok {
-		a.v = k
-		a.persisted = true
-	}
-	return a
-}
+func newAPIKeyStore() *apiKeyStore { return &apiKeyStore{} }
 
 func (a *apiKeyStore) get() string {
 	a.mu.RLock()
@@ -160,21 +155,50 @@ func (a *apiKeyStore) get() string {
 	return a.v
 }
 
-// set stores the key in RAM and, when persist is true, on disk. When
-// persist is false any previously persisted copy is removed (session-only).
+// loadForWorkspace points the store at a workspace and loads that
+// workspace's persisted key into RAM (skipping the prompt after a restart).
+// Resets the in-RAM state first; never deletes from disk. When migrateLegacy
+// is true and the workspace has no key of its own, the pre-per-workspace
+// global key (if any) is adopted for it — a one-time upgrade path used when
+// opening an existing workspace, not when creating a fresh one.
+func (a *apiKeyStore) loadForWorkspace(path string, migrateLegacy bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.v = ""
+	a.path = path
+	a.persisted = false
+	if path == "" {
+		return
+	}
+	if k, ok := secrets.LoadOpenRouterKey(path); ok {
+		a.v = k
+		a.persisted = true
+		return
+	}
+	if migrateLegacy {
+		if k, ok := secrets.MigrateLegacyOpenRouterKey(path); ok {
+			a.v = k
+			a.persisted = true
+		}
+	}
+}
+
+// set stores the key in RAM and, when persist is true and a workspace is
+// active, on disk for that workspace. When persist is false any previously
+// persisted copy for the active workspace is removed (session-only).
 func (a *apiKeyStore) set(v string, persist bool) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.v = v
-	if persist {
-		if err := secrets.SaveOpenRouterKey(v); err != nil {
+	if persist && a.path != "" {
+		if err := secrets.SaveOpenRouterKey(a.path, v); err != nil {
 			return err
 		}
 		a.persisted = true
 		return nil
 	}
-	if a.persisted {
-		if err := secrets.DeleteOpenRouterKey(); err != nil {
+	if a.persisted && a.path != "" {
+		if err := secrets.DeleteOpenRouterKey(a.path); err != nil {
 			return err
 		}
 	}
@@ -182,13 +206,17 @@ func (a *apiKeyStore) set(v string, persist bool) error {
 	return nil
 }
 
-// clear forgets the key from RAM and deletes any persisted copy.
+// clear forgets the key from RAM and deletes any persisted copy for the
+// active workspace.
 func (a *apiKeyStore) clear() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.v = ""
 	a.persisted = false
-	return secrets.DeleteOpenRouterKey()
+	if a.path == "" {
+		return nil
+	}
+	return secrets.DeleteOpenRouterKey(a.path)
 }
 
 func (a *apiKeyStore) has() bool {

@@ -70,35 +70,75 @@ func TestSessionAPIKeyStatusAndClear(t *testing.T) {
 func TestAPIKeyPersistenceRoundTrip(t *testing.T) {
 	t.Setenv("WHATSKEPT_CONFIG_DIR", t.TempDir())
 
-	// Persist a key, then simulate a restart by building a fresh store
-	// over the same config dir — it should load the key.
+	const ws = "/work/space"
+
+	// Persist a key for a workspace, then simulate a restart by building a
+	// fresh store and re-loading that workspace — the key should reappear.
 	a := newAPIKeyStore()
+	a.loadForWorkspace(ws, false)
 	if err := a.set("sk-or-remembered", true); err != nil {
 		t.Fatalf("set persist: %v", err)
 	}
-	if restarted := newAPIKeyStore(); restarted.get() != "sk-or-remembered" || !restarted.isPersisted() {
+	restarted := newAPIKeyStore()
+	restarted.loadForWorkspace(ws, false)
+	if restarted.get() != "sk-or-remembered" || !restarted.isPersisted() {
 		t.Fatalf("after restart: get=%q persisted=%v; want remembered,true", restarted.get(), restarted.isPersisted())
 	}
 
-	// Forget wipes RAM + disk; a fresh store sees nothing.
+	// Forget wipes RAM + disk; a fresh store sees nothing for the workspace.
 	if err := a.clear(); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
-	if restarted := newAPIKeyStore(); restarted.has() {
+	fresh := newAPIKeyStore()
+	fresh.loadForWorkspace(ws, false)
+	if fresh.has() {
 		t.Fatal("expected no key after forget + restart")
 	}
 
 	// Session-only set must not survive a restart, and must remove any
 	// previously persisted copy.
 	a2 := newAPIKeyStore()
+	a2.loadForWorkspace(ws, false)
 	if err := a2.set("sk-or-persisted", true); err != nil {
 		t.Fatal(err)
 	}
 	if err := a2.set("sk-or-session", false); err != nil {
 		t.Fatal(err)
 	}
-	if restarted := newAPIKeyStore(); restarted.has() {
-		t.Fatalf("session-only key should not persist; got %q", restarted.get())
+	after := newAPIKeyStore()
+	after.loadForWorkspace(ws, false)
+	if after.has() {
+		t.Fatalf("session-only key should not persist; got %q", after.get())
+	}
+}
+
+// TestAPIKeyWorkspaceIsolation: each workspace keeps its own key, and
+// switching workspaces swaps the in-RAM key rather than leaking it — the
+// regression that prompted the per-workspace rework.
+func TestAPIKeyWorkspaceIsolation(t *testing.T) {
+	t.Setenv("WHATSKEPT_CONFIG_DIR", t.TempDir())
+
+	const wsA, wsB = "/work/a", "/work/b"
+
+	a := newAPIKeyStore()
+	a.loadForWorkspace(wsA, false)
+	if err := a.set("sk-a", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Switch to a fresh workspace: the old key must not carry over.
+	a.loadForWorkspace(wsB, false)
+	if a.has() {
+		t.Errorf("workspace B leaked workspace A's key: %q", a.get())
+	}
+	if err := a.set("sk-b", true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Switching back restores A's own key.
+	a.loadForWorkspace(wsA, false)
+	if a.get() != "sk-a" {
+		t.Errorf("workspace A key = %q; want sk-a", a.get())
 	}
 }
 

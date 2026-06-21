@@ -1,8 +1,8 @@
 package secrets
 
-// Cross-platform persistence for app-managed credentials that aren't tied
-// to a single workspace — currently just the OpenRouter API key for the
-// cloud image describer.
+// Cross-platform persistence for app-managed credentials: the OpenRouter
+// API key (per workspace, for the cloud image describer) and iOS backup
+// passwords (per device). Both are keyed maps, not single values.
 //
 // Stored as a 0600 JSON file under the OS per-user config dir:
 //   macOS:   ~/Library/Application Support/whatskept/credentials.json
@@ -29,21 +29,26 @@ const (
 )
 
 // credentials is the on-disk shape of credentials.json. Add fields here
-// as more app-level (non-workspace) secrets need to persist.
+// as more app-level secrets need to persist.
 //
-// BackupPasswords is keyed by device UDID: unlike the OpenRouter key (a
-// single global account credential), each iOS backup has its own
-// encryption password, so a user with two iPhones has two entries.
+// Both secret kinds are keyed maps: OpenRouterKeys by absolute workspace
+// path (each workspace has its own API key) and BackupPasswords by device
+// UDID (each iOS backup has its own encryption password).
+//
+// OpenRouterAPIKey is the pre-per-workspace global key from older versions,
+// kept only so it can be migrated into the first workspace opened after an
+// upgrade (see MigrateLegacyOpenRouterKey); it is dropped once migrated.
 type credentials struct {
-	OpenRouterAPIKey string            `json:"openrouter_api_key,omitempty"`
+	OpenRouterKeys   map[string]string `json:"openrouter_keys,omitempty"`
+	OpenRouterAPIKey string            `json:"openrouter_api_key,omitempty"` // legacy global key, migrated on first load
 	BackupPasswords  map[string]string `json:"backup_passwords,omitempty"`
 }
 
 // isEmpty reports whether the file would carry no secrets (so it can be
 // removed rather than left as an empty husk). A struct == comparison can't
-// be used now that a map field is present.
+// be used now that map fields are present.
 func (c credentials) isEmpty() bool {
-	return c.OpenRouterAPIKey == "" && len(c.BackupPasswords) == 0
+	return len(c.OpenRouterKeys) == 0 && c.OpenRouterAPIKey == "" && len(c.BackupPasswords) == 0
 }
 
 // appConfigDir resolves the per-user config directory, honouring the
@@ -111,38 +116,85 @@ func saveCredentials(c credentials) error {
 	return os.Rename(tmp, p)
 }
 
-// LoadOpenRouterKey returns the persisted OpenRouter key and whether one
-// is present. Best-effort: any read/parse error reports "not present".
-func LoadOpenRouterKey() (string, bool) {
-	c, err := loadCredentials()
-	if err != nil || c.OpenRouterAPIKey == "" {
+// LoadOpenRouterKey returns the persisted OpenRouter key for a workspace and
+// whether one is present. Best-effort: any read/parse error, or an empty
+// workspace, reports "not present".
+func LoadOpenRouterKey(workspace string) (string, bool) {
+	if workspace == "" {
 		return "", false
 	}
-	return c.OpenRouterAPIKey, true
+	c, err := loadCredentials()
+	if err != nil {
+		return "", false
+	}
+	k, ok := c.OpenRouterKeys[workspace]
+	if !ok || k == "" {
+		return "", false
+	}
+	return k, true
 }
 
-// SaveOpenRouterKey persists the key, preserving any other fields already
-// in the file.
-func SaveOpenRouterKey(key string) error {
+// SaveOpenRouterKey persists the key for a workspace, preserving any other
+// fields (incl. other workspaces' keys and all backup passwords).
+func SaveOpenRouterKey(workspace, key string) error {
+	if workspace == "" {
+		return errors.New("SaveOpenRouterKey: empty workspace")
+	}
 	c, err := loadCredentials()
 	if err != nil {
 		// Corrupt/unreadable file: overwrite rather than refuse to save.
 		c = credentials{}
 	}
-	c.OpenRouterAPIKey = key
+	if c.OpenRouterKeys == nil {
+		c.OpenRouterKeys = map[string]string{}
+	}
+	c.OpenRouterKeys[workspace] = key
 	return saveCredentials(c)
 }
 
-// DeleteOpenRouterKey removes the persisted key. If nothing else remains
-// in the file it is deleted entirely; otherwise it's rewritten without the
-// key. A missing file is a no-op.
-func DeleteOpenRouterKey() error {
+// DeleteOpenRouterKey removes the persisted key for one workspace. If
+// nothing else remains in the file it is deleted entirely. A missing file
+// or absent entry is a no-op.
+func DeleteOpenRouterKey(workspace string) error {
 	c, err := loadCredentials()
 	if err != nil {
 		return err
 	}
-	c.OpenRouterAPIKey = ""
+	if _, ok := c.OpenRouterKeys[workspace]; !ok {
+		return nil
+	}
+	delete(c.OpenRouterKeys, workspace)
+	if len(c.OpenRouterKeys) == 0 {
+		c.OpenRouterKeys = nil
+	}
 	return saveOrRemove(c)
+}
+
+// MigrateLegacyOpenRouterKey moves the pre-per-workspace global key (written
+// by older versions) into the given workspace's slot and removes the global
+// copy, returning the adopted key. It runs once, the first time an existing
+// workspace is opened after an upgrade, so the user's single configured key
+// isn't lost — it's handed to the workspace they open first. Reports
+// ("", false) when there is no legacy key (the normal case).
+func MigrateLegacyOpenRouterKey(workspace string) (string, bool) {
+	if workspace == "" {
+		return "", false
+	}
+	c, err := loadCredentials()
+	if err != nil || c.OpenRouterAPIKey == "" {
+		return "", false
+	}
+	if c.OpenRouterKeys == nil {
+		c.OpenRouterKeys = map[string]string{}
+	}
+	if _, ok := c.OpenRouterKeys[workspace]; !ok {
+		c.OpenRouterKeys[workspace] = c.OpenRouterAPIKey
+	}
+	c.OpenRouterAPIKey = ""
+	if err := saveCredentials(c); err != nil {
+		return "", false
+	}
+	return c.OpenRouterKeys[workspace], true
 }
 
 // saveOrRemove writes the credentials file, or deletes it entirely when no

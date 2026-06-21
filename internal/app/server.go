@@ -314,9 +314,12 @@ func (s *server) handleCreateWorkspace(w http.ResponseWriter, r *http.Request) {
 	// that immediately needs it (running a fresh backup).
 	s.ws.set(abs)
 	// Brand-new workspace: no bound device yet, so no persisted password —
-	// this just resets the in-RAM cache. The OpenRouter key is a global
-	// account credential, not workspace-specific, so it survives a switch.
+	// this just resets the in-RAM cache. The OpenRouter key is per workspace;
+	// a fresh one starts blank, so load (which finds nothing) without
+	// migrating the legacy global key — that's reserved for opening an
+	// existing workspace, so a new workspace never inherits an old key.
 	s.pw.loadForWorkspace("")
+	s.apiKey.loadForWorkspace(abs, false)
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -361,10 +364,12 @@ func (s *server) handleOpenWorkspace(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.ws.set(abs)
-	// Load any persisted backup password for this workspace's device so the
-	// prompt can be skipped after a restart. The OpenRouter key is a global
-	// account credential, not workspace-specific, so it survives a switch.
+	// Load any persisted backup password for this workspace's device, and the
+	// workspace's own OpenRouter key, so both prompts can be skipped after a
+	// restart. migrateLegacy=true adopts a pre-per-workspace global key (if
+	// one exists from an older version) for this workspace, one time.
 	s.pw.loadForWorkspace(bindingUDID(info))
+	s.apiKey.loadForWorkspace(abs, true)
 	addRecent(abs)
 	writeJSON(w, http.StatusOK, describeWorkspace(abs))
 }
@@ -422,10 +427,14 @@ func (s *server) handleDeleteWorkspace(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	removeRecent(cur)
-	s.ws.set("")
-	// Drop the cached password and any persisted copy for the deleted
-	// workspace's device (forget uses the active device, which is this one).
+	// Drop the cached password and the OpenRouter key (RAM + persisted copy)
+	// for the deleted workspace. The key lives in the central credentials
+	// file, not the workspace dir, so RemoveAll above doesn't touch it — clear
+	// it explicitly while the store still points at this workspace, before the
+	// active-workspace pointer is cleared.
 	_ = s.pw.forget()
+	_ = s.apiKey.clear()
+	s.ws.set("")
 	w.WriteHeader(http.StatusNoContent)
 }
 

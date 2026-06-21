@@ -1260,10 +1260,19 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
   // sync) so coverage reflects files just downloaded, not just on remount.
   useEffect(() => { reloadStatus(); }, [dbStatus]);
+  // Refresh the real (DB-backed) coverage whenever a run *ends* — success,
+  // error, or manual stop. We key on the running→stopped transition rather
+  // than j.done === true because an interrupted run still persisted the rows
+  // it managed to describe: an abort (e.g. insufficient credits / HTTP 402)
+  // never set j.done, so the old guard skipped the refetch and the card kept
+  // showing the stale pre-run snapshot (0 described) until the workspace was
+  // reopened.
+  const wasRunning = useRef(false);
   useEffect(() => {
-    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
+    if (wasRunning.current && !isRunning) { reloadStatus(); reloadDbStatus(); }
+    wasRunning.current = isRunning;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasDone, j.done]);
+  }, [isRunning]);
 
   if (!dbStatus) return null;
   const hasDB      = !!dbStatus.db_exists;
@@ -1300,9 +1309,9 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   // beginRun gates on the key first (stashing the opts for after save).
   const proceed = (opts) => onMediaDescribe({ model: "", concurrency: CONCURRENCY, ...opts });
   const beginRun = async (opts) => {
-    // The OpenRouter key is a single session-wide credential shared by the
-    // image, voice, and document cloud features. This card's status.has_key
-    // is fetched on mount, so it can be stale if the key was set from another
+    // The OpenRouter key is a per-workspace credential shared by the image,
+    // voice, and document cloud features. This card's status.has_key is
+    // fetched on mount, so it can be stale if the key was set from another
     // card or from Settings since. Re-check the live shared key before
     // prompting, so we never ask again once any feature has set it.
     let keyPresent = hasKey;
@@ -1749,19 +1758,28 @@ function BackupPasswordModal({ onClose, onSaved }) {
 // forget. Key entry reuses OpenRouterKeyModal. This is the single place
 // the key is managed; the feature cards no longer repeat it.
 function SettingsModal({ onClose, onPasswordChanged }) {
-  const [keyStatus, setKeyStatus] = useState(null); // { has, persisted }
-  const [pwStatus, setPwStatus]   = useState(null); // backup pw { has, persisted }
+  // undefined = still loading, { error:true } = fetch failed, otherwise { has, persisted }.
+  const [keyStatus, setKeyStatus] = useState(undefined);
+  const [pwStatus, setPwStatus]   = useState(undefined);
   const [showKey, setShowKey]     = useState(false);
   const [showPw, setShowPw]       = useState(false);
 
+  // On failure record an error sentinel rather than swallowing it: a failed
+  // (or not-yet-resolved) status fetch must NOT render as "not set", which is
+  // exactly the bug where the dialog claimed the key was unset while it was
+  // actually present and the run paths used it fine.
   const reload = () =>
-    api.get("/api/session/openrouter-key").then(setKeyStatus).catch(() => {});
+    api.get("/api/session/openrouter-key").then(setKeyStatus).catch(() => setKeyStatus({ error: true }));
   const reloadPw = () =>
-    api.get("/api/session/password").then(setPwStatus).catch(() => {});
+    api.get("/api/session/password").then(setPwStatus).catch(() => setPwStatus({ error: true }));
   useEffect(() => { reload(); reloadPw(); }, []);
 
+  const keyLoading  = keyStatus === undefined;
+  const keyErr      = !!(keyStatus && keyStatus.error);
   const hasKey      = !!(keyStatus && keyStatus.has);
   const persisted   = !!(keyStatus && keyStatus.persisted);
+  const pwLoading   = pwStatus === undefined;
+  const pwErr       = !!(pwStatus && pwStatus.error);
   const hasPw       = !!(pwStatus && pwStatus.has);
   const pwPersisted = !!(pwStatus && pwStatus.persisted);
 
@@ -1794,16 +1812,20 @@ function SettingsModal({ onClose, onPasswordChanged }) {
             <div className="min-w-0">
               <p className="font-medium text-gray-700 text-sm">OpenRouter API key</p>
               <p className="text-xs text-gray-500 mt-1 leading-relaxed">
-                Used for cloud image descriptions and voice transcription.{" "}
+                Used for cloud image descriptions and voice transcription. Stored per workspace.{" "}
                 <a href="#" onClick={e => { e.preventDefault(); api.post("/api/open-url", { url: "https://openrouter.ai/keys" }).catch(() => {}); }}
                   className="font-medium text-gray-700 underline">Get a key</a>.
               </p>
               <p className="text-[11px] text-gray-400 mt-2">
-                {hasKey
-                  ? (persisted
-                      ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
-                      : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
-                  : <>Status: <span className="font-medium text-gray-600">not set</span></>}
+                {keyLoading
+                  ? <>Status: <span className="font-medium text-gray-600">checking…</span></>
+                  : keyErr
+                    ? <>Status: <span className="font-medium text-amber-600">couldn't check — is the app still running?</span></>
+                    : hasKey
+                      ? (persisted
+                          ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
+                          : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
+                      : <>Status: <span className="font-medium text-gray-600">not set</span></>}
               </p>
             </div>
             <div className="shrink-0 flex flex-col items-end gap-2">
@@ -1830,11 +1852,15 @@ function SettingsModal({ onClose, onPasswordChanged }) {
                 Decrypts this device's iOS backup. Set it here (it's verified against your backup), or when you run a sync — tick “Remember on this computer” to keep it across restarts.
               </p>
               <p className="text-[11px] text-gray-400 mt-2">
-                {hasPw
-                  ? (pwPersisted
-                      ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
-                      : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
-                  : <>Status: <span className="font-medium text-gray-600">not set</span></>}
+                {pwLoading
+                  ? <>Status: <span className="font-medium text-gray-600">checking…</span></>
+                  : pwErr
+                    ? <>Status: <span className="font-medium text-amber-600">couldn't check — is the app still running?</span></>
+                    : hasPw
+                      ? (pwPersisted
+                          ? <>Status: <span className="font-medium text-gray-600">remembered on this computer</span></>
+                          : <>Status: <span className="font-medium text-gray-600">set for this session</span></>)
+                      : <>Status: <span className="font-medium text-gray-600">not set</span></>}
               </p>
             </div>
             <div className="shrink-0 flex flex-col items-end gap-2">
@@ -1908,10 +1934,16 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
   // sync) so coverage reflects files just downloaded, not just on remount.
   useEffect(() => { reloadStatus(); }, [dbStatus]);
+  // Refresh real coverage whenever a run ends (success, error, or stop), keyed
+  // on the running→stopped transition: an aborted run still persisted the rows
+  // it managed, but a j.done===true guard skipped the refetch on the error
+  // path, leaving the card on its stale pre-run snapshot until reopened.
+  const wasRunning = useRef(false);
   useEffect(() => {
-    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
+    if (wasRunning.current && !isRunning) { reloadStatus(); reloadDbStatus(); }
+    wasRunning.current = isRunning;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasDone, j.done]);
+  }, [isRunning]);
   useEffect(() => { if (!isRunning) setStopping(false); }, [isRunning]);
 
   if (!dbStatus) return null;
@@ -1941,9 +1973,9 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   // beginRun gates on the key first (stashing opts for after save).
   const proceed = (opts) => onVoiceIndex({ model: "", concurrency: CONCURRENCY, ...opts });
   const beginRun = async (opts) => {
-    // The OpenRouter key is a single session-wide credential shared by the
-    // image, voice, and document cloud features. This card's status.has_key
-    // is fetched on mount, so it can be stale if the key was set from another
+    // The OpenRouter key is a per-workspace credential shared by the image,
+    // voice, and document cloud features. This card's status.has_key is
+    // fetched on mount, so it can be stale if the key was set from another
     // card or from Settings since. Re-check the live shared key before
     // prompting, so we never ask again once any feature has set it.
     let keyPresent = hasKey;
@@ -2176,10 +2208,16 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   // Refetch when dbStatus reloads (mount + ~1s after any db task such as a
   // sync) so coverage reflects files just downloaded, not just on remount.
   useEffect(() => { reloadStatus(); }, [dbStatus]);
+  // Refresh real coverage whenever a run ends (success, error, or stop), keyed
+  // on the running→stopped transition: an aborted run still persisted the rows
+  // it managed, but a j.done===true guard skipped the refetch on the error
+  // path, leaving the card on its stale pre-run snapshot until reopened.
+  const wasRunning = useRef(false);
   useEffect(() => {
-    if (hasDone && j.done === true) { reloadStatus(); reloadDbStatus(); }
+    if (wasRunning.current && !isRunning) { reloadStatus(); reloadDbStatus(); }
+    wasRunning.current = isRunning;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasDone, j.done]);
+  }, [isRunning]);
   useEffect(() => { if (!isRunning) setStopping(false); }, [isRunning]);
 
   if (!dbStatus) return null;
@@ -2207,9 +2245,9 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
 
   const proceed = (opts) => onDocumentIndex({ model: "", concurrency: CONCURRENCY, ...opts });
   const beginRun = async (opts) => {
-    // The OpenRouter key is a single session-wide credential shared by the
-    // image, voice, and document cloud features. This card's status.has_key
-    // is fetched on mount, so it can be stale if the key was set from another
+    // The OpenRouter key is a per-workspace credential shared by the image,
+    // voice, and document cloud features. This card's status.has_key is
+    // fetched on mount, so it can be stale if the key was set from another
     // card or from Settings since. Re-check the live shared key before
     // prompting, so we never ask again once any feature has set it.
     let keyPresent = hasKey;
