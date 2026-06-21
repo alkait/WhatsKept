@@ -489,50 +489,44 @@ function PasswordPromptModal({ device, onConfirm, onCancel, confirmLabel = "Star
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// MediaIssuesModal — explainer + per-row list for failed/skipped images
+// MediaIssuesModal — explainer + per-row list for cloud-run failures
 // ═══════════════════════════════════════════════════════════════════════════
 // Fetches GET /api/database/media-index/issues on mount, then groups
-// the error rows by error-message so "11 images failed with 'decrypt:
-// EOF'" doesn't render as 11 individual lines the user has to scan.
-// Missing rows aren't grouped — they all share the same (non-)reason
-// and the row count + sample paths are the useful signal there.
+// the failure rows by error-message so "11 images failed with 'model
+// rejected'" doesn't render as 11 individual lines the user has to scan.
+// Scope is cloud-run failures only (describe/transcribe/extract errors) —
+// backup-availability problems ("not in backup", "couldn't extract from
+// backup") are reported on the sync card, not here.
 // Per-modality copy for MediaIssuesModal — one shared modal serves image,
 // voice, and document indexing, so the title/table/nouns/explainers come from
 // here instead of being hardcoded to images.
 const ISSUE_KINDS = {
   image: {
-    title: "Image indexing issues",
+    title: "Image describe failures",
     source: "media_index",
     one: "image", many: "images",
-    errorsEmpty: "No errors recorded. Every image that the indexer could read was successfully described.",
-    errorsHelp: <>An <strong>error</strong> means the file was present but couldn't be processed — either the download failed (corrupted/truncated JPEG, decrypt error) or the cloud describer rejected the image or hit a transient API failure. Describe errors are auto-retried on the next run.</>,
-    missingEmpty: "No missing files. Every image referenced by a message exists in the backup.",
-    missingHelp: <><strong>Missing</strong> means the chat references an image but the file is not present in the iOS backup. This is almost always because the image was never downloaded on the phone (you saw a thumbnail in chat but never tapped to fetch the full image), or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to OCR.</>,
+    errorsEmpty: "No failures recorded. Every image on disk was successfully described.",
+    errorsHelp: <>A <strong>failure</strong> means the cloud describer couldn't process the image — it rejected the image or hit a transient API error. These are auto-retried on the next run.</>,
   },
   voice: {
-    title: "Voice transcription issues",
+    title: "Voice transcription failures",
     source: "voice_index",
     one: "voice note", many: "voice notes",
-    errorsEmpty: "No errors recorded. Every voice note that the indexer could read was successfully transcribed.",
-    errorsHelp: <>An <strong>error</strong> means the clip was present but couldn't be processed — either the download failed (corrupted/truncated audio, decrypt error) or the cloud transcriber rejected it or hit a transient API failure. Errors are auto-retried on the next run.</>,
-    missingEmpty: "No missing files. Every voice note referenced by a message exists in the backup.",
-    missingHelp: <><strong>Missing</strong> means the chat references a voice note but the file is not present in the iOS backup — usually because it was never downloaded/played on the phone, or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to transcribe.</>,
+    errorsEmpty: "No failures recorded. Every voice note on disk was successfully transcribed.",
+    errorsHelp: <>A <strong>failure</strong> means the cloud transcriber couldn't process the clip — it rejected the audio or hit a transient API error. These are auto-retried on the next run.</>,
   },
   document: {
-    title: "Document extraction issues",
+    title: "Document extraction failures",
     source: "document_index",
     one: "document", many: "documents",
-    errorsEmpty: "No errors recorded. Every PDF that the indexer could read had its text extracted.",
-    errorsHelp: <>An <strong>error</strong> means the file was present but couldn't be processed — either the download failed (corrupted/truncated file, decrypt error) or the PDF couldn't be parsed. Errors are auto-retried on the next run.</>,
-    missingEmpty: "No missing files. Every document referenced by a message exists in the backup.",
-    missingHelp: <><strong>Missing</strong> means the chat references a document but the file is not present in the iOS backup — usually because it was never downloaded on the phone, or WhatsApp's local media cache evicted it before the backup ran. Not an error — there's simply no file to extract.</>,
+    errorsEmpty: "No failures recorded. Every PDF on disk had its text extracted.",
+    errorsHelp: <>A <strong>failure</strong> means the cloud parser couldn't extract the PDF — it was rejected or hit a transient API error. These are auto-retried on the next run.</>,
   },
 };
 
 function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issues", kind = ISSUE_KINDS.image }) {
   const [data, setData] = useState(null);   // null = loading, {} = loaded
   const [error, setError] = useState("");
-  const [tab, setTab] = useState("errors"); // "errors" | "missing"
 
   useEffect(() => {
     api.get(endpoint + "?limit=500")
@@ -557,7 +551,6 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
   }, [data]);
 
   const errorsTotal  = data?.errors_total  ?? 0;
-  const missingTotal = data?.missing_total ?? 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4"
@@ -576,29 +569,11 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
           <button onClick={onClose} className="text-gray-400 hover:text-gray-700 text-xl leading-none px-2">×</button>
         </header>
 
-        {/* Tab strip — only show the row if either kind exists. */}
-        {(errorsTotal > 0 || missingTotal > 0) && (
-          <div className="px-6 pt-3 flex gap-2">
-            <button onClick={() => setTab("errors")}
-              className={"text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors " +
-                         (tab === "errors" ? "text-white" : "text-gray-600 hover:bg-gray-100")}
-              style={tab === "errors" ? {background:'#075E54'} : {}}>
-              Errors ({errorsTotal.toLocaleString()})
-            </button>
-            <button onClick={() => setTab("missing")}
-              className={"text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors " +
-                         (tab === "missing" ? "text-white" : "text-gray-600 hover:bg-gray-100")}
-              style={tab === "missing" ? {background:'#075E54'} : {}}>
-              Missing ({missingTotal.toLocaleString()})
-            </button>
-          </div>
-        )}
-
         <div className="flex-1 overflow-y-auto px-6 py-4">
           {error && <p className="text-sm text-red-500">{error}</p>}
           {!error && !data && <p className="text-sm text-gray-500">Loading…</p>}
 
-          {data && tab === "errors" && (
+          {data && (
             errorsTotal === 0 ? (
               <p className="text-sm text-gray-500">{kind.errorsEmpty}</p>
             ) : (
@@ -612,26 +587,6 @@ function MediaIssuesModal({ onClose, endpoint = "/api/database/media-index/issue
                     <ErrorGroup key={g.msg} msg={g.msg} rows={g.rows} one={kind.one} many={kind.many} />
                   ))}
                 </div>
-              </>
-            )
-          )}
-
-          {data && tab === "missing" && (
-            missingTotal === 0 ? (
-              <p className="text-sm text-gray-500">{kind.missingEmpty}</p>
-            ) : (
-              <>
-                <p className="text-[11px] text-gray-500 mb-3">
-                  {kind.missingHelp}{" "}
-                  Showing {data.missing.length.toLocaleString()} of {missingTotal.toLocaleString()}.
-                </p>
-                <ul className="space-y-1">
-                  {data.missing.map(row => (
-                    <li key={row.rowid} className="text-[11px] font-mono text-gray-600 truncate" title={row.manifest_path}>
-                      <span className="text-gray-400">#{row.rowid}</span> · {row.manifest_path}
-                    </li>
-                  ))}
-                </ul>
               </>
             )
           )}
@@ -1058,6 +1013,22 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
   const lastSynced  = dbStatus.last_synced_at;
   const latestBkp   = dbStatus.latest_backup_at;
 
+  // Files referenced in chats that this backup can't provide — not present in
+  // it ('missing') or failed to decrypt/extract out of it ('error'), summed
+  // across modalities. This is a backup/sync fact, so it's surfaced here
+  // rather than as "issues" on the cloud enrichment cards (which only own
+  // their own run failures). The fix is a fuller/newer backup + re-sync.
+  const naByKind = [
+    ["image",      (dbStatus.image_missing || 0)    + (dbStatus.image_errors || 0)],
+    ["voice note", (dbStatus.voice_missing || 0)    + (dbStatus.voice_errors || 0)],
+    ["document",   (dbStatus.document_missing || 0) + (dbStatus.document_errors || 0)],
+  ];
+  const notInBackup = naByKind.reduce((sum, [, n]) => sum + n, 0);
+  const notInBackupBreakdown = naByKind
+    .filter(([, n]) => n > 0)
+    .map(([label, n]) => `${n.toLocaleString()} ${label}${n === 1 ? "" : "s"}`)
+    .join(" · ");
+
   let title, subtitle, buttonLabel, buttonPrimary, statusDot;
   if (!hasBackups) {
     title         = "No iOS backups found";
@@ -1119,6 +1090,12 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
               )}
             </div>
             <p className="text-xs text-gray-500 mt-1">{subtitle}</p>
+            {dbExists && notInBackup > 0 && (
+              <p className="text-[11px] text-gray-400 mt-1.5" title="These can't be enriched — there's no file to process. A fuller or newer iPhone backup, then a re-sync, may recover them.">
+                {notInBackup.toLocaleString()} file{notInBackup === 1 ? "" : "s"} referenced in chats {notInBackup === 1 ? "isn't" : "aren't"} available from this backup
+                {notInBackupBreakdown && <span> · {notInBackupBreakdown}</span>}
+              </p>
+            )}
           </div>
           <button onClick={launch} disabled={buttonDisabled}
             className="shrink-0 flex items-center gap-2 rounded-lg text-white disabled:opacity-40 disabled:cursor-not-allowed px-4 py-2 text-sm font-semibold transition-colors"
@@ -1282,7 +1259,6 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const hasKey     = !!(status && status.has_key);
   const model      = (status && status.default_model) || "";
 
-  const missing = (status && status.missing) || 0;
   const errorCount = (status && status.errors) || 0;
   // pending = images a normal run would actually describe; describeFailed
   // = on-disk images that failed a prior attempt (only "Retry failures"
@@ -1293,7 +1269,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const describable = (status && status.downloaded) || 0;
   const pending = (status && status.pending) || 0;
   const describeFailed = (status && status.describe_failed) || 0;
-  const issueCount = errorCount + missing; // failed describes + not-in-backup
+  const issueCount = errorCount; // cloud describe failures only (not-in-backup lives on the sync card)
   const coveragePct = describable > 0 ? Math.min(100, Math.round((cloudCount / describable) * 100)) : 0;
   // "Done" = nothing fresh left to describe. Failures don't block done;
   // they get an explicit, separate "Retry failures" action.
@@ -1580,10 +1556,6 @@ function CloudTermsModal({ onClose }) {
           <div>
             <dt className="font-semibold text-gray-900">failed</dt>
             <dd className="text-gray-600 text-xs mt-0.5">Images that errored on a previous attempt. A normal run skips them; use “Retry failures” to re-attempt. Some are permanent (corrupt, or rejected by the model) and will keep failing.</dd>
-          </div>
-          <div>
-            <dt className="font-semibold text-gray-900">not in backup</dt>
-            <dd className="text-gray-600 text-xs mt-0.5">Images referenced in chats whose file was never downloaded to this phone, so there's nothing to describe. They can't be processed and are excluded from "done".</dd>
           </div>
         </dl>
         <button onClick={onClose}
@@ -1952,7 +1924,6 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const transcribed = (status && status.transcribed) || 0;
   const hasKey      = !!(status && status.has_key);
   const model       = (status && status.default_model) || "";
-  const missing     = (status && status.missing) || 0;
   const errorCount  = (status && status.errors) || 0;
   // pending = clips a normal run would actually transcribe; transcribeFailed
   // = on-disk clips that failed a prior attempt (only "Retry failures"
@@ -1963,7 +1934,7 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const describable = (status && status.downloaded) || 0; // .opus on disk
   const pending     = (status && status.pending) || 0;
   const transcribeFailed = (status && status.transcribe_failed) || 0;
-  const issueCount  = errorCount + missing; // failed transcribes + not-in-backup
+  const issueCount  = errorCount; // cloud transcribe failures only (not-in-backup lives on the sync card)
   const coveragePct = describable > 0 ? Math.min(100, Math.round((transcribed / describable) * 100)) : 0;
   const allDone     = pending === 0 && describable > 0;
   const actionCount = pending > 0 ? pending : (transcribeFailed > 0 ? transcribeFailed : describable);
@@ -2227,7 +2198,6 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   const empty       = (status && status.empty) || 0;
   const hasKey      = !!(status && status.has_key);
   const model       = (status && status.default_model) || "";
-  const missing     = (status && status.missing) || 0;
   const errorCount  = (status && status.errors) || 0;
   const unsupported = (status && status.unsupported) || 0;
   // pending = PDFs a normal run would extract; extractFailed = on-disk PDFs
@@ -2237,7 +2207,7 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   const pending     = (status && status.pending) || 0;
   const extractFailed = (status && status.extract_failed) || 0;
   const done        = extracted + empty;                    // processed cleanly
-  const issueCount  = errorCount + missing;
+  const issueCount  = errorCount; // cloud extract failures only (not-in-backup lives on the sync card)
   const coveragePct = describable > 0 ? Math.min(100, Math.round((done / describable) * 100)) : 0;
   const allDone     = pending === 0 && describable > 0;
   const actionCount = pending > 0 ? pending : (extractFailed > 0 ? extractFailed : describable);

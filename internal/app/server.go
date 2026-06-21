@@ -1179,9 +1179,10 @@ func (s *server) handleMediaDescribeStatus(w http.ResponseWriter, _ *http.Reques
 	// downloaded on device) can't be described — exclude them from
 	// "done" math so coverage can actually reach 100%.
 	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&resp.Missing)
-	// Failures the issues view surfaces: download errors + per-image
-	// describe failures (describe_error set, status still 'downloaded').
-	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error' OR describe_error IS NOT NULL`).Scan(&resp.Errors)
+	// Cloud-run failures only (describe_error set). Backup-availability
+	// problems (status 'missing'/'error') are reported on the sync card, not
+	// here — they aren't something the describe step caused or can fix.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE describe_error IS NOT NULL`).Scan(&resp.Errors)
 	// pending / describe_failed are computed by the same predicates as the
 	// resume queue (selectDescribeCandidates), so the card never implies
 	// work the queue would skip. pending drives "Resume"; describe_failed
@@ -1248,27 +1249,25 @@ func (s *server) handleMediaDescribe(w http.ResponseWriter, r *http.Request) {
 }
 
 // mediaIndexIssue is one row of the issues list shown in the
-// "View issues" modal under the Image OCR card. We keep this
+// "View issues" modal under the cloud enrichment cards. We keep this
 // flat (no nested objects) so the UI can render it with one map().
 type mediaIndexIssue struct {
 	Rowid        int64  `json:"rowid"`
 	ManifestPath string `json:"manifest_path"`
-	Error        string `json:"error,omitempty"` // empty for missing rows — there's no error, just no file
+	Error        string `json:"error,omitempty"`
 	AttemptedAt  string `json:"attempted_at,omitempty"`
-	Bytes        int64  `json:"bytes,omitempty"` // 0 for missing — file never decrypted
+	Bytes        int64  `json:"bytes,omitempty"`
 }
 
-// mediaIndexIssuesResponse buckets the rows by status so the modal
-// can render two clearly-separated tabs. Counts are reported
-// independently of the returned slice length so the UI can show
-// "displaying 50 of 1,247 missing" honestly even when we cap the
-// payload size.
+// mediaIndexIssuesResponse lists cloud-run failures (describe/transcribe/
+// extract errors). ErrorsTotal is reported independently of the returned
+// slice length so the UI can show "displaying 50 of 1,247" honestly even
+// when we cap the payload size. Backup-availability problems ('missing'/
+// 'error' rows) are reported on the sync card, not in this modal.
 type mediaIndexIssuesResponse struct {
-	Errors       []mediaIndexIssue `json:"errors"`
-	Missing      []mediaIndexIssue `json:"missing"`
-	ErrorsTotal  int               `json:"errors_total"`
-	MissingTotal int               `json:"missing_total"`
-	Limit        int               `json:"limit"`
+	Errors      []mediaIndexIssue `json:"errors"`
+	ErrorsTotal int               `json:"errors_total"`
+	Limit       int               `json:"limit"`
 }
 
 // handleMediaIndexIssues lists the failure rows in media_index so
@@ -1313,81 +1312,44 @@ func (s *server) handleMediaIndexIssues(w http.ResponseWriter, r *http.Request) 
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='media_index'`,
 	).Scan(&n); err != nil || n == 0 {
 		writeJSON(w, http.StatusOK, mediaIndexIssuesResponse{
-			Errors:  []mediaIndexIssue{}, // never null — UI does .map() on these
-			Missing: []mediaIndexIssue{},
-			Limit:   limit,
+			Errors: []mediaIndexIssue{}, // never null — UI does .map() on these
+			Limit:  limit,
 		})
 		return
 	}
 
 	out := mediaIndexIssuesResponse{
-		Errors:  []mediaIndexIssue{},
-		Missing: []mediaIndexIssue{},
-		Limit:   limit,
+		Errors: []mediaIndexIssue{},
+		Limit:  limit,
 	}
 
-	// Unbounded totals first — these power the "Showing X of Y" copy.
-	// "Errors" spans both download failures (status='error') and
-	// per-image describe failures (describe_error set, status still
-	// 'downloaded') — the cloud describer records the latter.
-	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'error' OR describe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+	// This modal lists cloud-run failures only (describe_error set). The
+	// sync card owns backup-availability problems (status 'missing'/'error'),
+	// so they're deliberately not surfaced here.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM media_index WHERE describe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
 
 	// Bounded sample, newest first so the user sees the most recent
 	// run's failures (which is almost always what they're debugging).
 	if out.ErrorsTotal > 0 {
 		out.Errors = queryMediaErrors(db, limit)
 	}
-	if out.MissingTotal > 0 {
-		out.Missing = queryMediaIssues(db, "missing", limit)
-	}
 
 	writeJSON(w, http.StatusOK, out)
 }
 
-// queryMediaErrors pulls up to `limit` failed rows from media_index,
-// newest first — both download errors (status='error') and per-image
-// describe failures (describe_error set), with the message taken from
-// whichever column carries it. Best-effort, like queryMediaIssues.
+// queryMediaErrors pulls up to `limit` cloud-describe failures from
+// media_index (describe_error set), newest first. Best-effort: a query
+// failure returns an empty slice rather than propagating to the handler.
 func queryMediaErrors(db *sql.DB, limit int) []mediaIndexIssue {
 	rows, err := db.Query(
 		`SELECT rowid, manifest_path,
-		        COALESCE(NULLIF(error, ''), describe_error, ''),
+		        COALESCE(describe_error, ''),
 		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
 		 FROM media_index
-		 WHERE status = 'error' OR describe_error IS NOT NULL
+		 WHERE describe_error IS NOT NULL
 		 ORDER BY attempted_at DESC
 		 LIMIT ?`,
 		limit,
-	)
-	if err != nil {
-		return []mediaIndexIssue{}
-	}
-	defer rows.Close()
-
-	out := []mediaIndexIssue{}
-	for rows.Next() {
-		var x mediaIndexIssue
-		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
-			out = append(out, x)
-		}
-	}
-	return out
-}
-
-// queryMediaIssues pulls up to `limit` rows of one status from
-// media_index, newest first. Best-effort: a query failure returns
-// an empty slice rather than propagating to the HTTP handler — the
-// caller has already reported the total count and an empty list is
-// a survivable (if disappointing) outcome.
-func queryMediaIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
-	rows, err := db.Query(
-		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
-		 FROM media_index
-		 WHERE status = ?
-		 ORDER BY attempted_at DESC
-		 LIMIT ?`,
-		status, limit,
 	)
 	if err != nil {
 		return []mediaIndexIssue{}
@@ -1682,7 +1644,9 @@ func (s *server) handleVoiceStatus(w http.ResponseWriter, _ *http.Request) {
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status IN ('downloaded','transcribed')`).Scan(&resp.Downloaded)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'transcribed'`).Scan(&resp.Transcribed)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`).Scan(&resp.Missing)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'error' OR transcribe_error IS NOT NULL`).Scan(&resp.Errors)
+	// Cloud-run failures only (transcribe_error set); backup-availability
+	// problems are reported on the sync card.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE transcribe_error IS NOT NULL`).Scan(&resp.Errors)
 	// pending / transcribe_failed use the same predicates as the resume
 	// queue (selectVoiceTranscribeCandidates) so the card never implies
 	// work the queue skips. pending drives "Resume"; transcribe_failed
@@ -1719,19 +1683,17 @@ func (s *server) handleVoiceIndexIssues(w http.ResponseWriter, r *http.Request) 
 	}
 	defer db.Close()
 
-	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Missing: []mediaIndexIssue{}, Limit: limit}
+	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Limit: limit}
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='voice_index'`).Scan(&n); err != nil || n == 0 {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'error' OR transcribe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+	// Cloud-run failures only (transcribe_error set); the sync card owns
+	// backup-availability problems.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM voice_index WHERE transcribe_error IS NOT NULL`).Scan(&out.ErrorsTotal)
 	if out.ErrorsTotal > 0 {
 		out.Errors = queryVoiceErrors(db, limit)
-	}
-	if out.MissingTotal > 0 {
-		out.Missing = queryVoiceIssues(db, "missing", limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1739,29 +1701,11 @@ func (s *server) handleVoiceIndexIssues(w http.ResponseWriter, r *http.Request) 
 func queryVoiceErrors(db *sql.DB, limit int) []mediaIndexIssue {
 	rows, err := db.Query(
 		`SELECT rowid, manifest_path,
-		        COALESCE(NULLIF(error, ''), transcribe_error, ''),
+		        COALESCE(transcribe_error, ''),
 		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
 		 FROM voice_index
-		 WHERE status = 'error' OR transcribe_error IS NOT NULL
+		 WHERE transcribe_error IS NOT NULL
 		 ORDER BY attempted_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return []mediaIndexIssue{}
-	}
-	defer rows.Close()
-	out := []mediaIndexIssue{}
-	for rows.Next() {
-		var x mediaIndexIssue
-		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
-			out = append(out, x)
-		}
-	}
-	return out
-}
-
-func queryVoiceIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
-	rows, err := db.Query(
-		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
-		 FROM voice_index WHERE status = ? ORDER BY attempted_at DESC LIMIT ?`, status, limit)
 	if err != nil {
 		return []mediaIndexIssue{}
 	}
@@ -1923,15 +1867,17 @@ func (s *server) handleDocumentStatus(w http.ResponseWriter, _ *http.Request) {
 	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'extracted_empty'`).Scan(&resp.Empty)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'missing'`).Scan(&resp.Missing)
 	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'unsupported'`).Scan(&resp.Unsupported)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'error' OR extract_error IS NOT NULL`).Scan(&resp.Errors)
+	// Cloud-run failures only (extract_error set); backup-availability
+	// problems are reported on the sync card.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE extract_error IS NOT NULL`).Scan(&resp.Errors)
 	resp.Pending, _ = postprocess.CountDocumentExtractPending(db)
 	resp.ExtractFailed, _ = postprocess.CountDocumentExtractFailed(db)
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleDocumentIndexIssues lists failed/missing documents (mirrors the voice
-// issues endpoint). Errors span download failures (status='error') and
-// per-doc extract failures (extract_error set).
+// handleDocumentIndexIssues lists cloud extract failures (extract_error set),
+// mirroring the voice issues endpoint. Backup-availability problems
+// (status 'missing'/'error') are reported on the sync card, not here.
 func (s *server) handleDocumentIndexIssues(w http.ResponseWriter, r *http.Request) {
 	cur := s.ws.get()
 	if cur == "" {
@@ -1956,19 +1902,17 @@ func (s *server) handleDocumentIndexIssues(w http.ResponseWriter, r *http.Reques
 	}
 	defer db.Close()
 
-	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Missing: []mediaIndexIssue{}, Limit: limit}
+	out := mediaIndexIssuesResponse{Errors: []mediaIndexIssue{}, Limit: limit}
 	var n int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='document_index'`).Scan(&n); err != nil || n == 0 {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'error' OR extract_error IS NOT NULL`).Scan(&out.ErrorsTotal)
-	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE status = 'missing'`).Scan(&out.MissingTotal)
+	// Cloud-run failures only (extract_error set); the sync card owns
+	// backup-availability problems.
+	_ = db.QueryRow(`SELECT COUNT(*) FROM document_index WHERE extract_error IS NOT NULL`).Scan(&out.ErrorsTotal)
 	if out.ErrorsTotal > 0 {
 		out.Errors = queryDocumentErrors(db, limit)
-	}
-	if out.MissingTotal > 0 {
-		out.Missing = queryDocumentIssues(db, "missing", limit)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -1976,29 +1920,11 @@ func (s *server) handleDocumentIndexIssues(w http.ResponseWriter, r *http.Reques
 func queryDocumentErrors(db *sql.DB, limit int) []mediaIndexIssue {
 	rows, err := db.Query(
 		`SELECT rowid, manifest_path,
-		        COALESCE(NULLIF(error, ''), extract_error, ''),
+		        COALESCE(extract_error, ''),
 		        COALESCE(attempted_at, ''), COALESCE(bytes, 0)
 		 FROM document_index
-		 WHERE status = 'error' OR extract_error IS NOT NULL
+		 WHERE extract_error IS NOT NULL
 		 ORDER BY attempted_at DESC LIMIT ?`, limit)
-	if err != nil {
-		return []mediaIndexIssue{}
-	}
-	defer rows.Close()
-	out := []mediaIndexIssue{}
-	for rows.Next() {
-		var x mediaIndexIssue
-		if err := rows.Scan(&x.Rowid, &x.ManifestPath, &x.Error, &x.AttemptedAt, &x.Bytes); err == nil {
-			out = append(out, x)
-		}
-	}
-	return out
-}
-
-func queryDocumentIssues(db *sql.DB, status string, limit int) []mediaIndexIssue {
-	rows, err := db.Query(
-		`SELECT rowid, manifest_path, COALESCE(error, ''), COALESCE(attempted_at, ''), COALESCE(bytes, 0)
-		 FROM document_index WHERE status = ? ORDER BY attempted_at DESC LIMIT ?`, status, limit)
 	if err != nil {
 		return []mediaIndexIssue{}
 	}
