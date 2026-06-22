@@ -1885,7 +1885,10 @@ function fmtEta(secs) {
 // voice notes downloaded during the messages sync. Password-free (reads
 // voice/ off disk); needs the session OpenRouter key. Shows coverage, a
 // cost estimate, a live cost meter, an issues link, and key management.
-const VOICE_COST_PER_CLIP = 0.003; // measured ~$ / clip (POC), for estimates
+const VOICE_COST_PER_CLIP = 0.0007; // ~$ / clip, for estimates. Calibrated
+// against a real run: $3.30 actual over 4,998 clips (~$0.00066/clip,
+// gemini-2.5-flash) → rounded up slightly so the estimate errs high. Cost
+// scales with clip length, so this is the average for a typical clip mix.
 
 function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
   const [status, setStatus]       = useState(null);
@@ -2159,7 +2162,9 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
 // disk); needs the session OpenRouter key. Cross-platform — replaces the old
 // macOS-only Apple PDFKit + Vision path. Shows coverage, a cost estimate, a
 // live cost meter, and an issues link.
-const DOC_COST_PER_DOC = 0.003; // measured ~$ / doc (POC), for estimates
+const DOC_COST_PER_DOC = 0.003; // ~$ / doc, for estimates. Validated against a
+// real run: $4.54 actual over 1,554 PDFs (~$0.00292/doc, gemini-2.5-flash-lite)
+// — already accurate and errs slightly high, so left as-is.
 
 function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
   const [status, setStatus]       = useState(null);
