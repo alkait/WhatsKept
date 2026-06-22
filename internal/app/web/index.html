@@ -1210,7 +1210,9 @@ function DatabaseTab({ dbStatus, reloadDbStatus, job, cloudJob, voiceJob, docume
 // reads the already-downloaded images off disk, so no backup password.
 // Shows cloud coverage, a cost estimate, and a live cost meter while
 // running, plus key management (change / forget).
-const CLOUD_COST_PER_IMAGE = 0.0002; // measured ~$ / image, for estimates
+const CLOUD_COST_PER_IMAGE = 0.00026; // ~$ / image, for estimates. Calibrated
+// against a real run: $8.06 actual spend over 31,652 images (~$0.000255/image,
+// qwen3-vl-8b, ~1.2 MP avg) → rounded up slightly so the estimate errs high.
 
 function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
   const [status, setStatus]       = useState(null);
@@ -1413,7 +1415,7 @@ function CloudDescribeCard({ dbStatus, job, onMediaDescribe, reloadDbStatus }) {
                 <RefreshIcon />
                 {buttonLabel}
               </button>
-              {hasKey && actionCount > 0 && (
+              {actionCount > 0 && (
                 <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
               )}
             </div>
@@ -2062,7 +2064,7 @@ function VoiceIndexCard({ dbStatus, job, onVoiceIndex, reloadDbStatus }) {
                 <RefreshIcon />
                 {buttonLabel}
               </button>
-              {hasKey && actionCount > 0 && (
+              {actionCount > 0 && (
                 <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
               )}
             </div>
@@ -2325,7 +2327,7 @@ function DocumentIndexCard({ dbStatus, job, onDocumentIndex, reloadDbStatus }) {
                 <RefreshIcon />
                 {buttonLabel}
               </button>
-              {hasKey && actionCount > 0 && (
+              {actionCount > 0 && (
                 <span className="text-[11px] text-gray-400">est. ≈ ${estCost.toFixed(2)}</span>
               )}
             </div>
