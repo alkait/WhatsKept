@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="380" viewBox="0 0 1280 380" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    @media (prefers-color-scheme: light) {
+      [fill="#e6f2ec"] { fill: #1f2328 }
+      [fill="#7fa898"] { fill: #6e8a7f }
+      [stroke="#7fa898"] { stroke: #6e8a7f }
+      [fill="#1f3d34"] { fill: #e3eee8 }
+      [fill="#14302a"] { fill: #f4f8f6 }
+      [stroke="#2b5447"] { stroke: #cbdcd3 }
+      [fill="#25d366"] { fill: #17a84e }
+      [stroke="#25d366"] { stroke: #17a84e }
+      [fill="#e9eef0"] { fill: #ffffff; stroke: #cbdcd3; stroke-width: 1.5 }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#25d366"/>
+    </marker>
+  </defs>
+
+  <!-- cards -->
+  <g fill="#14302a" stroke="#2b5447" stroke-width="2">
+    <rect x="30" y="20" width="370" height="340" rx="24"/>
+    <rect x="455" y="20" width="370" height="340" rx="24"/>
+    <rect x="880" y="20" width="370" height="340" rx="24"/>
+  </g>
+
+  <!-- arrows between steps -->
+  <g stroke="#25d366" stroke-width="4" stroke-linecap="round" marker-end="url(#a)">
+    <line x1="408" y1="125" x2="444" y2="125"/>
+    <line x1="869" y1="125" x2="833" y2="125"/>
+  </g>
+
+  <!-- step tags -->
+  <g font-size="14" font-weight="800" fill="#25d366" text-anchor="middle" letter-spacing="1.5">
+    <text x="215" y="56">ONCE</text>
+    <text x="640" y="56">ALWAYS ON</text>
+    <text x="1065" y="56">ANYTIME</text>
+  </g>
+
+  <!-- 1 · iPhone backup → database -->
+  <rect x="150" y="78" width="50" height="86" rx="10" fill="#1f3d34" stroke="#7fa898" stroke-width="2.5"/>
+  <rect x="167" y="84" width="16" height="4" rx="2" fill="#7fa898"/>
+  <rect x="157" y="98" width="26" height="10" rx="4" fill="#7fa898"/>
+  <rect x="166" y="114" width="26" height="10" rx="4" fill="#25d366"/>
+  <rect x="157" y="130" width="22" height="10" rx="4" fill="#7fa898"/>
+  <line x1="210" y1="121" x2="232" y2="121" stroke="#25d366" stroke-width="3.5" stroke-linecap="round" marker-end="url(#a)"/>
+  <path d="M244 96 v48 a20 7 0 0 0 40 0 v-48" fill="#25d366"/>
+  <ellipse cx="264" cy="96" rx="20" ry="7" fill="#5cf0a0"/>
+  <path d="M244 112 a20 7 0 0 0 40 0" fill="none" stroke="#0b1a16" stroke-opacity="0.3" stroke-width="2"/>
+  <path d="M244 128 a20 7 0 0 0 40 0" fill="none" stroke="#0b1a16" stroke-opacity="0.3" stroke-width="2"/>
+
+  <!-- 2 · live (broadcast) -->
+  <circle cx="556" cy="121" r="7" fill="#25d366"/>
+  <g fill="none" stroke="#25d366" stroke-width="3.5" stroke-linecap="round">
+    <path d="M541 106 a21 21 0 0 0 0 30"/>
+    <path d="M571 106 a21 21 0 0 1 0 30"/>
+    <path d="M531 96 a34 34 0 0 0 0 50"/>
+    <path d="M581 96 a34 34 0 0 1 0 50"/>
+  </g>
+  <!-- 2 · enrich (photo → text) -->
+  <rect x="622" y="92" width="36" height="28" rx="4" fill="#e9eef0"/>
+  <path d="M625 117 L637 105 L644 112 L650 106 L655 117 Z" fill="#7fa898"/>
+  <circle cx="650" cy="99" r="3" fill="#e8c46a"/>
+  <g fill="#e6f2ec">
+    <rect x="622" y="128" width="36" height="5" rx="2.5"/>
+    <rect x="622" y="138" width="28" height="5" rx="2.5"/>
+    <rect x="622" y="148" width="32" height="5" rx="2.5"/>
+  </g>
+  <!-- 2 · mcp (plug) -->
+  <g fill="none" stroke="#25d366" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M714 88 v13 M734 88 v13"/>
+    <path d="M706 101 h36 v15 a18 18 0 0 1 -36 0 Z"/>
+    <path d="M724 134 v12 q0 12 -12 12 h-5"/>
+  </g>
+
+  <!-- 3 · agent chat + send -->
+  <path d="M1000 90 h72 a10 10 0 0 1 10 10 v38 a10 10 0 0 1 -10 10 h-42 l-14 13 v-13 h-16 a10 10 0 0 1 -10 -10 v-38 a10 10 0 0 1 10 -10 Z" fill="#1f3d34" stroke="#7fa898" stroke-width="2.5"/>
+  <circle cx="1016" cy="119" r="5" fill="#25d366"/>
+  <circle cx="1036" cy="119" r="5" fill="#25d366"/>
+  <circle cx="1056" cy="119" r="5" fill="#25d366"/>
+  <g fill="none" stroke="#25d366" stroke-width="3.5" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M1098 120 L1144 98 L1130 148 L1116 130 Z"/>
+    <path d="M1116 130 L1144 98"/>
+  </g>
+
+  <!-- titles -->
+  <g font-size="22" font-weight="700" fill="#e6f2ec" text-anchor="middle">
+    <text x="215" y="212">Import your history</text>
+    <text x="640" y="212">Capture, enrich, serve</text>
+    <text x="1065" y="212">Ask and act</text>
+  </g>
+
+  <!-- descriptions -->
+  <g font-size="16" fill="#7fa898" text-anchor="middle">
+    <text x="215" y="244">Years of chats, in one go,</text>
+    <text x="215" y="266">from an encrypted iPhone backup.</text>
+
+    <text x="640" y="244">New messages land as they arrive,</text>
+    <text x="640" y="266">media becomes text via OpenRouter,</text>
+    <text x="640" y="288">and MCP serves it all to your agent.</text>
+
+    <text x="1065" y="244">Your AI agent searches everything,</text>
+    <text x="1065" y="266">sends, replies and forwards,</text>
+    <text x="1065" y="288">and works toward goals for you.</text>
+  </g>
+
+  <!-- commands -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" text-anchor="middle">
+    <rect x="177" y="312" width="76" height="30" rx="8" fill="#1f3d34"/>
+    <text x="215" y="332" fill="#25d366">import</text>
+    <rect x="530" y="312" width="62" height="30" rx="8" fill="#1f3d34"/>
+    <text x="561" y="332" fill="#25d366">live</text>
+    <rect x="600" y="312" width="80" height="30" rx="8" fill="#1f3d34"/>
+    <text x="640" y="332" fill="#25d366">enrich</text>
+    <rect x="688" y="312" width="62" height="30" rx="8" fill="#1f3d34"/>
+    <text x="719" y="332" fill="#25d366">mcp</text>
+  </g>
+  <text x="1065" y="332" font-size="15" fill="#7fa898" text-anchor="middle">Claude, ChatGPT or any MCP client</text>
+</svg>

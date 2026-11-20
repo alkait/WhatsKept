@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    @media (prefers-color-scheme: light) {
+      [fill="#ffffff"], [fill="#e6f2ec"] { fill: #1f2328 }
+      [fill="#a9c7bb"] { fill: #57606a }
+      [fill="#7fa898"] { fill: #6e8a7f }
+      [stroke="#7fa898"] { stroke: #6e8a7f }
+      [fill="#1f3d34"] { fill: #e3eee8 }
+      [fill="#14302a"] { fill: #f4f8f6 }
+      [fill="#2b5447"] { fill: #cbdcd3 }
+      [stroke="#2b5447"] { stroke: #cbdcd3 }
+      [fill="#25d366"] { fill: #17a84e }
+      [stroke="#25d366"] { stroke: #17a84e }      text[fill="#5cf0a0"] { fill: #17a84e }      [fill="#e9eef0"] { fill: #ffffff; stroke: #cbdcd3; stroke-width: 1.5 }
+    }
+  </style>
+  
+  <!-- wordmark -->
+  <text x="76" y="168" font-size="104" font-weight="800" letter-spacing="-4" fill="#ffffff">Whats<tspan fill="#25d366">Kept</tspan></text>
+  <text x="82" y="222" font-size="27" fill="#a9c7bb">Give your AI agent the power to</text>
+  <text x="82" y="258" font-size="27" fill="#a9c7bb"><tspan font-weight="700" fill="#ffffff">find</tspan> and <tspan font-weight="700" fill="#ffffff">send</tspan> WhatsApp messages.</text>
+
+  <!-- floating message bubbles -->
+  <g>
+    <!-- text -->
+    <rect x="820" y="52" width="190" height="46" rx="14" fill="#1f3d34"/>
+    <rect x="838" y="68" width="120" height="6" rx="3" fill="#7fa898"/>
+    <rect x="838" y="80" width="80" height="6" rx="3" fill="#7fa898"/>
+    <!-- photo -->
+    <rect x="790" y="114" width="150" height="82" rx="14" fill="#1f3d34"/>
+    <rect x="802" y="124" width="126" height="62" rx="8" fill="#2b5447"/>
+    <circle cx="904" cy="140" r="8" fill="#e8c46a"/>
+    <path d="M806 182 L842 146 L866 168 L882 154 L924 182 Z" fill="#4f8a76"/>
+    <!-- voice -->
+    <rect x="830" y="212" width="200" height="46" rx="14" fill="#1f3d34"/>
+    <path d="M848 225 L848 245 L864 235 Z" fill="#25d366"/>
+    <g fill="#7fa898">
+      <rect x="876" y="231" width="4" height="8" rx="2"/>
+      <rect x="884" y="226" width="4" height="18" rx="2"/>
+      <rect x="892" y="222" width="4" height="26" rx="2"/>
+      <rect x="900" y="228" width="4" height="14" rx="2"/>
+      <rect x="908" y="224" width="4" height="22" rx="2"/>
+      <rect x="916" y="230" width="4" height="10" rx="2"/>
+      <rect x="924" y="226" width="4" height="18" rx="2"/>
+      <rect x="932" y="231" width="4" height="8" rx="2"/>
+      <rect x="940" y="228" width="4" height="14" rx="2"/>
+      <rect x="948" y="232" width="4" height="6" rx="2"/>
+    </g>
+    <text x="968" y="240" font-size="13" fill="#7fa898">0:42</text>
+    <!-- pdf -->
+    <rect x="960" y="124" width="92" height="62" rx="14" fill="#1f3d34"/>
+    <rect x="976" y="134" width="30" height="40" rx="4" fill="#e9eef0"/>
+    <rect x="976" y="158" width="30" height="12" fill="#e5534b"/>
+    <text x="991" y="168" font-size="9" font-weight="700" text-anchor="middle" fill="#fff">PDF</text>
+    <rect x="1014" y="144" width="26" height="5" rx="2.5" fill="#7fa898"/>
+    <rect x="1014" y="156" width="18" height="5" rx="2.5" fill="#7fa898"/>
+  </g>
+
+  <!-- flow into the database -->
+  <path d="M1062 155 C1092 155 1100 160 1120 160" fill="none" stroke="#25d366" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 9"/>
+  <g>
+    <path d="M1130 118 v84 a46 14 0 0 0 92 0 v-84" fill="#25d366"/>
+    <ellipse cx="1176" cy="118" rx="46" ry="14" fill="#5cf0a0"/>
+    <path d="M1130 146 a46 14 0 0 0 92 0" fill="none" stroke="#0f2c24" stroke-opacity="0.35" stroke-width="2"/>
+    <path d="M1130 174 a46 14 0 0 0 92 0" fill="none" stroke="#0f2c24" stroke-opacity="0.35" stroke-width="2"/>
+  </g>
+
+  <!-- caption under the illustration -->
+  <text x="1006" y="296" font-size="18" fill="#7fa898" text-anchor="middle">Searchable text, photos, voice notes, videos and PDFs</text>
+</svg>
