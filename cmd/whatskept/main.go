@@ -25,6 +25,7 @@ Usage:
   whatskept send <chat> --forward <stanza-id>
                                      forward a message (text, image, voice note, document) to a chat
   whatskept mcp --database <file>    serve a database file over MCP (HTTP) [--addr host:port]
+                                     [--stdio] serves over stdin/stdout instead (no token)
   whatskept -v | --version           show the version
   whatskept -h | --help              show this help
 `

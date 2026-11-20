@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"database/sql"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -358,6 +359,66 @@ func TestCLIMCPNeverPrintsToken(t *testing.T) {
 	}
 	if strings.Contains(out, token) {
 		t.Errorf("stdout leaks the token: %q", out)
+	}
+}
+
+// TestCLIMCPStdio: --stdio speaks MCP over stdin/stdout with no token,
+// serves even with no database yet, and keeps stdout pure protocol.
+func TestCLIMCPStdio(t *testing.T) {
+	cmd := exec.Command(binPath, "mcp", "--stdio", "--database", "ChatStorage.sqlite")
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(os.Environ(), mcpserve.TokenEnv+"=")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cmd.Process.Kill(); cmd.Wait() }()
+
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 0, 1<<20), 1<<20)
+	// next reads one stdout line; every line must be a JSON-RPC message.
+	next := func() map[string]any {
+		t.Helper()
+		if !sc.Scan() {
+			t.Fatalf("no response on stdout (stderr: %q)", stderr.String())
+		}
+		var msg map[string]any
+		if err := json.Unmarshal(sc.Bytes(), &msg); err != nil || msg["jsonrpc"] != "2.0" {
+			t.Fatalf("stdout line is not JSON-RPC: %q", sc.Text())
+		}
+		return msg
+	}
+	send := func(s string) {
+		t.Helper()
+		if _, err := stdin.Write([]byte(s + "\n")); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`)
+	if init := next(); init["result"] == nil {
+		t.Fatalf("initialize failed: %v", init)
+	}
+	send(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+	send(`{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
+	list := next()
+	result, _ := list["result"].(map[string]any)
+	tools, _ := result["tools"].([]any)
+	var names []string
+	for _, tool := range tools {
+		names = append(names, tool.(map[string]any)["name"].(string))
+	}
+	if got, want := strings.Join(names, ","), "get_schema,query,search,send"; got != want {
+		t.Errorf("tools = %s, want %s", got, want)
 	}
 }
 

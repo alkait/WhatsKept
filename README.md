@@ -76,7 +76,7 @@ Web does.
 | `whatskept enrich` | Turn queued photos, voice notes, videos and PDFs into text via OpenRouter. Resumable. |
 | `whatskept live` | Link as a WhatsApp companion device (scan a QR once) and capture new messages. |
 | `whatskept send <chat> <text>` | Send through the running `live`. Supports `--reply-to` and `--forward`. |
-| `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token. |
+| `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token. `--stdio` serves over stdin/stdout instead, for clients that launch it. |
 
 ## Privacy & security
 

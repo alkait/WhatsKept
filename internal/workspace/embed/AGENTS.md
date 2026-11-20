@@ -386,6 +386,10 @@ content answers, never writes (see Hard rules).
    - Claude Code:
      `claude mcp add --transport http whatskept <url> --header "Authorization: Bearer <token>"`
 
+   A client on this same machine can skip the server, port and token:
+   it launches `whatskept mcp --stdio --database <path-to-ChatStorage.sqlite>`
+   itself, e.g. `claude mcp add whatskept -- whatskept mcp --stdio --database <path>`.
+
 ### Moving off a token-in-path URL
 
 Older versions served the endpoint at `/<token>/mcp`. That path no

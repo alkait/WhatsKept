@@ -1,5 +1,5 @@
 // Package mcpserve exposes the workspace database over the Model
-// Context Protocol (streamable HTTP) — the only query surface of
+// Context Protocol (streamable HTTP, or stdio) — the only query surface of
 // whatskept. Read-only by construction: the database is opened with
 // mode=ro and PRAGMA query_only per tool call, and never held open, so
 // a re-import can replace the file mid-serve without a restart.
@@ -94,6 +94,23 @@ func Serve(ctx context.Context, dbPath, addr, token string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// ServeStdio runs the same MCP server over stdin/stdout until the
+// client disconnects or ctx is cancelled — for clients that launch the
+// server themselves. No listener, so no token: only the parent process
+// can talk to it. stdout carries the protocol, so the startup notes go
+// to stderr.
+func ServeStdio(ctx context.Context, dbPath string) error {
+	dbState := dbPath
+	if db, err := (&server{dbPath: dbPath}).openDB(); err != nil {
+		dbState = fmt.Sprintf("NOT available (%v) — serving anyway", err)
+	} else {
+		db.Close()
+	}
+	fmt.Fprintln(os.Stderr, "MCP over stdio")
+	fmt.Fprintf(os.Stderr, "Database:      %s\n", dbState)
+	return newMCPServer(dbPath).Run(ctx, &mcp.StdioTransport{})
 }
 
 // TokenEnv is where Serve's callers read the auth token from.

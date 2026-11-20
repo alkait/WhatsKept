@@ -20,6 +20,7 @@ func runMCP(args []string) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	database := fs.String("database", "", "path to the database file (required), e.g. <workspace>/ChatStorage.sqlite")
 	addr := fs.String("addr", "127.0.0.1:8787", "listen address")
+	stdio := fs.Bool("stdio", false, "serve over stdin/stdout instead of HTTP (no token; for clients that launch the server)")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -32,5 +33,8 @@ func runMCP(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *stdio {
+		return mcpserve.ServeStdio(ctx, *database)
+	}
 	return mcpserve.Serve(ctx, *database, *addr, os.Getenv(mcpserve.TokenEnv))
 }
