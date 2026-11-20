@@ -107,7 +107,7 @@ things stand (e.g. everything is deployed on a host and this machine
 is only the import station).
 
 Check for updates: compare `whatskept -v` against the latest release
-at https://github.com/alkait/whatskept-cli/releases (`dev` means a
+at https://github.com/alkait/whatskept/releases (`dev` means a
 source build — skip the check). If newer, offer to update: replace
 the binary, re-run `whatskept init` to refresh this guide, and
 restart any running `live` or `mcp` — on a deployed host too. Never
@@ -417,7 +417,7 @@ truth.
 Manage the whole process over ssh. The steps, generically:
 
 1. Install the release binary matching the host's OS/architecture
-   (https://github.com/alkait/whatskept-cli/releases) on the host's
+   (https://github.com/alkait/whatskept/releases) on the host's
    PATH, and verify with `whatskept -v`.
 2. Copy the workspace directory to the host wholesale — it is fully
    portable (database, `.whatskept/`, `.unenriched/`, `.env`); rsync

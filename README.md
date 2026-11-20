@@ -10,14 +10,14 @@ agent can then answer questions across years of chats.
 ## Audit prompt (optional)
 
 ```
-trace the latest release of https://github.com/alkait/whatskept-cli to the source commit it
+trace the latest release of https://github.com/alkait/whatskept to the source commit it
 was built from and audit that code: should I trust this with my privacy and my WhatsApp data?
 ```
 
 ## Installation and getting started prompt
 
 ```
-install the latest release of https://github.com/alkait/whatskept-cli and put it on my PATH.
+install the latest release of https://github.com/alkait/whatskept and put it on my PATH.
 When done, ask me one question — where my workspace is, or where I'd like a new one —
 then tell me to continue in a new terminal and print the matching command with my path
 filled in:

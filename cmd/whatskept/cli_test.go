@@ -20,7 +20,7 @@ import (
 var binPath string
 
 func TestMain(m *testing.M) {
-	tmp, err := os.MkdirTemp("", "whatskept-cli-test")
+	tmp, err := os.MkdirTemp("", "whatskept-test")
 	if err != nil {
 		panic(err)
 	}
