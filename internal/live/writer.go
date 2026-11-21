@@ -68,6 +68,8 @@ var coreDataEntity = map[string]string{
 	"ZWACHATSESSION": "WAChatSession",
 	"ZWAGROUPMEMBER": "WAGroupMember",
 	"ZWAMEDIAITEM":   "WAMediaItem",
+
+	"ZWAPROFILEPUSHNAME": "WAProfilePushName",
 }
 
 type action int
@@ -363,6 +365,10 @@ type Writer struct {
 	// backup — rare, and worth a round trip to avoid titling the
 	// thread after whoever happened to speak first.
 	groupSubject func(context.Context, types.JID) (string, bool)
+	// knownName is a chat's name as history sync reported it (a group's
+	// subject, a contact's name), consulted first when a chat has to be
+	// created. Nil or no answer falls back to groupSubject / push name.
+	knownName func(types.JID) (string, bool)
 	// download fetches an attachment's bytes. Injected so the writer is
 	// testable without a WhatsApp connection.
 	download func(context.Context, downloadable) ([]byte, error)
@@ -379,6 +385,9 @@ type Result struct {
 	// root (".unenriched/voice/48213.opus") — set only on an insert
 	// that carried one.
 	MediaPath string
+	// MediaNote says why an insert that carried an attachment stored
+	// no file ("download failed: …"); empty otherwise.
+	MediaNote string
 
 	// Staged file, renamed into place by Apply once the transaction
 	// commits. Writing it inside the transaction and publishing it
@@ -432,32 +441,54 @@ func (w *Writer) Apply(ctx context.Context, p plan) (Result, error) {
 	if p.Action == actionSkip {
 		return Result{Action: actionSkip, Reason: p.SkipReason}, nil
 	}
+
+	// Fetch attachment bytes BEFORE the transaction opens, and outside
+	// the writer lock. WhatsApp's CDN blobs expire, so this has to happen
+	// on receipt — but a network round trip inside a transaction would
+	// hold the write lock against a database the MCP server is reading,
+	// and inside mu it would stall every other capture and send behind
+	// one slow download.
+	//
+	// A message already stored is not downloaded at all: history sync
+	// re-delivers what a backup import already holds, and fetching those
+	// bytes only to discard them as "already present" is pure waste.
+	// (applyInsert re-checks under the lock, so a race costs at most one
+	// redundant download, never a duplicate row.)
+	//
+	// A download that fails still records the message, without its
+	// file: the text, caption and filename stay searchable, and the
+	// stored download details still let a forward ask the phone to
+	// re-upload. Skipping it would lose the row for good wherever no
+	// later backup exists to bring it back.
+	var mediaNote string
+	if p.Media != nil && p.Media.CopyFrom == 0 && !p.Media.RowOnly {
+		if present, err := w.hasStanza(ctx, p.StanzaID); err != nil {
+			return Result{}, err
+		} else if present {
+			return Result{Action: actionSkip, Reason: "already present"}, nil
+		}
+		var data []byte
+		var err error
+		switch {
+		case w.download == nil:
+			err = errors.New("media capture disabled")
+		default:
+			if data, err = w.download(ctx, p.Media.Source); err == nil && len(data) == 0 {
+				err = errors.New("no bytes returned")
+			}
+		}
+		if err != nil {
+			p.Media.RowOnly = true
+			mediaNote = "download failed: " + err.Error()
+		} else {
+			p.Media.Data = data
+			// Trust the bytes over the sender's declared length.
+			p.Media.Size = uint64(len(data))
+		}
+	}
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
-
-	// Fetch attachment bytes BEFORE the transaction opens. WhatsApp's
-	// CDN blobs expire, so this has to happen on receipt — but a network
-	// round trip inside a transaction would hold the write lock for its
-	// whole duration, against a database the MCP server is reading.
-	//
-	// A download that fails is a skip, not an error: the message is on
-	// the phone and the next backup brings the row and the file together,
-	// which is strictly better than a row pointing at nothing.
-	if p.Media != nil && p.Media.CopyFrom == 0 && !p.Media.RowOnly {
-		if w.download == nil {
-			return Result{Action: actionSkip, Reason: "media capture disabled"}, nil
-		}
-		data, err := w.download(ctx, p.Media.Source)
-		if err != nil {
-			return Result{Action: actionSkip, Reason: "download failed: " + err.Error()}, nil
-		}
-		if len(data) == 0 {
-			return Result{Action: actionSkip, Reason: "download returned no bytes"}, nil
-		}
-		p.Media.Data = data
-		// Trust the bytes over the sender's declared length.
-		p.Media.Size = uint64(len(data))
-	}
 
 	db, err := openRW(w.dbPath)
 	if err != nil {
@@ -481,6 +512,9 @@ func (w *Writer) Apply(ctx context.Context, p plan) (Result, error) {
 		res, err = applyReaction(ctx, tx, p)
 	default:
 		res, err = w.applyInsert(ctx, tx, p)
+		if res.Action == actionInsert {
+			res.MediaNote = mediaNote
+		}
 	}
 	if err != nil {
 		// A staged file whose transaction never committed is litter.
@@ -642,14 +676,22 @@ func (w *Writer) applyInsert(ctx context.Context, tx *sql.Tx, p plan) (Result, e
 	}
 
 	// Chat metadata. v_chats reads these; leaving them stale makes chat
-	// lists show the wrong "last message".
+	// lists show the wrong "last message". The last message moves only
+	// forward in time: history sync inserts messages older than what the
+	// chat already holds, and those must not become its latest.
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE ZWACHATSESSION
-		   SET ZMESSAGECOUNTER  = COALESCE(ZMESSAGECOUNTER, 0) + 1,
-		       ZLASTMESSAGE     = ?,
+		   SET ZMESSAGECOUNTER = COALESCE(ZMESSAGECOUNTER, 0) + 1
+		 WHERE Z_PK = ?`, chatPK); err != nil {
+		return Result{}, fmt.Errorf("update session: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE ZWACHATSESSION
+		   SET ZLASTMESSAGE     = ?,
 		       ZLASTMESSAGEDATE = ?,
 		       ZLASTMESSAGETEXT = ?
-		 WHERE Z_PK = ?`, pk, cocoa, nullIfEmpty(p.ftsText()), chatPK); err != nil {
+		 WHERE Z_PK = ? AND (ZLASTMESSAGEDATE IS NULL OR ZLASTMESSAGEDATE <= ?)`,
+		pk, cocoa, nullIfEmpty(p.ftsText()), chatPK, cocoa); err != nil {
 		return Result{}, fmt.Errorf("update session: %w", err)
 	}
 
@@ -900,8 +942,8 @@ func (w *Writer) resolveChat(ctx context.Context, tx *sql.Tx, p plan) (int64, bo
 		// belongs to whoever sent this message — for our own messages,
 		// us — so using it would name the group after a person. Ask
 		// WhatsApp for the real subject instead.
-		var subject string
-		if w.groupSubject != nil {
+		subject, _ := w.nameOf(p.ChatJID)
+		if subject == "" && w.groupSubject != nil {
 			if name, ok := w.groupSubject(ctx, p.ChatJID); ok {
 				subject = name
 			}
@@ -948,14 +990,26 @@ func (w *Writer) resolveChat(ctx context.Context, tx *sql.Tx, p plan) (int64, bo
 	}
 	// Same trap as groups: on an OUTGOING message the push name is our
 	// own, so a new thread would be titled after us. Only an incoming
-	// message tells us anything about the other party. Left NULL,
-	// v_chats falls back to the push-name tables and then the JID.
-	partner := ""
-	if !p.IsFromMe {
+	// message tells us anything about the other party. A name history
+	// sync reported for the chat beats both. Left NULL, v_chats falls
+	// back to the push-name tables and then the JID.
+	partner, _ := w.nameOf(p.ChatJID)
+	if partner == "" && !phone.IsEmpty() {
+		partner, _ = w.nameOf(phone)
+	}
+	if partner == "" && !p.IsFromMe {
 		partner = p.PushName
 	}
 	pk, err = createChat(ctx, tx, key.String(), lid.String(), partner, 0)
 	return pk, true, err
+}
+
+// nameOf asks knownName, tolerating its absence.
+func (w *Writer) nameOf(jid types.JID) (string, bool) {
+	if w.knownName == nil || jid.IsEmpty() {
+		return "", false
+	}
+	return w.knownName(jid)
 }
 
 func lookupChat(ctx context.Context, tx *sql.Tx, phone, lid sql.NullString) (int64, bool, error) {
@@ -1090,6 +1144,25 @@ func (w *Writer) quote(ctx context.Context, to types.JID, stanzaID string) (*waE
 		Participant:   proto.String(sender),
 		QuotedMessage: &waE2E.Message{Conversation: proto.String(body)},
 	}, nil
+}
+
+// hasStanza reports whether a message with this stanza ID is stored,
+// outside any transaction — the pre-download check in Apply.
+func (w *Writer) hasStanza(ctx context.Context, stanzaID string) (bool, error) {
+	if stanzaID == "" {
+		return false, nil
+	}
+	db, err := openRW(w.dbPath)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM ZWAMESSAGE WHERE ZSTANZAID = ?`, stanzaID).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func findByStanza(ctx context.Context, tx *sql.Tx, stanzaID string) (int64, bool, error) {

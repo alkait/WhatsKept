@@ -1,7 +1,8 @@
 # WhatsApp history — query surface
 
 You are connected to a read-only SQLite copy of the user's WhatsApp
-history (seeded from an iOS backup and kept current by live capture),
+history (seeded from an iOS backup and/or the history the phone sends
+when live is paired, and kept current by live capture),
 with SQL views, an FTS5 index, and — once enrichment has run — image,
 sticker, GIF and video descriptions/OCR, voice-note and video
 transcripts, and extracted PDF text. Answer the user's questions with
@@ -40,6 +41,17 @@ taken back.
   result means it went out but was not stored — do **not** resend.
 - "live is not running" means capture is stopped on the host; tell the
   user rather than retrying.
+
+## When results carry a `note`
+
+`search` and `query` results include a `note` while the history is
+known to be incomplete: a history sync still arriving after a pairing
+(with its progress), one that stopped before finishing, or media whose
+descriptions/transcripts aren't searchable yet (with an ETA when
+enrichment is running). Pass it on to the user when it bears on the
+answer — "your WhatsApp history is still syncing (40%), so older
+messages may be missing" — rather than presenting the result as
+complete. No `note` means nothing is known to be missing.
 
 ## No media here — cite instead
 

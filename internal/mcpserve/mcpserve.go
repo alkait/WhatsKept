@@ -268,6 +268,7 @@ type queryOut struct {
 	Columns   []string `json:"columns"`
 	Rows      [][]any  `json:"rows"`
 	Truncated bool     `json:"truncated,omitempty" jsonschema:"true when the row or byte cap cut the result short — narrow the query"`
+	Note      string   `json:"note,omitempty" jsonschema:"present while the history is known to be incomplete (a history sync arriving, media not yet searchable) — tell the user"`
 }
 
 func (s *server) query(ctx context.Context, _ *mcp.CallToolRequest, in queryIn) (*mcp.CallToolResult, queryOut, error) {
@@ -329,6 +330,7 @@ func (s *server) query(ctx context.Context, _ *mcp.CallToolRequest, in queryIn) 
 	if err := rows.Err(); err != nil {
 		return nil, queryOut{}, err
 	}
+	out.Note = s.statusNote(ctx, db)
 	return nil, out, nil
 }
 
@@ -405,6 +407,7 @@ type searchHit struct {
 
 type searchOut struct {
 	Hits []searchHit `json:"hits"`
+	Note string      `json:"note,omitempty" jsonschema:"present while the history is known to be incomplete (a history sync arriving, media not yet searchable) — tell the user"`
 }
 
 func (s *server) search(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
@@ -499,5 +502,9 @@ func (s *server) search(ctx context.Context, _ *mcp.CallToolRequest, in searchIn
 		h.Reactions = react.String
 		out.Hits = append(out.Hits, h)
 	}
-	return nil, out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, searchOut{}, err
+	}
+	out.Note = s.statusNote(ctx, db)
+	return nil, out, nil
 }

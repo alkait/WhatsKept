@@ -74,7 +74,7 @@ Web does.
 | `whatskept init [dir]` | Create a workspace. |
 | `whatskept import <backup>` | Import full history from an encrypted iPhone backup. Resumable. `--list` finds backups. |
 | `whatskept enrich` | Turn queued photos, voice notes, videos and PDFs into text via OpenRouter. Resumable. |
-| `whatskept live` | Link as a WhatsApp companion device (scan a QR once) and capture new messages. |
+| `whatskept live` | Link as a WhatsApp companion device (scan a QR once), store the history the phone sends at pairing, and capture new messages. |
 | `whatskept send <chat> <text>` | Send through the running `live`. Supports `--reply-to` and `--forward`. |
 | `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token or OAuth. `--stdio` serves over stdin/stdout instead, for clients that launch it. |
 

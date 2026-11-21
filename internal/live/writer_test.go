@@ -439,26 +439,85 @@ func TestApplyVideo(t *testing.T) {
 	}
 }
 
-func TestApplyMediaDownloadFailureSkips(t *testing.T) {
+func TestApplyMediaDownloadFailureKeepsRow(t *testing.T) {
 	w, root := newTestWriter(t)
 	w.download = func(context.Context, downloadable) ([]byte, error) {
 		return nil, errors.New("cdn said no")
 	}
-	res, err := w.Apply(context.Background(), decide(imageEvent("M1", ""), nil))
+	res, err := w.Apply(context.Background(), decide(imageEvent("M1", "the view"), nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Action != actionSkip || !strings.Contains(res.Reason, "download failed") {
+	if res.Action != actionInsert || res.MediaPath != "" || !strings.Contains(res.MediaNote, "cdn said no") {
 		t.Fatalf("res = %+v", res)
 	}
-	// No row, no file: the next backup brings both together.
-	var n int
-	if err := queryDB(t, w, `SELECT COUNT(*) FROM ZWAMESSAGE`).Scan(&n); err != nil || n != 0 {
-		t.Errorf("messages = %d, %v", n, err)
+	// The row and its media item are stored; the caption is searchable.
+	var title string
+	var key []byte
+	if err := queryDB(t, w, `SELECT ZTITLE, ZMEDIAKEY FROM ZWAMEDIAITEM WHERE ZMESSAGE = ?`,
+		res.PK).Scan(&title, &key); err != nil {
+		t.Fatal(err)
 	}
+	if title != "the view" || len(key) == 0 {
+		t.Errorf("media item: title=%q key=%x", title, key)
+	}
+	var n int
+	if err := queryDB(t, w, `SELECT COUNT(*) FROM messages_fts WHERE rowid = ? AND text = 'the view'`,
+		res.PK).Scan(&n); err != nil || n != 1 {
+		t.Errorf("fts = %d, %v", n, err)
+	}
+	// No file: nothing for enrichment to pick up.
 	entries, _ := os.ReadDir(filepath.Join(root, backup.UnenrichedDir, "media"))
 	if len(entries) != 0 {
 		t.Errorf("unexpected queued files: %v", entries)
+	}
+}
+
+// A message already stored — the history-sync case, re-delivering what
+// a backup import holds — is skipped before its attachment is fetched.
+func TestApplyPresentMediaNotDownloaded(t *testing.T) {
+	w, _ := newTestWriter(t)
+	calls := 0
+	w.download = func(context.Context, downloadable) ([]byte, error) {
+		calls++
+		return []byte("jpgbytes"), nil
+	}
+	ctx := context.Background()
+	if _, err := w.Apply(ctx, decide(imageEvent("M1", ""), nil)); err != nil {
+		t.Fatal(err)
+	}
+	res, err := w.Apply(ctx, decide(imageEvent("M1", ""), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Action != actionSkip || res.Reason != "already present" || calls != 1 {
+		t.Errorf("res = %+v, downloads = %d (want 1)", res, calls)
+	}
+}
+
+// An older message inserted after a newer one — history arriving after
+// live capture — doesn't become the chat's last message.
+func TestLastMessageOnlyMovesForward(t *testing.T) {
+	w, _ := newTestWriter(t)
+	ctx := context.Background()
+	newer, err := w.Apply(ctx, decide(dmEvent("S2", "newer"), nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := dmEvent("S1", "older")
+	old.Info.Timestamp = old.Info.Timestamp.Add(-24 * time.Hour)
+	if _, err := w.Apply(ctx, decide(old, nil)); err != nil {
+		t.Fatal(err)
+	}
+	var last int64
+	var text string
+	var counter int
+	if err := queryDB(t, w, `SELECT ZLASTMESSAGE, ZLASTMESSAGETEXT, ZMESSAGECOUNTER FROM ZWACHATSESSION WHERE Z_PK = ?`,
+		newer.ChatPK).Scan(&last, &text, &counter); err != nil {
+		t.Fatal(err)
+	}
+	if last != newer.PK || text != "newer" || counter != 2 {
+		t.Errorf("last=%d text=%q counter=%d, want %d \"newer\" 2", last, text, counter, newer.PK)
 	}
 }
 
