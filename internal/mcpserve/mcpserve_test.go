@@ -4,12 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -280,7 +283,7 @@ func (b bearer) RoundTrip(r *http.Request) (*http.Response, error) {
 // token is the gate, and the old token-in-path URL is gone.
 func TestHTTPTransport(t *testing.T) {
 	const token = "0123456789abcdef0123456789abcdef"
-	ts := httptest.NewServer(newHandler(newMCPServer(writeFixtureDB(t)), token))
+	ts := httptest.NewServer(newHandler(newMCPServer(writeFixtureDB(t)), token, time.Now))
 	t.Cleanup(ts.Close)
 
 	for _, tc := range []struct {
@@ -456,5 +459,85 @@ func TestSendWithoutLive(t *testing.T) {
 	call(t, sess, "query", map[string]any{"sql": "SELECT COUNT(*) FROM v_messages"}, &out)
 	if len(out.Rows) != 1 || out.Rows[0][0] != float64(3) {
 		t.Errorf("rows = %v, want the 3 fixture messages and nothing new", out.Rows)
+	}
+}
+
+// TestHTTPProtocolVersions drives both handshakes over raw HTTP: the
+// 2026-07-28 server/discover flow (ChatGPT) and the older initialize
+// flow (claude.ai and most clients). Both must reach the tools.
+func TestHTTPProtocolVersions(t *testing.T) {
+	const token = "0123456789abcdef0123456789abcdef"
+	ts := httptest.NewServer(newHandler(newMCPServer(writeFixtureDB(t)), token, time.Now))
+	t.Cleanup(ts.Close)
+
+	// rpc posts one JSON-RPC message and returns the status and the
+	// decoded result (SSE or JSON body).
+	rpc := func(version, method string, id any, params map[string]any) (int, map[string]any) {
+		t.Helper()
+		msg := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+		if id != nil {
+			msg["id"] = id
+		}
+		b, _ := json.Marshal(msg)
+		req, _ := http.NewRequest("POST", ts.URL+"/mcp", strings.NewReader(string(b)))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Mcp-Protocol-Version", version)
+		req.Header.Set("Mcp-Method", method)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		body := string(raw)
+		if i := strings.Index(body, "data: "); i >= 0 {
+			body = strings.TrimSpace(strings.SplitN(body[i+6:], "\n", 2)[0])
+		}
+		var out struct {
+			Result map[string]any `json:"result"`
+			Error  any            `json:"error"`
+		}
+		json.Unmarshal([]byte(body), &out)
+		if out.Error != nil {
+			t.Errorf("%s %s: error %v", version, method, out.Error)
+		}
+		return resp.StatusCode, out.Result
+	}
+	toolNames := func(res map[string]any) []string {
+		var names []string
+		tools, _ := res["tools"].([]any)
+		for _, tool := range tools {
+			names = append(names, tool.(map[string]any)["name"].(string))
+		}
+		return names
+	}
+
+	// ChatGPT: stateless discover, then tools/list, each carrying _meta.
+	meta := map[string]any{"_meta": map[string]any{
+		"io.modelcontextprotocol/protocolVersion":    "2026-07-28",
+		"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "openai-mcp", "version": "1.0.0"},
+		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+	}}
+	status, res := rpc("2026-07-28", "server/discover", "d", meta)
+	if versions, _ := res["supportedVersions"].([]any); status != 200 || len(versions) == 0 || versions[0] != "2026-07-28" {
+		t.Errorf("discover: %d supportedVersions=%v, want 2026-07-28 first", status, res["supportedVersions"])
+	}
+	if status, res := rpc("2026-07-28", "tools/list", 2, meta); status != 200 || !slices.Contains(toolNames(res), "search") {
+		t.Errorf("2026-07-28 tools/list: %d %v", status, toolNames(res))
+	}
+
+	// Older clients: initialize, then tools/list with no session id.
+	status, res = rpc("2025-06-18", "initialize", 1, map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "claude-ai", "version": "1"},
+	})
+	if status != 200 || res["protocolVersion"] != "2025-06-18" {
+		t.Errorf("initialize: %d protocolVersion=%v", status, res["protocolVersion"])
+	}
+	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 4 {
+		t.Errorf("2025-06-18 tools/list: %d %v", status, toolNames(res))
 	}
 }

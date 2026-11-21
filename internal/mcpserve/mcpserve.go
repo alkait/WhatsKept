@@ -15,7 +15,6 @@ package mcpserve
 
 import (
 	"context"
-	"crypto/subtle"
 	"database/sql"
 	_ "embed"
 	"errors"
@@ -55,7 +54,8 @@ type server struct {
 // cancelled. dbPath is the workspace's ChatStorage.sqlite; it may be
 // absent (tools report "run whatskept import first"). The token is
 // required — the endpoint is /mcp and every request must carry it as
-// `Authorization: Bearer <token>`. One mode, dev and production alike.
+// `Authorization: Bearer <token>`, or an access token from the OAuth
+// flow that token approves. One mode, dev and production alike.
 func Serve(ctx context.Context, dbPath, addr, token string) error {
 	if token == "" {
 		return errors.New("set " + TokenEnv + " — every request to the MCP endpoint must carry it as a bearer token")
@@ -75,7 +75,7 @@ func Serve(ctx context.Context, dbPath, addr, token string) error {
 
 	httpServer := &http.Server{
 		Addr:    addr,
-		Handler: newHandler(newMCPServer(dbPath), token),
+		Handler: newHandler(newMCPServer(dbPath), token, time.Now),
 		// No WriteTimeout: streamable HTTP holds SSE streams open.
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -83,7 +83,7 @@ func Serve(ctx context.Context, dbPath, addr, token string) error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
 	// The token is never printed — logs are not a place for secrets.
-	fmt.Printf("MCP endpoint:  http://%s/mcp (send header `Authorization: Bearer $%s`)\n", addr, TokenEnv)
+	fmt.Printf("MCP endpoint:  http://%s/mcp (send header `Authorization: Bearer $%s`, or connect with OAuth and approve with it)\n", addr, TokenEnv)
 	fmt.Printf("Database:      %s\n", dbState)
 
 	select {
@@ -120,34 +120,23 @@ const TokenEnv = "WHATSKEPT_MCP_TOKEN"
 // is 128 bits.
 const minTokenLen = 32
 
-// newHandler routes the MCP endpoint at /mcp behind the bearer token —
-// the Authorization header is the sole credential, so the URL itself
-// is not a secret.
-func newHandler(mcpServer *mcp.Server, token string) http.Handler {
+// newHandler routes the MCP endpoint at /mcp behind the bearer token
+// or an OAuth access token (oauth.go) — the Authorization header is the
+// sole credential, so the URL itself is not a secret.
+func newHandler(mcpServer *mcp.Server, token string, now func() time.Time) http.Handler {
 	// The SDK's DNS-rebinding protection 403s requests that arrive on a
 	// localhost address with a non-localhost Host header — which is
 	// exactly how every tunnel (cloudflared, ssh -R) delivers traffic.
 	// The token is the gate, so lift it.
+	//
+	// Stateless: every tool call stands alone (the database is opened per
+	// call), and the SDK serves protocol 2026-07-28 — which ChatGPT
+	// requires — only on stateless servers. Older clients still connect.
 	handler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return mcpServer },
-		&mcp.StreamableHTTPOptions{DisableLocalhostProtection: true},
+		&mcp.StreamableHTTPOptions{DisableLocalhostProtection: true, Stateless: true},
 	)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/mcp", func(rw http.ResponseWriter, r *http.Request) {
-		// The "Bearer " prefix is optional: some clients send the
-		// configured header value verbatim.
-		got := r.Header.Get("Authorization")
-		if len(got) > 7 && strings.EqualFold(got[:7], "Bearer ") {
-			got = got[7:]
-		}
-		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-			rw.Header().Set("WWW-Authenticate", "Bearer")
-			http.Error(rw, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		handler.ServeHTTP(rw, r)
-	})
-	return mux
+	return newOAuth(token, now).routes(handler)
 }
 
 // newMCPServer builds the server with its tools registered —

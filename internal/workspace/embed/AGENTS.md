@@ -363,7 +363,8 @@ content answers, never writes (see Hard rules).
 
    It prints the endpoint, `http://127.0.0.1:8787/mcp`. The URL is not
    a secret; the token is. Every request must carry it as the header
-   `Authorization: Bearer <token>`, or gets a 401.
+   `Authorization: Bearer <token>`, or an access token from an OAuth
+   sign-in the user approved with it, or gets a 401.
 
 3. To expose it for testing (e.g. a claude.ai custom connector), offer
    a Cloudflare quick tunnel (https://trycloudflare.com — no account
@@ -375,16 +376,24 @@ content answers, never writes (see Hard rules).
 
    The client URL is then `https://<random>.trycloudflare.com/mcp`.
 
-4. Tell the user how to connect their client — the URL, plus the
-   token as a request header. They copy the token out of `.env`
-   themselves; never echo it into the conversation, a command line, or
-   MEMORY.md.
+4. Tell the user how to connect their client — the URL, plus either
+   the token as a request header or an OAuth sign-in. They copy the
+   token out of `.env` themselves; never echo it into the conversation,
+   a command line, or MEMORY.md.
 
-   - claude.ai custom connector: paste the URL, choose the
-     no-sign-in option, and under request headers add `authorization`
+   - OAuth (claude.ai, ChatGPT, any client that offers sign-in): paste
+     the URL and sign in. A WhatsKept page opens naming the app; the
+     user pastes the token there and clicks Allow. Behind a proxy or
+     tunnel, it must forward the public `Host` and, if it terminates
+     TLS, `X-Forwarded-Proto: https` (cloudflared does both).
+   - Header: a claude.ai custom connector can instead choose the
+     no-sign-in option and add the request header `authorization`
      with the value `Bearer <token>`.
    - Claude Code:
      `claude mcp add --transport http whatskept <url> --header "Authorization: Bearer <token>"`
+
+   Replacing the token in `.env` and restarting signs out every OAuth
+   app; they sign in again with the new one.
 
    A client on this same machine can skip the server, port and token:
    it launches `whatskept mcp --stdio --database <path-to-ChatStorage.sqlite>`

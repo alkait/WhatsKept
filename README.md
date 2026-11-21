@@ -76,7 +76,7 @@ Web does.
 | `whatskept enrich` | Turn queued photos, voice notes, videos and PDFs into text via OpenRouter. Resumable. |
 | `whatskept live` | Link as a WhatsApp companion device (scan a QR once) and capture new messages. |
 | `whatskept send <chat> <text>` | Send through the running `live`. Supports `--reply-to` and `--forward`. |
-| `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token. `--stdio` serves over stdin/stdout instead, for clients that launch it. |
+| `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token or OAuth. `--stdio` serves over stdin/stdout instead, for clients that launch it. |
 
 ## Privacy & security
 
@@ -85,7 +85,7 @@ Web does.
 | **Where does my data live?** | In one SQLite file in your workspace, on your computer or a server you run. There is no WhatsKept service, account or telemetry. | Keep that machine secure. |
 | **Who gets my photos, videos, voice notes and PDFs?** | [OpenRouter](https://openrouter.ai), only when you enrich. Media goes out, text comes back, and the local file is deleted. | Decide whether OpenRouter is acceptable for your media. If not, don't enrich. |
 | **What does my AI provider see?** | Only what your agent reads through MCP. | Use an AI provider you trust with your chats. |
-| **Who can reach the MCP server?** | Only requests carrying your bearer token. | Keep the token secret. |
+| **Who can reach the MCP server?** | Only requests carrying your bearer token, or apps you approved over OAuth by entering that token. | Keep the token secret. Changing it signs out every OAuth app. |
 | **Can I trust the binary?** | Every release is built by GitHub Actions from a public commit. | Run the [Audit](#audit) prompt before you install, or build it yourself from source. |
 
 ## Development
