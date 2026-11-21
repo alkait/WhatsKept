@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -131,7 +132,7 @@ func TestStoreHistoryOverExistingMessages(t *testing.T) {
 		},
 	}
 
-	st := storeHistory(ctx, w, hints, data, client.ParseWebMessage, applyDirect(w))
+	st := storeHistory(ctx, w, hints, data, client.ParseWebMessage, applyDirect(w), nil)
 	want := historyStats{Messages: 6, Inserted: 4, Skipped: 2}
 	if st != want {
 		t.Errorf("stats = %+v, want %+v", st, want)
@@ -179,7 +180,7 @@ func TestStoreHistoryOverExistingMessages(t *testing.T) {
 	}
 
 	// Replaying the chunk — a re-pair re-sends history — adds nothing.
-	again := storeHistory(ctx, w, hints, data, client.ParseWebMessage, applyDirect(w))
+	again := storeHistory(ctx, w, hints, data, client.ParseWebMessage, applyDirect(w), nil)
 	if again.Inserted != 0 || again.Skipped != 6 {
 		t.Errorf("replay stats = %+v", again)
 	}
@@ -199,7 +200,7 @@ func TestStoreHistoryPushNames(t *testing.T) {
 				webText(group, "G1", false, "220000000003@lid", time.Now(), "hi all"),
 			}}},
 	}
-	storeHistory(ctx, w, hints, msgs, client.ParseWebMessage, applyDirect(w))
+	storeHistory(ctx, w, hints, msgs, client.ParseWebMessage, applyDirect(w), nil)
 
 	names := &waHistorySync.HistorySync{
 		SyncType: waHistorySync.HistorySync_PUSH_NAME.Enum(),
@@ -208,7 +209,7 @@ func TestStoreHistoryPushNames(t *testing.T) {
 			{ID: proto.String("not a jid@@"), Pushname: proto.String("x")},
 		},
 	}
-	st := storeHistory(ctx, w, hints, names, client.ParseWebMessage, applyDirect(w))
+	st := storeHistory(ctx, w, hints, names, client.ParseWebMessage, applyDirect(w), nil)
 	if st.PushNames != 2 || st.PushNamesStored != 1 {
 		t.Errorf("stats = %+v", st)
 	}
@@ -250,10 +251,11 @@ func TestHistoryHintsFromConversation(t *testing.T) {
 	}
 }
 
-func TestRecordHistoryChunk(t *testing.T) {
+func TestHistorySyncStatus(t *testing.T) {
 	ctx := context.Background()
 	w := historyWriter(t, newHistoryHints())
 	t0 := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+	min := func(i int) time.Time { return t0.Add(time.Duration(i) * time.Minute) }
 	type row struct {
 		started, last       string
 		progress, ins, done int
@@ -267,25 +269,66 @@ func TestRecordHistoryChunk(t *testing.T) {
 		}
 		return r
 	}
-	steps := []struct {
-		kind     waHistorySync.HistorySync_HistorySyncType
-		progress uint32
-		inserted int
-		want     row
-	}{
-		{waHistorySync.HistorySync_INITIAL_BOOTSTRAP, 5, 100, row{"2026-11-21 10:00:00", "2026-11-21 10:00:00", 5, 100, 0}},
-		{waHistorySync.HistorySync_PUSH_NAME, 0, 0, row{"2026-11-21 10:00:00", "2026-11-21 10:01:00", 5, 100, 0}},
-		{waHistorySync.HistorySync_RECENT, 60, 50, row{"2026-11-21 10:00:00", "2026-11-21 10:02:00", 60, 150, 0}},
-		{waHistorySync.HistorySync_FULL, 100, 7, row{"2026-11-21 10:00:00", "2026-11-21 10:03:00", 100, 157, 1}},
-		// A re-pair starts a new sync.
-		{waHistorySync.HistorySync_INITIAL_BOOTSTRAP, 3, 2, row{"2026-11-21 10:04:00", "2026-11-21 10:04:00", 3, 2, 0}},
+	check := func(step string, want row) {
+		t.Helper()
+		if got := read(); got != want {
+			t.Errorf("%s: got %+v, want %+v", step, got, want)
+		}
 	}
-	for i, s := range steps {
-		if err := w.RecordHistoryChunk(ctx, s.kind, s.progress, s.inserted, t0.Add(time.Duration(i)*time.Minute)); err != nil {
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
 			t.Fatal(err)
 		}
-		if got := read(); got != s.want {
-			t.Errorf("step %d (%s): got %+v, want %+v", i, s.kind, got, s.want)
-		}
+	}
+
+	must(w.ResetHistorySync(ctx, min(0)))
+	check("paired", row{"2026-11-21 10:00:00", "2026-11-21 10:00:00", 0, 0, 0})
+	must(w.RecordHistoryChunk(ctx, 0, 0, min(1))) // a chunk starts
+	must(w.RecordHistoryChunk(ctx, 100, 569, min(2)))
+	check("bootstrap at 100%", row{"2026-11-21 10:00:00", "2026-11-21 10:02:00", 100, 569, 1})
+	must(w.RecordHistoryChunk(ctx, 0, 0, min(3))) // the next chunk keeps it active
+	must(w.RecordHistoryChunk(ctx, 30, 40, min(4)))
+	check("recent at 30%", row{"2026-11-21 10:00:00", "2026-11-21 10:04:00", 30, 609, 0})
+
+	// A new pairing starts over.
+	must(w.ResetHistorySync(ctx, min(9)))
+	check("re-paired", row{"2026-11-21 10:09:00", "2026-11-21 10:09:00", 0, 0, 0})
+}
+
+// A long chunk keeps marking itself active while it is worked through.
+func TestStoreHistoryTouches(t *testing.T) {
+	hints := newHistoryHints()
+	w := historyWriter(t, hints)
+	dm := "971500000001@s.whatsapp.net"
+	conv := &waHistorySync.Conversation{ID: proto.String(dm)}
+	for i := 0; i < 250; i++ {
+		conv.Messages = append(conv.Messages, webText(dm, fmt.Sprintf("T%d", i), false, "", time.Now(), "x"))
+	}
+	touches := 0
+	st := storeHistory(context.Background(), w, hints,
+		&waHistorySync.HistorySync{SyncType: waHistorySync.HistorySync_RECENT.Enum(), Conversations: []*waHistorySync.Conversation{conv}},
+		parsingClient(t).ParseWebMessage, applyDirect(w), func() { touches++ })
+	if st.Inserted != 250 || touches != 3 { // on arrival, at 100, at 200
+		t.Errorf("inserted=%d touches=%d", st.Inserted, touches)
+	}
+}
+
+// A group message with no sender can't be parsed; it is counted and the
+// rest of the chunk still lands.
+func TestStoreHistoryUnparseable(t *testing.T) {
+	hints := newHistoryHints()
+	w := historyWriter(t, hints)
+	group := "120363000000000001@g.us"
+	st := storeHistory(context.Background(), w, hints, &waHistorySync.HistorySync{
+		SyncType: waHistorySync.HistorySync_RECENT.Enum(),
+		Conversations: []*waHistorySync.Conversation{{ID: proto.String(group), Name: proto.String("Family"),
+			Messages: []*waHistorySync.HistorySyncMsg{
+				webText(group, "NOSENDER", false, "", time.Now(), ""),
+				webText(group, "G1", false, "220000000003@lid", time.Now(), "hi"),
+			}}},
+	}, parsingClient(t).ParseWebMessage, applyDirect(w), nil)
+	if st.Unparseable != 1 || st.Inserted != 1 || st.Messages != 2 {
+		t.Errorf("stats = %+v", st)
 	}
 }

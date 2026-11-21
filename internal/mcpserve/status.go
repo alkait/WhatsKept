@@ -66,18 +66,27 @@ func historyNote(ctx context.Context, db *sql.DB) string {
 	var progress, done int
 	if err := db.QueryRowContext(ctx,
 		`SELECT started_at, last_chunk_at, progress, done FROM wa_history_sync WHERE id = 1`).
-		Scan(&started, &last, &progress, &done); err != nil || done != 0 {
+		Scan(&started, &last, &progress, &done); err != nil {
 		return ""
 	}
 	lastAt, err := time.Parse(tsLayout, last)
 	if err != nil {
 		return ""
 	}
+	// Recent activity, not the phone's percentage, says a sync is still
+	// arriving: the percentage is per chunk type, and a bootstrap chunk
+	// reports 100 with more chunks to come.
 	since := now().Sub(lastAt)
 	switch {
 	case since < syncQuiet:
-		return fmt.Sprintf("history sync in progress (%d%%, started %s UTC, last chunk %s ago) — "+
-			"older messages are still arriving; results may be incomplete", progress, started, roundAgo(since))
+		pct := ""
+		if progress > 0 && progress < 100 {
+			pct = fmt.Sprintf("%d%%, ", progress)
+		}
+		return fmt.Sprintf("history sync in progress (%sstarted %s UTC, last activity %s ago) — "+
+			"older messages are still arriving; results may be incomplete", pct, started, roundAgo(since))
+	case done != 0:
+		return ""
 	case since < syncStaleFor:
 		return fmt.Sprintf("history sync stopped at %d%% (last chunk %s UTC) — "+
 			"messages from before linking may be partial; re-pairing live completes it", progress, last)

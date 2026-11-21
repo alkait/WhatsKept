@@ -56,10 +56,12 @@ func TestHistoryNote(t *testing.T) {
 		done       int
 		wantPrefix string
 	}{
-		{"2026-11-21 10:04:30", 42, 0, "history sync in progress (42%, started 2026-11-21 10:00:00 UTC, last chunk 30s ago)"},
+		{"2026-11-21 10:04:30", 42, 0, "history sync in progress (42%, started 2026-11-21 10:00:00 UTC, last activity 30s ago)"},
+		// A chunk type can report 100% with more to come: still active.
+		{"2026-11-21 10:04:30", 100, 1, "history sync in progress (started 2026-11-21 10:00:00 UTC, last activity 30s ago)"},
 		{"2026-11-21 09:00:00", 42, 0, "history sync stopped at 42% (last chunk 2026-11-21 09:00:00 UTC)"},
-		{"2026-11-19 09:00:00", 42, 0, ""}, // long stale: no longer mentioned
-		{"2026-11-21 10:04:30", 100, 1, ""},
+		{"2026-11-21 09:00:00", 100, 1, ""}, // quiet and complete
+		{"2026-11-19 09:00:00", 42, 0, ""},  // long stale: no longer mentioned
 	} {
 		writeSyncRow(t, path, c.last, c.progress, c.done)
 		n := historyNote(ctx, db)

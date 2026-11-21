@@ -200,15 +200,19 @@ func Run(ctx context.Context, root string) error {
 	bound := make(chan struct{})
 	applyHistory := func(data *waHistorySync.HistorySync) {
 		<-bound
+		record := func(progress uint32, inserted int) {
+			if err := w.RecordHistoryChunk(context.Background(), progress, inserted, time.Now()); err != nil {
+				logf("history sync: status: ERROR %v", err)
+			}
+		}
 		st := storeHistory(context.Background(), w, hints, data, client.ParseWebMessage,
 			func(evt *events.Message) (bool, error) {
 				outcome, err := applyMsg(evt, 0)
 				logMessage(evt, " src=history"+outcome)
 				return strings.HasPrefix(outcome, " write=insert"), err
-			})
-		if err := w.RecordHistoryChunk(context.Background(), data.GetSyncType(), data.GetProgress(), st.Inserted, time.Now()); err != nil {
-			logf("history sync: status: ERROR %v", err)
-		}
+			},
+			func() { record(0, 0) })
+		record(data.GetProgress(), st.Inserted)
 		if st.PushNames > 0 {
 			logf("history sync: push names: %d received, %d stored or updated", st.PushNames, st.PushNamesStored)
 		}
@@ -318,6 +322,10 @@ func Run(ctx context.Context, root string) error {
 				logf("could not unlink the mismatched device: %v", lerr)
 			}
 			return err
+		}
+		// A new pairing means a new history sync.
+		if err := w.ResetHistorySync(ctx, time.Now()); err != nil {
+			logf("history sync: status: ERROR %v", err)
 		}
 		close(bound)
 	} else {

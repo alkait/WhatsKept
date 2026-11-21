@@ -100,18 +100,18 @@ func (h *historyHints) name(jid types.JID) (string, bool) {
 // message that can't be parsed is counted, not fatal.
 func historyEvents(data *waHistorySync.HistorySync,
 	parse func(types.JID, *waWeb.WebMessageInfo) (*events.Message, error),
-	onBad func(chat string, err error)) []*events.Message {
+	onBad func(chat string, msg *waWeb.WebMessageInfo, err error)) []*events.Message {
 	var out []*events.Message
 	for _, conv := range data.GetConversations() {
 		chat, err := types.ParseJID(conv.GetID())
 		if err != nil {
-			onBad(conv.GetID(), err)
+			onBad(conv.GetID(), nil, err)
 			continue
 		}
 		for _, hm := range conv.GetMessages() {
 			evt, err := parse(chat, hm.GetMessage())
 			if err != nil {
-				onBad(conv.GetID(), err)
+				onBad(conv.GetID(), hm.GetMessage(), err)
 				continue
 			}
 			out = append(out, evt)
@@ -126,14 +126,25 @@ type historyStats struct {
 	PushNames, PushNamesStored                       int
 }
 
+// touchEvery is how often, in messages, storeHistory calls touch while
+// it works through a chunk: a chunk with many attachments takes minutes,
+// and the status must not look stalled meanwhile.
+const touchEvery = 100
+
 // storeHistory applies one chunk: identities first (so the chunk's own
 // messages resolve against them), then push names, then every message
 // through apply — in live, the same applyMsg real-time messages take.
-// apply reports whether the message was inserted.
+// apply reports whether the message was inserted. touch (may be nil) is
+// called on arrival and every touchEvery messages, to mark the sync as
+// still active.
 func storeHistory(ctx context.Context, w *Writer, hints *historyHints, data *waHistorySync.HistorySync,
 	parse func(types.JID, *waWeb.WebMessageInfo) (*events.Message, error),
-	apply func(*events.Message) (bool, error)) historyStats {
+	apply func(*events.Message) (bool, error), touch func()) historyStats {
 	var st historyStats
+	if touch == nil {
+		touch = func() {}
+	}
+	touch()
 	hints.absorb(data)
 	if names := data.GetPushnames(); len(names) > 0 {
 		st.PushNames = len(names)
@@ -143,12 +154,18 @@ func storeHistory(ctx context.Context, w *Writer, hints *historyHints, data *waH
 		}
 		st.PushNamesStored = n
 	}
-	evts := historyEvents(data, parse, func(chat string, err error) {
+	evts := historyEvents(data, parse, func(chat string, msg *waWeb.WebMessageInfo, err error) {
 		st.Unparseable++
-		logf("history sync: unparseable message in %s: %v", chat, err)
+		// What the message was, so a failure can be told apart from a
+		// system event that carries nothing to store anyway.
+		logf("history sync: unparseable message in %s: %v stub=%s fields=%s",
+			chat, err, msg.GetMessageStubType(), messageFields(msg.GetMessage()))
 	})
 	st.Messages = len(evts) + st.Unparseable
-	for _, evt := range evts {
+	for i, evt := range evts {
+		if i > 0 && i%touchEvery == 0 {
+			touch()
+		}
 		inserted, err := apply(evt)
 		switch {
 		case err != nil:
@@ -215,13 +232,50 @@ func (w *Writer) PutPushNames(ctx context.Context, names []*waHistorySync.Pushna
 	return changed, tx.Commit()
 }
 
-// RecordHistoryChunk keeps the one-row wa_history_sync status table
-// current, so the MCP server (which only reads the database) can tell
-// its client a sync is under way. An INITIAL_BOOTSTRAP chunk opens a
-// new sync — a re-pair — and resets the row. progress is the phone's
-// own percentage; chunks that carry none leave it alone.
-func (w *Writer) RecordHistoryChunk(ctx context.Context, kind waHistorySync.HistorySync_HistorySyncType,
-	progress uint32, inserted int, at time.Time) error {
+// The one-row wa_history_sync status table lets the MCP server (which
+// only reads the database) tell its client a sync is under way.
+const historySyncDDL = `CREATE TABLE IF NOT EXISTS wa_history_sync (
+	id            INTEGER PRIMARY KEY CHECK (id = 1),
+	started_at    TEXT,    -- UTC, when this pairing's sync began
+	last_chunk_at TEXT,    -- UTC, last sign of activity (chunk arrived or in progress)
+	progress      INTEGER, -- 0–100, the last percentage the phone reported
+	inserted      INTEGER, -- messages added by this sync
+	done          INTEGER  -- 1 once that percentage reached 100
+)`
+
+// ResetHistorySync opens the status for a new pairing: whatever an
+// earlier pairing's sync recorded no longer describes what is arriving.
+func (w *Writer) ResetHistorySync(ctx context.Context, at time.Time) error {
+	return w.historyStatus(ctx, func(db *sql.DB) error {
+		ts := at.UTC().Format("2006-01-02 15:04:05")
+		_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO wa_history_sync
+			(id, started_at, last_chunk_at, progress, inserted, done) VALUES (1, ?, ?, 0, 0, 0)`, ts, ts)
+		return err
+	})
+}
+
+// RecordHistoryChunk marks the sync active at `at`, adds `inserted`
+// messages, and takes the phone's percentage when it carries one. The
+// phone's percentage is per chunk type — a bootstrap chunk can say 100
+// with more chunks still to come — so `done` is only a hint; recent
+// activity is what says a sync is still arriving.
+func (w *Writer) RecordHistoryChunk(ctx context.Context, progress uint32, inserted int, at time.Time) error {
+	return w.historyStatus(ctx, func(db *sql.DB) error {
+		ts := at.UTC().Format("2006-01-02 15:04:05")
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO wa_history_sync (id, started_at, last_chunk_at, progress, inserted, done)
+			VALUES (1, :ts, :ts, :p, :n, :p >= 100)
+			ON CONFLICT (id) DO UPDATE SET
+				last_chunk_at = :ts,
+				progress      = CASE WHEN :p > 0 THEN :p ELSE progress END,
+				inserted      = inserted + :n,
+				done          = (CASE WHEN :p > 0 THEN :p ELSE progress END) >= 100`,
+			sql.Named("ts", ts), sql.Named("p", int64(progress)), sql.Named("n", inserted))
+		return err
+	})
+}
+
+func (w *Writer) historyStatus(ctx context.Context, fn func(*sql.DB) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	db, err := openRW(w.dbPath)
@@ -229,30 +283,8 @@ func (w *Writer) RecordHistoryChunk(ctx context.Context, kind waHistorySync.Hist
 		return err
 	}
 	defer db.Close()
-	if _, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS wa_history_sync (
-		id            INTEGER PRIMARY KEY CHECK (id = 1),
-		started_at    TEXT,    -- UTC, first chunk of this sync
-		last_chunk_at TEXT,    -- UTC, most recent chunk
-		progress      INTEGER, -- 0–100, as the phone reports it
-		inserted      INTEGER, -- messages added by this sync
-		done          INTEGER  -- 1 once progress reached 100
-	)`); err != nil {
+	if _, err := db.ExecContext(ctx, historySyncDDL); err != nil {
 		return fmt.Errorf("create wa_history_sync: %w", err)
 	}
-	ts := at.UTC().Format("2006-01-02 15:04:05")
-	if kind == waHistorySync.HistorySync_INITIAL_BOOTSTRAP {
-		if _, err := db.ExecContext(ctx, `DELETE FROM wa_history_sync`); err != nil {
-			return err
-		}
-	}
-	_, err = db.ExecContext(ctx, `
-		INSERT INTO wa_history_sync (id, started_at, last_chunk_at, progress, inserted, done)
-		VALUES (1, :ts, :ts, :p, :n, :p >= 100)
-		ON CONFLICT (id) DO UPDATE SET
-			last_chunk_at = :ts,
-			progress      = CASE WHEN :p > 0 THEN :p ELSE progress END,
-			inserted      = inserted + :n,
-			done          = (CASE WHEN :p > 0 THEN :p ELSE progress END) >= 100`,
-		sql.Named("ts", ts), sql.Named("p", int64(progress)), sql.Named("n", inserted))
-	return err
+	return fn(db)
 }
