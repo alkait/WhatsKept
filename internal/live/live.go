@@ -25,13 +25,11 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
-	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
-	"google.golang.org/protobuf/proto"
 
 	"whatskept/internal/backup"
 	"whatskept/internal/workspace"
@@ -50,10 +48,6 @@ func Run(ctx context.Context, root string) error {
 	// The name shown in WhatsApp → Linked Devices. Stable on purpose —
 	// a changing name looks like a new device each time.
 	store.SetOSInfo("whatskept", [3]uint32{0, 1, 0})
-	// Ask for the full history at pairing, not just the recent slice.
-	// Read only during the pairing handshake; the phone decides how much
-	// it actually sends.
-	store.DeviceProps.RequireFullSync = proto.Bool(true)
 
 	sessionPath := workspace.SessionDBPath(root)
 	dsn := fmt.Sprintf("file:%s?_foreign_keys=on&_busy_timeout=5000", sessionPath)
@@ -84,9 +78,6 @@ func Run(ctx context.Context, root string) error {
 		writeErrs atomic.Int64
 	)
 
-	// What history-sync chunks say about identities (see history.go).
-	hints := newHistoryHints()
-
 	// Import usually seeds the database; a workspace going straight to
 	// live without a backup starts from an empty one instead. A later
 	// import replaces it with the phone's full history as usual.
@@ -112,9 +103,6 @@ func Run(ctx context.Context, root string) error {
 			return types.JID{}
 		},
 		resolvePN: func(ctx context.Context, lid types.JID) (types.JID, bool) {
-			if pn, ok := hints.phoneFor(lid); ok {
-				return pn, true
-			}
 			pn, err := client.Store.LIDs.GetPNForLID(ctx, lid)
 			return pn, err == nil && !pn.IsEmpty()
 		},
@@ -126,7 +114,6 @@ func Run(ctx context.Context, root string) error {
 			}
 			return info.Name, info.Name != ""
 		},
-		knownName: hints.name,
 		// Attachments are fetched on receipt: WhatsApp's CDN blobs
 		// expire, so there is no second chance at these bytes short of
 		// the next backup. `downloadable` has the same method set as
@@ -168,9 +155,6 @@ func Run(ctx context.Context, root string) error {
 				// model call.
 				enr.Nudge()
 			}
-			if res.MediaNote != "" {
-				s += " file=none(" + res.MediaNote + ")"
-			}
 			if res.NewChat {
 				// Worth seeing: a new session per message would mean
 				// chat resolution is forking threads.
@@ -190,35 +174,6 @@ func Run(ctx context.Context, root string) error {
 			skipped.Add(1)
 			return " write=skip(" + res.Reason + ")", nil
 		}
-	}
-
-	// applyHistory stores one history-sync chunk. It runs on whatsmeow's
-	// history goroutine, so real-time messages keep flowing meanwhile;
-	// the writer's lock interleaves the two. It waits for the account
-	// check: history from a phone that turns out to be the wrong account
-	// must never reach the database.
-	bound := make(chan struct{})
-	applyHistory := func(data *waHistorySync.HistorySync) {
-		<-bound
-		record := func(progress uint32, inserted int) {
-			if err := w.RecordHistoryChunk(context.Background(), progress, inserted, time.Now()); err != nil {
-				logf("history sync: status: ERROR %v", err)
-			}
-		}
-		st := storeHistory(context.Background(), w, hints, data, client.ParseWebMessage,
-			func(evt *events.Message) (bool, error) {
-				outcome, err := applyMsg(evt, 0)
-				logMessage(evt, " src=history"+outcome)
-				return strings.HasPrefix(outcome, " write=insert"), err
-			},
-			func() { record(0, 0) })
-		record(data.GetProgress(), st.Inserted)
-		if st.PushNames > 0 {
-			logf("history sync: push names: %d received, %d stored or updated", st.PushNames, st.PushNamesStored)
-		}
-		logf("history sync: type=%s chunk=%d progress=%d%% conversations=%d messages=%d | inserted=%d skipped=%d unparseable=%d errors=%d",
-			data.GetSyncType(), data.GetChunkOrder(), data.GetProgress(), len(data.GetConversations()),
-			st.Messages, st.Inserted, st.Skipped, st.Unparseable, st.Errors)
 	}
 
 	// Auto-reconnect is on by default; the hook makes failures visible
@@ -302,7 +257,14 @@ func Run(ctx context.Context, root string) error {
 		case *events.PairError:
 			logf("pair error: id=%s: %v", v.ID, v.Error)
 		case *events.HistorySync:
-			applyHistory(v.Data)
+			// History comes from backups via import; linking backfill is
+			// counted for visibility but not stored.
+			n := 0
+			for _, conv := range v.Data.GetConversations() {
+				n += len(conv.GetMessages())
+			}
+			logf("history sync: type=%s conversations=%d messages=%d (not stored — import owns history)",
+				v.Data.GetSyncType(), len(v.Data.GetConversations()), n)
 		}
 	})
 
@@ -323,17 +285,11 @@ func Run(ctx context.Context, root string) error {
 			}
 			return err
 		}
-		// A new pairing means a new history sync.
-		if err := w.ResetHistorySync(ctx, time.Now()); err != nil {
-			logf("history sync: status: ERROR %v", err)
-		}
-		close(bound)
 	} else {
 		// Verify the stored session before spending a connect on it.
 		if err := bindNumber(root, &s, client.Store.ID.User); err != nil {
 			return fmt.Errorf("%w (the session at %s belongs to a different account — delete it to re-pair)", err, sessionPath)
 		}
-		close(bound)
 		logf("existing session for %s — connecting", client.Store.ID)
 		if err := client.Connect(); err != nil {
 			return fmt.Errorf("connect: %w", err)

@@ -157,10 +157,8 @@ Then look at `settings.json` and the files, and pick the path:
    - **Import an encrypted iOS backup** (below) — the full history,
      years of it, then live keeps it current.
    - **Skip the backup and go straight to live** (see "Capturing
-     live") — `live` creates an empty database and stores whatever
-     history the phone sends when it is paired (often months, never
-     media WhatsApp's servers have dropped), then every new message.
-     Right when
+     live") — `live` creates an empty database and history starts
+     from the moment it links; nothing older is captured. Right when
      there is no iPhone backup to hand (Android, no Mac/PC, no time).
      An import from the same account can still be added later; it
      replaces the live-only history, which the backup contains too.
@@ -203,12 +201,9 @@ was never set up; offer it once the database exists.
    Check the backup's date. If it is more than 24 hours old, suggest
    taking a fresh backup first, and explain why: an import carries
    only what the backup contains, so everything sent since that date
-   stays missing until a newer backup is imported. Pairing live
-   (below) after the import fills part of that gap — the phone sends
-   recent history at pairing, and what the backup already holds is
-   skipped — but only at pairing: an already-linked live doesn't
-   receive it again, and media too old for WhatsApp's servers is
-   stored without its file.
+   stays missing until a newer backup is imported — live capture
+   (below) only covers from the moment it links onward, so the gap
+   between an old backup and today never fills itself.
 
 2. The import reads `WHATSKEPT_BACKUP_PASSWORD` (the iOS backup
    password) from its environment. If `.env` already defines it,
@@ -310,20 +305,7 @@ account is refused). The session persists in `.whatskept/session.db`;
 later runs reconnect without a QR. Run it in the background: it logs
 every message it writes and a 15-minute heartbeat with queue counts.
 In a workspace with no `ChatStorage.sqlite` yet, live creates an empty
-one and says so.
-
-Right after a QR pairing the phone sends a **history sync**: recent
-history (often months — the phone decides how much), in chunks over
-several minutes. Live stores it through the same path as new
-messages, logged with `src=history`, plus one `history sync:` line per
-chunk with its progress. Messages already in the database (from an
-import) are skipped, so pairing after an import fills the gap between
-the backup and now. It arrives **only at pairing**: to get it for a
-workspace whose live is already linked, delete `.whatskept/session.db`
-and pair again. If live stops mid-sync, the remaining chunks are lost
-until the next pairing — never duplicated. Attachments WhatsApp's
-servers no longer hold are stored as messages without files (caption
-and filename stay searchable).
+one and says so; nothing from before the link is captured.
 
 Before starting live — here or on a host — ask the user which mode
 they want; don't silently default to either:
@@ -332,9 +314,7 @@ they want; don't silently default to either:
   `whatskept enrich` run. The right suggestion when the user has no
   preference — nothing is lost, media just waits.
 - **Enrich-as-it-goes** (paid): live runs with `OPENROUTER_API_KEY`
-  in its environment and enriches **its own captures** on arrival —
-  including the history sync's media right after a pairing, which
-  can be hundreds or thousands of files. Say so when asking.
+  in its environment and enriches **its own captures** on arrival.
   Choosing this answer IS the go-ahead the paid-path rule requires.
 
 Either way, live never touches queued files from import or earlier
