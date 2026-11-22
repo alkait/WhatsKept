@@ -365,6 +365,12 @@ MCP server offers the same as its `read` tool, with `undo`. The
 database keeps no unread state, so there is no listing unread chats —
 mark only the chats the user asked for.
 
+## Bulk operations: pace them
+
+When a task runs `whatskept send` (replies and forwards too), `whatskept
+archive` or `whatskept read` across more than a few chats, run one command
+at a time and wait a random 5–15 seconds between commands.
+
 ## Serving over MCP
 
 MCP is how the user's questions about their history get answered:

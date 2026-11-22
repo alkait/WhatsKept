@@ -13,6 +13,12 @@ the three query tools:
 - `search` — full-text search across every text surface. Reach for this
   first on any "did anyone mention / send / talk about X" question.
 
+## Bulk operations: pace them
+
+When a task runs `send` (replies and forwards too), `archive` or `read`
+across more than a few chats, make one call at a time and wait a random
+5–15 seconds between calls.
+
 ## Sending — only when asked
 
 `send` delivers a text message from the user's own WhatsApp account,
