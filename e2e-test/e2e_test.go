@@ -667,3 +667,32 @@ func TestArchiveSent(t *testing.T) {
 		t.Errorf("after unarchive: ZARCHIVED = %d, want 0", v)
 	}
 }
+
+// TestReadSent marks the tester's chat in the workspace account unread
+// with `whatskept read --undo`, then read again, through the running
+// live. Exit 0 means WhatsApp accepted each app-state change; the
+// database keeps no unread state, and whether the phone's badge follows
+// is beyond what the tester number can see. Ending on read leaves the
+// chat as an incoming e2e message would want it.
+func TestReadSent(t *testing.T) {
+	cfg := loadConfig(t)
+	stanza, _ := sendText(t, cfg, "read-me")
+	bin := buildWhatskept(t)
+	db := openWorkspaceDB(t, cfg)
+	pk := waitForRow(t, db, stanza)
+
+	var testerChat string
+	if err := db.QueryRow(`SELECT cs.ZCONTACTJID FROM ZWAMESSAGE m
+		JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION WHERE m.Z_PK = ?`, pk).Scan(&testerChat); err != nil {
+		t.Fatal(err)
+	}
+
+	out := whatskept(t, cfg, bin, "read", testerChat, "--undo")
+	if !strings.HasPrefix(out, "marked unread chat=") {
+		t.Fatalf("unread output = %q", out)
+	}
+	out = whatskept(t, cfg, bin, "read", testerChat)
+	if !strings.HasPrefix(out, "marked read chat=") {
+		t.Fatalf("read output = %q", out)
+	}
+}

@@ -3,8 +3,8 @@ package live
 // Sending. The linked session allows one connection and `whatskept
 // live` owns it, so nothing else can put a message on the wire: `send`
 // and the MCP send tool hand the text to the running live process over
-// a loopback HTTP endpoint — as do `archive` and the MCP archive tool,
-// with an archive change. The address and a random token are
+// a loopback HTTP endpoint — as do `archive` and `read` and their MCP
+// tools, with an archive or read change. The address and a random token are
 // advertised in .whatskept/live.json while live runs — the token is
 // the credential, because any local process can reach a loopback port.
 //
@@ -77,13 +77,25 @@ type archiveReply struct {
 	Error string `json:"error,omitempty"`
 }
 
-// archiver is what the endpoint archives a chat with: find it in the
-// database, put the change on the wire, record it. The wire half is
-// injected so the endpoint is testable without a WhatsApp connection.
-type archiver struct {
-	target func(ctx context.Context, to types.JID) (archiveTarget, error)
-	wire   func(ctx context.Context, t archiveTarget, archive bool) error
-	record func(ctx context.Context, t archiveTarget, archive bool) error
+type readRequest struct {
+	Chat string `json:"chat"`
+	Read bool   `json:"read"` // false marks the chat unread
+}
+
+type readReply struct {
+	MarkedRead
+	Error string `json:"error,omitempty"`
+}
+
+// chatOps is what the endpoint changes a chat's app state with: find it
+// in the database, put the archive or read change on the wire, record
+// an archive change. The wire halves are injected so the endpoint is
+// testable without a WhatsApp connection.
+type chatOps struct {
+	target  func(ctx context.Context, to types.JID) (archiveTarget, error)
+	archive func(ctx context.Context, t archiveTarget, archive bool) error
+	record  func(ctx context.Context, t archiveTarget, archive bool) error
+	read    func(ctx context.Context, t archiveTarget, read bool) error
 }
 
 type endpoint struct {
@@ -142,7 +154,7 @@ type recordFunc func(v *events.Message, forwardOf int64) error
 // startSend serves the send endpoint for the workspace at root and
 // advertises it in .whatskept/live.json. The returned stop closes the
 // listener and removes the advertisement.
-func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceFunc, fetch fetchFunc, record recordFunc, arch archiver) (stop func(), err error) {
+func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceFunc, fetch fetchFunc, record recordFunc, ops chatOps) (stop func(), err error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, err
@@ -237,21 +249,51 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), sendTimeout)
 		defer cancel()
-		t, err := arch.target(ctx, to)
+		t, err := ops.target(ctx, to)
 		if err != nil {
 			reply(http.StatusBadRequest, archiveReply{Error: "cannot " + verb + ": " + err.Error()})
 			return
 		}
-		if err := arch.wire(ctx, t, req.Archive); err != nil {
+		if err := ops.archive(ctx, t, req.Archive); err != nil {
 			logf("%s %s FAILED: %v", verb, t.JID, err)
 			reply(http.StatusBadGateway, archiveReply{Error: verb + " failed: " + err.Error()})
 			return
 		}
 		out := archiveReply{Archived: Archived{Chat: t.JID.String(), Archived: req.Archive}}
-		if err := arch.record(ctx, t, req.Archive); err != nil {
+		if err := ops.record(ctx, t, req.Archive); err != nil {
 			out.Warning = "changed on WhatsApp, but not recorded in the database: " + err.Error()
 		}
 		reply(http.StatusOK, out)
+	})
+	mux.HandleFunc("POST /"+token+"/read", func(rw http.ResponseWriter, r *http.Request) {
+		reply := func(status int, v readReply) { writeJSON(rw, status, v) }
+		var req readRequest
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 1<<20)).Decode(&req); err != nil {
+			reply(http.StatusBadRequest, readReply{Error: "bad request: " + err.Error()})
+			return
+		}
+		verb := "mark unread"
+		if req.Read {
+			verb = "mark read"
+		}
+		to, err := ParseChat(req.Chat)
+		if err != nil {
+			reply(http.StatusBadRequest, readReply{Error: err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), sendTimeout)
+		defer cancel()
+		t, err := ops.target(ctx, to)
+		if err != nil {
+			reply(http.StatusBadRequest, readReply{Error: "cannot " + verb + ": " + err.Error()})
+			return
+		}
+		if err := ops.read(ctx, t, req.Read); err != nil {
+			logf("%s %s FAILED: %v", verb, t.JID, err)
+			reply(http.StatusBadGateway, readReply{Error: verb + " failed: " + err.Error()})
+			return
+		}
+		reply(http.StatusOK, readReply{MarkedRead: MarkedRead{Chat: t.JID.String(), Read: req.Read}})
 	})
 
 	data, err := json.Marshal(endpoint{Addr: ln.Addr().String(), Token: token})
@@ -306,18 +348,20 @@ func StartFakeSend(root string) (stop func(), err error) {
 			_, err := w.Apply(context.Background(), forwardPlan(decide(v, nil), forwardOf))
 			return err
 		},
-		w.archiver(func(context.Context, archiveTarget, bool) error { return nil }))
+		w.chatOps(func(context.Context, archiveTarget, bool) error { return nil },
+			func(context.Context, archiveTarget, bool) error { return nil }))
 }
 
-// archiver is the endpoint's archiver over this writer, with wire
-// putting the change on WhatsApp.
-func (w *Writer) archiver(wire func(context.Context, archiveTarget, bool) error) archiver {
-	return archiver{
-		target: w.archiveTarget,
-		wire:   wire,
+// chatOps is the endpoint's chatOps over this writer, with archive and
+// read putting each change on WhatsApp.
+func (w *Writer) chatOps(archive, read func(context.Context, archiveTarget, bool) error) chatOps {
+	return chatOps{
+		target:  w.archiveTarget,
+		archive: archive,
 		record: func(ctx context.Context, t archiveTarget, archive bool) error {
 			return w.recordArchived(ctx, t.PK, archive)
 		},
+		read: read,
 	}
 }
 
@@ -342,6 +386,14 @@ func Forward(ctx context.Context, root, to, stanzaID string) (Sent, error) {
 func Archive(ctx context.Context, root, to string, archive bool) (Archived, error) {
 	r, err := post[archiveReply](ctx, root, "archive", archiveRequest{Chat: to, Archive: archive})
 	return r.Archived, err
+}
+
+// MarkRead asks the running live to mark chat `to` (see ParseChat) as
+// read, or with read false as unread, on the user's own devices. No
+// read receipts are sent. The chat must be one the database holds.
+func MarkRead(ctx context.Context, root, to string, read bool) (MarkedRead, error) {
+	r, err := post[readReply](ctx, root, "read", readRequest{Chat: to, Read: read})
+	return r.MarkedRead, err
 }
 
 // post hands one request to the live process running in the workspace
@@ -393,3 +445,4 @@ func post[R interface{ errText() string }](ctx context.Context, root, op string,
 
 func (r sendReply) errText() string    { return r.Error }
 func (r archiveReply) errText() string { return r.Error }
+func (r readReply) errText() string    { return r.Error }

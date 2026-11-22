@@ -26,6 +26,8 @@ Usage:
                                      forward a message (text, image, voice note, document) to a chat
   whatskept archive <chat>           archive a chat through the running live
                                      [--undo] unarchives it instead
+  whatskept read <chat>              mark a chat as read through the running live (no read receipts)
+                                     [--undo] marks it unread instead
   whatskept mcp --database <file>    serve a database file over MCP (HTTP) [--addr host:port]
                                      [--stdio] serves over stdin/stdout instead (no token)
   whatskept -v | --version           show the version
@@ -109,6 +111,20 @@ func main() {
 			os.Exit(2)
 		}
 		if err := runArchive(os.Args[2], undo); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "read":
+		var undo bool
+		switch {
+		case len(os.Args) == 3 && os.Args[2] != "--undo":
+		case len(os.Args) == 4 && os.Args[2] != "--undo" && os.Args[3] == "--undo":
+			undo = true
+		default:
+			fmt.Fprint(os.Stderr, "read requires a chat (phone number or JID), then optionally --undo to mark it unread\n\n"+usage)
+			os.Exit(2)
+		}
+		if err := runRead(os.Args[2], undo); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}

@@ -34,6 +34,20 @@ type fakeWire struct {
 	archiveErr error
 	archived   []archiveTarget
 	archives   []bool
+
+	// read stand-in: the read changes it was asked to make, or readErr.
+	readErr error
+	readOf  []archiveTarget
+	reads   []bool
+}
+
+func (f *fakeWire) read(_ context.Context, t archiveTarget, read bool) error {
+	if f.readErr != nil {
+		return f.readErr
+	}
+	f.readOf = append(f.readOf, t)
+	f.reads = append(f.reads, read)
+	return nil
 }
 
 func (f *fakeWire) archive(_ context.Context, t archiveTarget, archive bool) error {
@@ -78,7 +92,7 @@ func sendFixture(t *testing.T) (*Writer, string, *fakeWire) {
 			_, err := w.Apply(context.Background(), forwardPlan(decide(v, nil), forwardOf))
 			return err
 		},
-		w.archiver(wire.archive))
+		w.chatOps(wire.archive, wire.read))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +342,7 @@ func TestSendRecordFailureWarns(t *testing.T) {
 	wire := &fakeWire{}
 	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error {
 		return errors.New("database is locked")
-	}, archiver{})
+	}, chatOps{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +393,7 @@ func TestSendEndpointLifecycle(t *testing.T) {
 	}
 
 	wire := &fakeWire{}
-	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil }, archiver{})
+	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil }, chatOps{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -499,6 +499,47 @@ func TestArchiveWithoutLive(t *testing.T) {
 	}
 }
 
+func TestRead(t *testing.T) {
+	path := writeSendWorkspace(t)
+	stop, err := live.StartFakeSend(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	sess := connect(t, path)
+
+	var got live.MarkedRead
+	if res := call(t, sess, "read", map[string]any{"chat": "+971501111111"}, &got); res.IsError {
+		t.Fatalf("read: %s", errText(res))
+	}
+	if got != (live.MarkedRead{Chat: "971501111111@s.whatsapp.net", Read: true}) {
+		t.Errorf("read = %+v", got)
+	}
+	if res := call(t, sess, "read", map[string]any{"chat": "971501111111@s.whatsapp.net", "undo": true}, &got); res.IsError {
+		t.Fatalf("unread: %s", errText(res))
+	}
+	if got.Read {
+		t.Errorf("unread = %+v", got)
+	}
+
+	res := call(t, sess, "read", map[string]any{"chat": "+971509999999"}, nil)
+	if !res.IsError || !strings.Contains(errText(res), "is not in the database") {
+		t.Errorf("unknown chat: want an error, got %q", errText(res))
+	}
+	res = call(t, sess, "read", map[string]any{"chat": "Sarah"}, nil)
+	if !res.IsError || !strings.Contains(errText(res), "invalid chat") {
+		t.Errorf("bad chat: want an error, got %q", errText(res))
+	}
+}
+
+func TestReadWithoutLive(t *testing.T) {
+	sess := connect(t, writeSendWorkspace(t))
+	res := call(t, sess, "read", map[string]any{"chat": "+971501111111"}, nil)
+	if !res.IsError || !strings.Contains(errText(res), "`whatskept live` is not running") {
+		t.Errorf("want not-running error, got %q", errText(res))
+	}
+}
+
 // Without live there is nobody to send: the tool says so, and the
 // query tools carry on.
 func TestSendWithoutLive(t *testing.T) {
@@ -589,7 +630,7 @@ func TestHTTPProtocolVersions(t *testing.T) {
 	if status != 200 || res["protocolVersion"] != "2025-06-18" {
 		t.Errorf("initialize: %d protocolVersion=%v", status, res["protocolVersion"])
 	}
-	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 5 {
+	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 6 {
 		t.Errorf("2025-06-18 tools/list: %d %v", status, toolNames(res))
 	}
 }

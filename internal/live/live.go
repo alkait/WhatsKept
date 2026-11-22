@@ -7,8 +7,8 @@
 // Deliberately silent on the wire: no presence, no read receipts, no
 // typing indicators. whatsmeow sends none of these unless asked, and
 // nothing here asks — the user's chats are never marked read behind
-// their back. The one thing live does send is a message or an archive
-// change it was explicitly handed (see send.go).
+// their back. The one thing live does send is a message, an archive
+// change or a read change it was explicitly handed (see send.go).
 package live
 
 import (
@@ -323,11 +323,21 @@ func Run(ctx context.Context, root string) error {
 	// Archive changes are handed over by `whatskept archive` and the
 	// MCP archive tool. whatsmeow fetches the collection back after
 	// sending, so the change also returns as an *events.Archive.
-	arch := w.archiver(func(ctx context.Context, t archiveTarget, archive bool) error {
-		return client.SendAppState(ctx, appstate.BuildArchive(t.JID, archive, t.LastTs, t.Last))
-	})
-	record := arch.record
-	arch.record = func(ctx context.Context, t archiveTarget, archive bool) error {
+	ops := w.chatOps(
+		func(ctx context.Context, t archiveTarget, archive bool) error {
+			return client.SendAppState(ctx, appstate.BuildArchive(t.JID, archive, t.LastTs, t.Last))
+		},
+		// Read changes come from `whatskept read` and the MCP read tool.
+		// An app-state patch only: no read receipts reach the sender.
+		func(ctx context.Context, t archiveTarget, read bool) error {
+			err := client.SendAppState(ctx, appstate.BuildMarkChatAsRead(t.JID, read, t.LastTs, t.Last))
+			if err == nil {
+				logf("read chat=%s read=%v: sent, chat=%d", t.JID, read, t.PK)
+			}
+			return err
+		})
+	record := ops.record
+	ops.record = func(ctx context.Context, t archiveTarget, archive bool) error {
 		err := record(ctx, t, archive)
 		if err != nil {
 			writeErrs.Add(1)
@@ -356,7 +366,7 @@ func Run(ctx context.Context, root string) error {
 			logMessage(v, outcome)
 			return err
 		},
-		arch)
+		ops)
 	if err != nil {
 		return err
 	}

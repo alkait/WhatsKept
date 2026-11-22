@@ -97,6 +97,9 @@ func TestCLILiveInUsage(t *testing.T) {
 	if !strings.Contains(stdout, "whatskept archive <chat>") {
 		t.Errorf("usage missing archive: %q", stdout)
 	}
+	if !strings.Contains(stdout, "whatskept read <chat>") {
+		t.Errorf("usage missing read: %q", stdout)
+	}
 }
 
 func TestCLIInit(t *testing.T) {
@@ -420,7 +423,7 @@ func TestCLIMCPStdio(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got, want := strings.Join(names, ","), "archive,get_schema,query,search,send"; got != want {
+	if got, want := strings.Join(names, ","), "archive,get_schema,query,read,search,send"; got != want {
 		t.Errorf("tools = %s, want %s", got, want)
 	}
 }
@@ -692,6 +695,58 @@ func TestCLIArchiveThroughLive(t *testing.T) {
 		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
 	code, _, stderr = run(t, dir, "archive", "Sarah")
+	if code != 1 || !strings.Contains(stderr, "invalid chat") {
+		t.Errorf("exit %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestCLIReadUsage(t *testing.T) {
+	for _, args := range [][]string{{"read"}, {"read", "--undo"}, {"read", "+971500000001", "extra"},
+		{"read", "+971500000001", "--undo", "extra"}, {"read", "--undo", "+971500000001"}} {
+		code, _, stderr := run(t, t.TempDir(), args...)
+		if code != 2 {
+			t.Errorf("%v: exit %d, want 2", args, code)
+		}
+		if !strings.Contains(stderr, "read requires") {
+			t.Errorf("%v: stderr = %q", args, stderr)
+		}
+	}
+}
+
+func TestCLIReadOutsideWorkspace(t *testing.T) {
+	code, _, stderr := run(t, t.TempDir(), "read", "+971500000001")
+	if code != 1 || !strings.Contains(stderr, "not a whatskept workspace") {
+		t.Errorf("exit %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestCLIReadLiveNotRunning(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init")
+	code, stdout, stderr := run(t, dir, "read", "+971500000001")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "`whatskept live` is not running") {
+		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+}
+
+func TestCLIReadThroughLive(t *testing.T) {
+	dir := sendWorkspace(t)
+	run(t, dir, "send", "+971500000001", "see you at 8") // the chat now exists
+
+	code, stdout, stderr := run(t, dir, "read", "+971 50 000 0001")
+	if code != 0 || stdout != "marked read chat=971500000001@s.whatsapp.net\n" || stderr != "" {
+		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	code, stdout, stderr = run(t, dir, "read", "971500000001@s.whatsapp.net", "--undo")
+	if code != 0 || stdout != "marked unread chat=971500000001@s.whatsapp.net\n" || stderr != "" {
+		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+
+	code, stdout, stderr = run(t, dir, "read", "+971500000002")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "cannot mark read: chat 971500000002@s.whatsapp.net is not in the database") {
+		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	code, _, stderr = run(t, dir, "read", "Sarah")
 	if code != 1 || !strings.Contains(stderr, "invalid chat") {
 		t.Errorf("exit %d, stderr = %q", code, stderr)
 	}

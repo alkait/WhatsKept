@@ -19,7 +19,7 @@ already knows.
 ./ChatStorage.sqlite         # the database — messages, chats, SQL views, FTS index
 ./.whatskept/settings.json   # portable workspace configuration (see below)
 ./.whatskept/session.db      # WhatsApp companion-device session (once `live` has linked)
-./.whatskept/live.json       # live's send/archive endpoint + token (only while `live` runs; a secret)
+./.whatskept/live.json       # live's send/archive/read endpoint + token (only while `live` runs; a secret)
 ./AGENTS.md                  # this guide (the source of truth)
 ./CLAUDE.md                  # one-line stub importing AGENTS.md
 ./MEMORY.md                  # your own notes across sessions (see below; may not exist yet)
@@ -351,6 +351,19 @@ WhatsApp has accepted the change. The MCP server offers the same as its
 but it reorders the user's chat list — archive only the chats the user
 asked for. Archiving or unarchiving on the phone shows up in
 `v_chats.archived` too while `live` runs.
+
+## Marking a chat read
+
+`whatskept read <chat>` marks a chat as read in the user's account —
+clearing its unread badge on their phone and every linked device —
+through the running `whatskept live`; `--undo` after the chat marks it
+unread. No read receipts are sent, so senders see no blue ticks.
+`<chat>` takes the same forms as for `send`, and must be a chat already
+in the database. It prints `marked read chat=…` (or `marked unread
+chat=…`) and exits 0 only once WhatsApp has accepted the change. The
+MCP server offers the same as its `read` tool, with `undo`. The
+database keeps no unread state, so there is no listing unread chats —
+mark only the chats the user asked for.
 
 ## Serving over MCP
 
