@@ -312,7 +312,10 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
 	go srv.Serve(ln)
 	return func() {
+		// Close the listener too: srv.Close misses it if Serve has not
+		// started yet, leaving the port accepting after stop returns.
 		srv.Close()
+		ln.Close()
 		os.Remove(path)
 	}, nil
 }
