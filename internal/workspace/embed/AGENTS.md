@@ -19,7 +19,7 @@ already knows.
 ./ChatStorage.sqlite         # the database — messages, chats, SQL views, FTS index
 ./.whatskept/settings.json   # portable workspace configuration (see below)
 ./.whatskept/session.db      # WhatsApp companion-device session (once `live` has linked)
-./.whatskept/live.json       # live's send endpoint + token (only while `live` runs; a secret)
+./.whatskept/live.json       # live's send/archive endpoint + token (only while `live` runs; a secret)
 ./AGENTS.md                  # this guide (the source of truth)
 ./CLAUDE.md                  # one-line stub importing AGENTS.md
 ./MEMORY.md                  # your own notes across sessions (see below; may not exist yet)
@@ -337,6 +337,20 @@ any chat instead — text, link, image, voice note or document, marked
 servers is re-uploaded by the user's phone first. The MCP server
 offers the same as its `send` tool, with `reply_to` and `forward`. Real people read these messages and they cannot be unsent — send
 only what the user explicitly asked for, to the chat they named.
+
+## Archiving a chat
+
+`whatskept archive <chat>` archives a chat in the user's account —
+on their phone and every linked device — through the running
+`whatskept live`, and records it in the database (`v_chats.archived`);
+`--undo` after the chat unarchives it. `<chat>` takes the same forms as
+for `send`, and must be a chat already in the database. It prints
+`archived chat=…` (or `unarchived chat=…`) and exits 0 only once
+WhatsApp has accepted the change. The MCP server offers the same as its
+`archive` tool, with `undo`. Nobody else sees it and it can be undone,
+but it reorders the user's chat list — archive only the chats the user
+asked for. Archiving or unarchiving on the phone shows up in
+`v_chats.archived` too while `live` runs.
 
 ## Serving over MCP
 

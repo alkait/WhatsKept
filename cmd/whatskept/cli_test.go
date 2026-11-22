@@ -94,6 +94,9 @@ func TestCLILiveInUsage(t *testing.T) {
 	if !strings.Contains(stdout, "whatskept live") {
 		t.Errorf("usage missing live: %q", stdout)
 	}
+	if !strings.Contains(stdout, "whatskept archive <chat>") {
+		t.Errorf("usage missing archive: %q", stdout)
+	}
 }
 
 func TestCLIInit(t *testing.T) {
@@ -417,7 +420,7 @@ func TestCLIMCPStdio(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got, want := strings.Join(names, ","), "get_schema,query,search,send"; got != want {
+	if got, want := strings.Join(names, ","), "archive,get_schema,query,search,send"; got != want {
 		t.Errorf("tools = %s, want %s", got, want)
 	}
 }
@@ -512,7 +515,7 @@ func sendWorkspace(t *testing.T) string {
 		CREATE TABLE ZWACHATSESSION (Z_PK INTEGER PRIMARY KEY, Z_ENT INTEGER, Z_OPT INTEGER,
 			ZSESSIONTYPE INTEGER, ZCONTACTJID TEXT, ZCONTACTIDENTIFIER TEXT,
 			ZPARTNERNAME TEXT, ZMESSAGECOUNTER INTEGER,
-			ZLASTMESSAGE INTEGER, ZLASTMESSAGEDATE REAL, ZLASTMESSAGETEXT TEXT);
+			ZLASTMESSAGE INTEGER, ZLASTMESSAGEDATE REAL, ZLASTMESSAGETEXT TEXT, ZARCHIVED INTEGER);
 		CREATE TABLE ZWAGROUPMEMBER (Z_PK INTEGER PRIMARY KEY, ZCHATSESSION INTEGER, ZMEMBERJID TEXT);
 		CREATE TABLE ZWAMEDIAITEM (Z_PK INTEGER PRIMARY KEY, ZMESSAGE INTEGER, ZMEDIALOCALPATH TEXT,
 			ZFILESIZE INTEGER, ZMOVIEDURATION INTEGER, ZAUTHORNAME TEXT, ZTITLE TEXT,
@@ -617,5 +620,79 @@ func TestCLISendRejectsBadChat(t *testing.T) {
 	}
 	if stdout != "" || !strings.Contains(stderr, "invalid chat") {
 		t.Errorf("stdout = %q, stderr = %q", stdout, stderr)
+	}
+}
+
+func TestCLIArchiveUsage(t *testing.T) {
+	for _, args := range [][]string{{"archive"}, {"archive", "--undo"}, {"archive", "+971500000001", "extra"},
+		{"archive", "+971500000001", "--undo", "extra"}, {"archive", "--undo", "+971500000001"}} {
+		code, _, stderr := run(t, t.TempDir(), args...)
+		if code != 2 {
+			t.Errorf("%v: exit %d, want 2", args, code)
+		}
+		if !strings.Contains(stderr, "archive requires") {
+			t.Errorf("%v: stderr = %q", args, stderr)
+		}
+	}
+}
+
+func TestCLIArchiveOutsideWorkspace(t *testing.T) {
+	code, _, stderr := run(t, t.TempDir(), "archive", "+971500000001")
+	if code != 1 || !strings.Contains(stderr, "not a whatskept workspace") {
+		t.Errorf("exit %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestCLIArchiveLiveNotRunning(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init")
+	code, stdout, stderr := run(t, dir, "archive", "+971500000001")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "`whatskept live` is not running") {
+		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+}
+
+func TestCLIArchiveThroughLive(t *testing.T) {
+	dir := sendWorkspace(t)
+	run(t, dir, "send", "+971500000001", "see you at 8") // the chat now exists
+	db, err := sql.Open("sqlite", filepath.Join(dir, backup.ChatStorageName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	archived := func() int {
+		t.Helper()
+		var v int
+		if err := db.QueryRow(`SELECT COALESCE(ZARCHIVED, -1) FROM ZWACHATSESSION
+			WHERE ZCONTACTJID = '971500000001@s.whatsapp.net'`).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	code, stdout, stderr := run(t, dir, "archive", "+971 50 000 0001")
+	if code != 0 || stdout != "archived chat=971500000001@s.whatsapp.net\n" || stderr != "" {
+		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	if v := archived(); v != 1 {
+		t.Errorf("ZARCHIVED = %d, want 1", v)
+	}
+
+	code, stdout, stderr = run(t, dir, "archive", "971500000001@s.whatsapp.net", "--undo")
+	if code != 0 || stdout != "unarchived chat=971500000001@s.whatsapp.net\n" || stderr != "" {
+		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	if v := archived(); v != 0 {
+		t.Errorf("ZARCHIVED = %d, want 0", v)
+	}
+
+	// Archiving never creates a chat.
+	code, stdout, stderr = run(t, dir, "archive", "+971500000002")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "cannot archive: chat 971500000002@s.whatsapp.net is not in the database") {
+		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	code, _, stderr = run(t, dir, "archive", "Sarah")
+	if code != 1 || !strings.Contains(stderr, "invalid chat") {
+		t.Errorf("exit %d, stderr = %q", code, stderr)
 	}
 }

@@ -358,6 +358,10 @@ type Writer struct {
 	// resolvePN maps a LID to a phone JID using whatsmeow's local
 	// mapping store. Used only when the event itself didn't carry one.
 	resolvePN func(context.Context, types.JID) (types.JID, bool)
+	// resolveLID is the reverse map, phone JID to LID, from the same
+	// store: an archive change addresses a DM by its LID, and may name
+	// a chat stored under either.
+	resolveLID func(context.Context, types.JID) (types.JID, bool)
 	// groupSubject fetches a group's real name. Only called when a
 	// group has to be created, i.e. it did not exist in the last
 	// backup — rare, and worth a round trip to avoid titling the
@@ -958,6 +962,32 @@ func (w *Writer) resolveChat(ctx context.Context, tx *sql.Tx, p plan) (int64, bo
 	return pk, true, err
 }
 
+// findChat is the lookup half of resolveChat, for a chat named by the
+// caller rather than by an event: the session of chat `to`, tried under
+// its phone JID and its LID, and never created.
+func (w *Writer) findChat(ctx context.Context, tx *sql.Tx, to types.JID) (int64, bool, error) {
+	if to.Server == types.GroupServer {
+		return lookupChat(ctx, tx, nullJID(to), sql.NullString{})
+	}
+	var phone, lid types.JID
+	if to.Server == types.HiddenUserServer {
+		lid = to
+		if w.resolvePN != nil {
+			if pn, ok := w.resolvePN(ctx, lid); ok {
+				phone = pn
+			}
+		}
+	} else {
+		phone = to
+		if w.resolveLID != nil {
+			if l, ok := w.resolveLID(ctx, phone); ok {
+				lid = l
+			}
+		}
+	}
+	return lookupChat(ctx, tx, nullJID(phone), nullJID(lid))
+}
+
 func lookupChat(ctx context.Context, tx *sql.Tx, phone, lid sql.NullString) (int64, bool, error) {
 	var pk int64
 	err := tx.QueryRowContext(ctx, `
@@ -1059,19 +1089,7 @@ func (w *Writer) quote(ctx context.Context, to types.JID, stanzaID string) (*waE
 		return nil, fmt.Errorf("message %s was deleted", stanzaID)
 	}
 
-	// The same phone/LID candidates resolveChat tries for a DM.
-	var phone, lid types.JID
-	if to.Server == types.HiddenUserServer {
-		lid = to
-		if w.resolvePN != nil {
-			if pn, ok := w.resolvePN(ctx, lid); ok {
-				phone = pn
-			}
-		}
-	} else {
-		phone = to
-	}
-	toPK, ok, err := lookupChat(ctx, tx, nullJID(phone), nullJID(lid))
+	toPK, ok, err := w.findChat(ctx, tx, to)
 	if err != nil {
 		return nil, err
 	}

@@ -3,7 +3,8 @@ package live
 // Sending. The linked session allows one connection and `whatskept
 // live` owns it, so nothing else can put a message on the wire: `send`
 // and the MCP send tool hand the text to the running live process over
-// a loopback HTTP endpoint. The address and a random token are
+// a loopback HTTP endpoint — as do `archive` and the MCP archive tool,
+// with an archive change. The address and a random token are
 // advertised in .whatskept/live.json while live runs — the token is
 // the credential, because any local process can reach a loopback port.
 //
@@ -66,6 +67,25 @@ type sendReply struct {
 	Error string `json:"error,omitempty"`
 }
 
+type archiveRequest struct {
+	Chat    string `json:"chat"`
+	Archive bool   `json:"archive"` // false unarchives
+}
+
+type archiveReply struct {
+	Archived
+	Error string `json:"error,omitempty"`
+}
+
+// archiver is what the endpoint archives a chat with: find it in the
+// database, put the change on the wire, record it. The wire half is
+// injected so the endpoint is testable without a WhatsApp connection.
+type archiver struct {
+	target func(ctx context.Context, to types.JID) (archiveTarget, error)
+	wire   func(ctx context.Context, t archiveTarget, archive bool) error
+	record func(ctx context.Context, t archiveTarget, archive bool) error
+}
+
 type endpoint struct {
 	Addr  string `json:"addr"`
 	Token string `json:"token"`
@@ -93,7 +113,7 @@ func ParseChat(s string) (types.JID, error) {
 		case types.DefaultUserServer, types.GroupServer, types.HiddenUserServer:
 			return jid.ToNonAD(), nil
 		}
-		return types.JID{}, fmt.Errorf("cannot send to %q — only chats (@%s, @%s, @%s)",
+		return types.JID{}, fmt.Errorf("%q is not a chat — want @%s, @%s or @%s",
 			s, types.DefaultUserServer, types.GroupServer, types.HiddenUserServer)
 	}
 	digits := strings.NewReplacer(" ", "", "-", "", "(", "", ")", "").Replace(strings.TrimPrefix(s, "+"))
@@ -122,7 +142,7 @@ type recordFunc func(v *events.Message, forwardOf int64) error
 // startSend serves the send endpoint for the workspace at root and
 // advertises it in .whatskept/live.json. The returned stop closes the
 // listener and removes the advertisement.
-func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceFunc, fetch fetchFunc, record recordFunc) (stop func(), err error) {
+func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceFunc, fetch fetchFunc, record recordFunc, arch archiver) (stop func(), err error) {
 	raw := make([]byte, 16)
 	if _, err := rand.Read(raw); err != nil {
 		return nil, err
@@ -136,11 +156,7 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /"+token+"/send", func(rw http.ResponseWriter, r *http.Request) {
-		reply := func(status int, v sendReply) {
-			rw.Header().Set("Content-Type", "application/json")
-			rw.WriteHeader(status)
-			json.NewEncoder(rw).Encode(v)
-		}
+		reply := func(status int, v sendReply) { writeJSON(rw, status, v) }
 		var req sendRequest
 		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 1<<20)).Decode(&req); err != nil {
 			reply(http.StatusBadRequest, sendReply{Error: "bad request: " + err.Error()})
@@ -203,6 +219,40 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 		}
 		reply(http.StatusOK, out)
 	})
+	mux.HandleFunc("POST /"+token+"/archive", func(rw http.ResponseWriter, r *http.Request) {
+		reply := func(status int, v archiveReply) { writeJSON(rw, status, v) }
+		var req archiveRequest
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 1<<20)).Decode(&req); err != nil {
+			reply(http.StatusBadRequest, archiveReply{Error: "bad request: " + err.Error()})
+			return
+		}
+		verb := "unarchive"
+		if req.Archive {
+			verb = "archive"
+		}
+		to, err := ParseChat(req.Chat)
+		if err != nil {
+			reply(http.StatusBadRequest, archiveReply{Error: err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), sendTimeout)
+		defer cancel()
+		t, err := arch.target(ctx, to)
+		if err != nil {
+			reply(http.StatusBadRequest, archiveReply{Error: "cannot " + verb + ": " + err.Error()})
+			return
+		}
+		if err := arch.wire(ctx, t, req.Archive); err != nil {
+			logf("%s %s FAILED: %v", verb, t.JID, err)
+			reply(http.StatusBadGateway, archiveReply{Error: verb + " failed: " + err.Error()})
+			return
+		}
+		out := archiveReply{Archived: Archived{Chat: t.JID.String(), Archived: req.Archive}}
+		if err := arch.record(ctx, t, req.Archive); err != nil {
+			out.Warning = "changed on WhatsApp, but not recorded in the database: " + err.Error()
+		}
+		reply(http.StatusOK, out)
+	})
 
 	data, err := json.Marshal(endpoint{Addr: ln.Addr().String(), Token: token})
 	if err != nil {
@@ -225,12 +275,18 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 	}, nil
 }
 
+func writeJSON(rw http.ResponseWriter, status int, v any) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	json.NewEncoder(rw).Encode(v)
+}
+
 // StartFakeSend runs the real send endpoint for root with a stand-in
 // for WhatsApp: nothing reaches the wire, stanza IDs are FAKE1, FAKE2…,
-// and messages are recorded in the workspace database as usual. A
-// forwarded attachment is taken as still on the CDN, with a fixed
-// plaintext hash. Test support for the packages that drive sends from
-// outside — the CLI and the MCP server.
+// and messages and archive changes are recorded in the workspace
+// database as usual. A forwarded attachment is taken as still on the
+// CDN, with a fixed plaintext hash. Test support for the packages that
+// drive sends from outside — the CLI and the MCP server.
 func StartFakeSend(root string) (stop func(), err error) {
 	w := &Writer{dbPath: filepath.Join(root, backup.ChatStorageName), root: root}
 	if err := w.EnsureReady(context.Background()); err != nil {
@@ -249,58 +305,91 @@ func StartFakeSend(root string) (stop func(), err error) {
 		func(v *events.Message, forwardOf int64) error {
 			_, err := w.Apply(context.Background(), forwardPlan(decide(v, nil), forwardOf))
 			return err
-		})
+		},
+		w.archiver(func(context.Context, archiveTarget, bool) error { return nil }))
+}
+
+// archiver is the endpoint's archiver over this writer, with wire
+// putting the change on WhatsApp.
+func (w *Writer) archiver(wire func(context.Context, archiveTarget, bool) error) archiver {
+	return archiver{
+		target: w.archiveTarget,
+		wire:   wire,
+		record: func(ctx context.Context, t archiveTarget, archive bool) error {
+			return w.recordArchived(ctx, t.PK, archive)
+		},
+	}
 }
 
 // Send asks the live process running in the workspace at root to send
 // text to a chat (see ParseChat for the accepted forms). A non-empty
 // replyTo is the stanza ID of a message in that chat to quote.
 func Send(ctx context.Context, root, to, text, replyTo string) (Sent, error) {
-	return post(ctx, root, sendRequest{To: to, Text: text, ReplyTo: replyTo})
+	r, err := post[sendReply](ctx, root, "send", sendRequest{To: to, Text: text, ReplyTo: replyTo})
+	return r.Sent, err
 }
 
 // Forward asks the running live to forward the message with the given
 // stanza ID, from any chat, to chat `to`.
 func Forward(ctx context.Context, root, to, stanzaID string) (Sent, error) {
-	return post(ctx, root, sendRequest{To: to, Forward: stanzaID})
+	r, err := post[sendReply](ctx, root, "send", sendRequest{To: to, Forward: stanzaID})
+	return r.Sent, err
 }
 
-func post(ctx context.Context, root string, r sendRequest) (Sent, error) {
+// Archive asks the running live to archive chat `to` (see ParseChat),
+// or with archive false to unarchive it. The chat must be one the
+// database holds.
+func Archive(ctx context.Context, root, to string, archive bool) (Archived, error) {
+	r, err := post[archiveReply](ctx, root, "archive", archiveRequest{Chat: to, Archive: archive})
+	return r.Archived, err
+}
+
+// post hands one request to the live process running in the workspace
+// at root and returns its reply. R is a reply type carrying Error.
+func post[R interface{ errText() string }](ctx context.Context, root, op string, r any) (R, error) {
+	var zero R
 	data, err := os.ReadFile(workspace.LiveEndpointPath(root))
 	if err != nil {
-		return Sent{}, ErrNotRunning
+		return zero, ErrNotRunning
 	}
 	var ep endpoint
 	if err := json.Unmarshal(data, &ep); err != nil {
-		return Sent{}, fmt.Errorf("parse %s: %w", workspace.LiveEndpointPath(root), err)
+		return zero, fmt.Errorf("parse %s: %w", workspace.LiveEndpointPath(root), err)
 	}
 	body, err := json.Marshal(r)
 	if err != nil {
-		return Sent{}, err
+		return zero, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"http://"+ep.Addr+"/"+ep.Token+"/send", bytes.NewReader(body))
+		"http://"+ep.Addr+"/"+ep.Token+"/"+op, bytes.NewReader(body))
 	if err != nil {
-		return Sent{}, err
+		return zero, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := &http.Client{Timeout: sendTimeout + 10*time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		// A refused dial is a live.json left behind by a crash.
-		var op *net.OpError
-		if errors.As(err, &op) && op.Op == "dial" {
-			return Sent{}, ErrNotRunning
+		var opErr *net.OpError
+		if errors.As(err, &opErr) && opErr.Op == "dial" {
+			return zero, ErrNotRunning
 		}
-		return Sent{}, err
+		return zero, err
 	}
 	defer resp.Body.Close()
-	var reply sendReply
+	var reply R
 	if err := json.NewDecoder(resp.Body).Decode(&reply); err != nil {
-		return Sent{}, fmt.Errorf("live answered %s", resp.Status)
+		if resp.StatusCode == http.StatusNotFound {
+			// A live started from a release that predates this request.
+			return zero, fmt.Errorf("the running `whatskept live` does not support %s — restart it with this release", op)
+		}
+		return zero, fmt.Errorf("live answered %s", resp.Status)
 	}
-	if reply.Error != "" {
-		return Sent{}, errors.New(reply.Error)
+	if msg := reply.errText(); msg != "" {
+		return zero, errors.New(msg)
 	}
-	return reply.Sent, nil
+	return reply, nil
 }
+
+func (r sendReply) errText() string    { return r.Error }
+func (r archiveReply) errText() string { return r.Error }

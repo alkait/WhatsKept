@@ -29,6 +29,20 @@ type fakeWire struct {
 	// or fetchErr.
 	fetchErr error
 	fetched  []string // stanza IDs
+
+	// archive stand-in: the changes it was asked to make, or archiveErr.
+	archiveErr error
+	archived   []archiveTarget
+	archives   []bool
+}
+
+func (f *fakeWire) archive(_ context.Context, t archiveTarget, archive bool) error {
+	if f.archiveErr != nil {
+		return f.archiveErr
+	}
+	f.archived = append(f.archived, t)
+	f.archives = append(f.archives, archive)
+	return nil
 }
 
 func (f *fakeWire) fetch(_ context.Context, src forwardSource) (string, []byte, error) {
@@ -63,7 +77,8 @@ func sendFixture(t *testing.T) (*Writer, string, *fakeWire) {
 		func(v *events.Message, forwardOf int64) error {
 			_, err := w.Apply(context.Background(), forwardPlan(decide(v, nil), forwardOf))
 			return err
-		})
+		},
+		w.archiver(wire.archive))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +288,7 @@ func TestSendRejectsBadInput(t *testing.T) {
 	w, root, wire := sendFixture(t)
 	for _, c := range []struct{ to, text, want string }{
 		{"Sarah", "hi", "invalid chat"},
-		{"status@broadcast", "hi", "cannot send"},
+		{"status@broadcast", "hi", "is not a chat"},
 		{"+971500000001", "  ", "empty message"},
 	} {
 		_, err := Send(context.Background(), root, c.to, c.text, "")
@@ -313,7 +328,7 @@ func TestSendRecordFailureWarns(t *testing.T) {
 	wire := &fakeWire{}
 	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error {
 		return errors.New("database is locked")
-	})
+	}, archiver{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +379,7 @@ func TestSendEndpointLifecycle(t *testing.T) {
 	}
 
 	wire := &fakeWire{}
-	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil })
+	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil }, archiver{})
 	if err != nil {
 		t.Fatal(err)
 	}

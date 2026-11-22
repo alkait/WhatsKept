@@ -8,9 +8,10 @@
 // agent the real CREATE statements, query runs arbitrary read-only
 // SQL, and search is a convenience wrapper over messages_fts.
 //
-// send is the one tool that is not a query: it hands a text to the
-// `whatskept live` process running beside the database, which sends it
-// and records it. The server itself still never writes.
+// send and archive are the tools that are not queries: they hand a
+// message or an archive change to the `whatskept live` process running
+// beside the database, which makes it and records it. The server itself
+// still never writes.
 package mcpserve
 
 import (
@@ -177,6 +178,14 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"seen by real people: send only what the user explicitly asked for, to the chat they " +
 			"named. Needs `whatskept live` running.",
 	}, s.send)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "archive",
+		Description: "Archive a WhatsApp chat in the user's own account, or with `undo` unarchive it — " +
+			"on their phone and every linked device. `chat` is a phone number in international format " +
+			"or a chat JID (v_chats.jid — the only way to address a group); it must be a chat in " +
+			"v_chats. Seen by nobody else and reversible, but it changes the user's chat list: archive " +
+			"only the chats the user asked for. Needs `whatskept live` running.",
+	}, s.archive)
 
 	return mcpServer
 }
@@ -382,6 +391,20 @@ func (s *server) send(ctx context.Context, _ *mcp.CallToolRequest, in sendIn) (*
 	}
 	sent, err := live.Forward(ctx, root, in.To, in.Forward)
 	return nil, sent, err
+}
+
+// --- archive ------------------------------------------------------------
+
+type archiveIn struct {
+	Chat string `json:"chat" jsonschema:"phone number in international format (+971501234567) or a chat JID from v_chats.jid"`
+	Undo bool   `json:"undo,omitempty" jsonschema:"optional: true unarchives the chat instead"`
+}
+
+// archive hands the change to the live process of the workspace the
+// database sits in; live owns the WhatsApp connection.
+func (s *server) archive(ctx context.Context, _ *mcp.CallToolRequest, in archiveIn) (*mcp.CallToolResult, live.Archived, error) {
+	got, err := live.Archive(ctx, filepath.Dir(s.dbPath), in.Chat, !in.Undo)
+	return nil, got, err
 }
 
 // --- search -------------------------------------------------------------

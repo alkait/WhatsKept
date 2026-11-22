@@ -28,10 +28,13 @@ SQLite database, etc.) sits at the workspace root. Secrets come from
   any chat instead — attachments by their stored download details, the
   phone re-uploading any the CDN has dropped. The hand-off is a
   loopback endpoint advertised in `.whatskept/live.json` while live runs.
+- `whatskept archive <chat> [--undo]` — archive (or unarchive) a chat
+  through the running `live`, the same hand-off; `live` also records
+  archiving done on the phone.
 - `whatskept mcp --database <file>` — the only query surface; serves the
   unified DB over HTTP at `/mcp`, behind a bearer token (or over stdio with
-  `--stdio`, for clients that launch it). Read-only, plus a
-  `send` tool that hands off to the live running beside the database.
+  `--stdio`, for clients that launch it). Read-only, plus `send` and
+  `archive` tools that hand off to the live running beside the database.
 
 Enrichment (image descriptions/OCR, voice transcripts, PDF text) runs via
 OpenRouter on both import and live paths. Media, PDFs and voice files are

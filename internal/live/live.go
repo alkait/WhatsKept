@@ -7,8 +7,8 @@
 // Deliberately silent on the wire: no presence, no read receipts, no
 // typing indicators. whatsmeow sends none of these unless asked, and
 // nothing here asks — the user's chats are never marked read behind
-// their back. The one thing live does send is a message it was
-// explicitly handed (see send.go).
+// their back. The one thing live does send is a message or an archive
+// change it was explicitly handed (see send.go).
 package live
 
 import (
@@ -24,6 +24,7 @@ import (
 	_ "github.com/mattn/go-sqlite3" // whatsmeow's session store; our own DB code stays on modernc
 	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -105,6 +106,10 @@ func Run(ctx context.Context, root string) error {
 		resolvePN: func(ctx context.Context, lid types.JID) (types.JID, bool) {
 			pn, err := client.Store.LIDs.GetPNForLID(ctx, lid)
 			return pn, err == nil && !pn.IsEmpty()
+		},
+		resolveLID: func(ctx context.Context, pn types.JID) (types.JID, bool) {
+			lid, err := client.Store.LIDs.GetLIDForPN(ctx, pn)
+			return lid, err == nil && !lid.IsEmpty()
 		},
 		groupSubject: func(ctx context.Context, jid types.JID) (string, bool) {
 			info, err := client.GetGroupInfo(ctx, jid)
@@ -226,6 +231,25 @@ func Run(ctx context.Context, root string) error {
 				s += " file=" + res.MediaPath
 			}
 			logf("%s", s)
+		case *events.Archive:
+			// Archiving on the phone — or by `whatskept archive`, whose
+			// change WhatsApp hands back — arrives as an app-state
+			// mutation. Changes from the initial sync at pairing are not
+			// emitted, so chats untouched since keep their imported state.
+			if isNoiseJID(v.JID) {
+				break
+			}
+			archived := v.Action.GetArchived()
+			pk, ok, err := w.SetArchived(context.Background(), v.JID.ToNonAD(), archived)
+			switch {
+			case err != nil:
+				writeErrs.Add(1)
+				logf("archive chat=%s archived=%v: ERROR %v", v.JID, archived, err)
+			case !ok:
+				logf("archive chat=%s archived=%v: chat not in the database", v.JID, archived)
+			default:
+				logf("archive chat=%s archived=%v: chat=%d", v.JID, archived, pk)
+			}
 		case *events.Connected:
 			connects.Add(1)
 			connectedAt.Store(time.Now().Unix())
@@ -296,6 +320,24 @@ func Run(ctx context.Context, root string) error {
 		}
 	}
 
+	// Archive changes are handed over by `whatskept archive` and the
+	// MCP archive tool. whatsmeow fetches the collection back after
+	// sending, so the change also returns as an *events.Archive.
+	arch := w.archiver(func(ctx context.Context, t archiveTarget, archive bool) error {
+		return client.SendAppState(ctx, appstate.BuildArchive(t.JID, archive, t.LastTs, t.Last))
+	})
+	record := arch.record
+	arch.record = func(ctx context.Context, t archiveTarget, archive bool) error {
+		err := record(ctx, t, archive)
+		if err != nil {
+			writeErrs.Add(1)
+			logf("archive chat=%s archived=%v: sent, but write=ERROR(%v)", t.JID, archive, err)
+		} else {
+			logf("archive chat=%s archived=%v: sent, chat=%d", t.JID, archive, t.PK)
+		}
+		return err
+	}
+
 	// Sends are handed over by `whatskept send` and the MCP send tool;
 	// recording goes through applyMsg like any captured message.
 	stopSend, err := startSend(root,
@@ -313,7 +355,8 @@ func Run(ctx context.Context, root string) error {
 			outcome, err := applyMsg(v, forwardOf)
 			logMessage(v, outcome)
 			return err
-		})
+		},
+		arch)
 	if err != nil {
 		return err
 	}

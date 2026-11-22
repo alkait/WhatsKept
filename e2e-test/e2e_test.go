@@ -569,19 +569,8 @@ func TestForwardSent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	bin := filepath.Join(t.TempDir(), "whatskept")
-	build := exec.Command("go", "build", "-o", bin, "./cmd/whatskept")
-	build.Dir = ".."
-	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build whatskept: %v\n%s", err, out)
-	}
-	cmd := exec.Command(bin, "send", testerChat, "--forward", stanza)
-	cmd.Dir = cfg.Workspace
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("whatskept send --forward: %v\n%s", err, out)
-	}
-	m := sentID.FindStringSubmatch(string(out))
+	out := whatskept(t, cfg, buildWhatskept(t), "send", testerChat, "--forward", stanza)
+	m := sentID.FindStringSubmatch(out)
 	if m == nil {
 		t.Fatalf("no stanza ID in send output: %s", out)
 	}
@@ -599,5 +588,82 @@ func TestForwardSent(t *testing.T) {
 	}
 	if got != text || fromMe != 1 || chat != origChat {
 		t.Errorf("forward row: text=%q fromMe=%d chat=%d, want %q, 1, %d", got, fromMe, chat, text, origChat)
+	}
+}
+
+// buildWhatskept builds the CLI from this checkout and returns its path.
+func buildWhatskept(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "whatskept")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/whatskept")
+	build.Dir = ".."
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build whatskept: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// whatskept runs the built CLI in the test workspace and returns its
+// combined output.
+func whatskept(t *testing.T, cfg config, bin string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = cfg.Workspace
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("whatskept %v: %v\n%s", args, err, out)
+	}
+	return string(out)
+}
+
+// TestArchiveSent archives the tester's chat in the workspace account
+// with `whatskept archive`, then unarchives it with --undo, through the
+// running live. Exit 0 means WhatsApp accepted the app-state change;
+// the database follows each one. Whether the phone shows it is beyond
+// what the tester number can see.
+func TestArchiveSent(t *testing.T) {
+	cfg := loadConfig(t)
+	stanza, _ := sendText(t, cfg, "archive-me")
+	bin := buildWhatskept(t)
+	db := openWorkspaceDB(t, cfg)
+	pk := waitForRow(t, db, stanza)
+
+	var testerChat string
+	var chatPK int64
+	var was sql.NullInt64
+	if err := db.QueryRow(`SELECT cs.ZCONTACTJID, cs.Z_PK, cs.ZARCHIVED FROM ZWAMESSAGE m
+		JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION WHERE m.Z_PK = ?`, pk).Scan(&testerChat, &chatPK, &was); err != nil {
+		t.Fatal(err)
+	}
+	archived := func() int64 {
+		var v sql.NullInt64
+		if err := db.QueryRow(`SELECT ZARCHIVED FROM ZWACHATSESSION WHERE Z_PK = ?`, chatPK).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v.Int64
+	}
+	// Leave the chat as it was found, whatever happens below.
+	t.Cleanup(func() {
+		args := []string{"archive", testerChat, "--undo"}
+		if was.Int64 == 1 {
+			args = args[:2]
+		}
+		whatskept(t, cfg, bin, args...)
+	})
+
+	out := whatskept(t, cfg, bin, "archive", testerChat)
+	if !strings.HasPrefix(out, "archived chat=") {
+		t.Fatalf("archive output = %q", out)
+	}
+	if v := archived(); v != 1 {
+		t.Errorf("after archive: ZARCHIVED = %d, want 1", v)
+	}
+
+	out = whatskept(t, cfg, bin, "archive", testerChat, "--undo")
+	if !strings.HasPrefix(out, "unarchived chat=") {
+		t.Fatalf("unarchive output = %q", out)
+	}
+	if v := archived(); v != 0 {
+		t.Errorf("after unarchive: ZARCHIVED = %d, want 0", v)
 	}
 }

@@ -306,7 +306,7 @@ func TestForwardRefusals(t *testing.T) {
 	}
 
 	// A forward carries nothing of the caller's own.
-	_, err := post(context.Background(), root, sendRequest{To: "+971500000002", Text: "look", Forward: "IN1"})
+	_, err := post[sendReply](context.Background(), root, "send", sendRequest{To: "+971500000002", Text: "look", Forward: "IN1"})
 	if err == nil || !strings.Contains(err.Error(), "no text or reply_to") {
 		t.Errorf("forward with text: err = %v", err)
 	}
