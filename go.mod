@@ -57,3 +57,10 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.52
 	golang.org/x/crypto v0.58.0 // indirect
 )
+
+// whatsmeow pinned at v0.0.0-20261031222104-5d4657a5c29e plus one patch:
+// EncodePatch removes a record written under an earlier app-state key
+// before setting the same index under the current one, as the primary
+// does. Without it the primary's LTHash diverges and app-state writes
+// (read, archive) fail with 409 / "mismatching LTHash".
+replace go.mau.fi/whatsmeow => ./third_party/whatsmeow

@@ -43,6 +43,11 @@ Enrichment (image descriptions/OCR, voice transcripts, PDF text) runs via
 OpenRouter on both import and live paths. Media, PDFs and voice files are
 deleted once enriched — the text in the DB is the record.
 
+whatsmeow is vendored in `third_party/whatsmeow` (wired in by `replace`
+in `go.mod`) with one patch: an app-state write first removes the
+record's copy under an older key, as the phone does. Re-apply the patch
+when bumping whatsmeow; `TestArchiveAfterKeyRotation` fails without it.
+
 ## Philosophy
 
 - **Less is more.** Minimal code, minimal commands, minimal README.
