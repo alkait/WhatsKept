@@ -1,7 +1,7 @@
 // Package views turns a freshly extracted ChatStorage.sqlite into the
 // query surface the MCP server expects: the SQL view layer (wa_contact,
 // wa_jid_alias, wa_document, v_chats, v_messages, wa_reaction,
-// v_reactions) plus the messages_fts FTS5 index.
+// v_reactions, wa_chat_read) plus the messages_fts FTS5 index.
 package views
 
 import (
@@ -9,6 +9,7 @@ import (
 	_ "embed"
 	"fmt"
 	"strings"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -30,6 +31,9 @@ func Apply(dbPath string) (int, error) {
 	}
 	if _, err := EnsureReactions(db); err != nil {
 		return 0, fmt.Errorf("apply reactions: %w", err)
+	}
+	if _, err := EnsureChats(db, time.Now()); err != nil {
+		return 0, fmt.Errorf("apply chats: %w", err)
 	}
 	n, err := rebuildFTS(db)
 	if err != nil {

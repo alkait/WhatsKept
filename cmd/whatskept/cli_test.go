@@ -733,13 +733,36 @@ func TestCLIReadThroughLive(t *testing.T) {
 	dir := sendWorkspace(t)
 	run(t, dir, "send", "+971500000001", "see you at 8") // the chat now exists
 
+	db, err := sql.Open("sqlite", filepath.Join(dir, backup.ChatStorageName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// Whether the chat's read state is recorded as read through some
+	// time, and as marked unread.
+	state := func() (read, marked bool) {
+		t.Helper()
+		if err := db.QueryRow(`SELECT r.read_through IS NOT NULL, r.unread_marked IS NOT NULL
+			FROM wa_chat_read r JOIN ZWACHATSESSION cs ON cs.Z_PK = r.chat_pk
+			WHERE cs.ZCONTACTJID = '971500000001@s.whatsapp.net'`).Scan(&read, &marked); err != nil {
+			t.Fatal(err)
+		}
+		return read, marked
+	}
+
 	code, stdout, stderr := run(t, dir, "read", "+971 50 000 0001")
 	if code != 0 || stdout != "marked read chat=971500000001@s.whatsapp.net\n" || stderr != "" {
 		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
 	}
+	if read, marked := state(); !read || marked {
+		t.Errorf("after read: read=%v marked=%v, want read and not marked", read, marked)
+	}
 	code, stdout, stderr = run(t, dir, "read", "971500000001@s.whatsapp.net", "--undo")
 	if code != 0 || stdout != "marked unread chat=971500000001@s.whatsapp.net\n" || stderr != "" {
 		t.Fatalf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+	if _, marked := state(); !marked {
+		t.Errorf("after mark unread: not marked")
 	}
 
 	code, stdout, stderr = run(t, dir, "read", "+971500000002")

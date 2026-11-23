@@ -12,8 +12,9 @@ import (
 )
 
 // runRead hands one read change to the `whatskept live` process running
-// in this workspace — live owns the WhatsApp connection. undo marks the
-// chat unread instead.
+// in this workspace — live owns the WhatsApp connection, so it makes the
+// change and records it in the database. undo marks the chat unread
+// instead.
 func runRead(chat string, undo bool) error {
 	root, err := workspace.Find()
 	if err != nil {
@@ -30,5 +31,8 @@ func runRead(chat string, undo bool) error {
 		verb = "unread"
 	}
 	fmt.Printf("marked %s chat=%s\n", verb, got.Chat)
+	if got.Warning != "" {
+		fmt.Fprintln(os.Stderr, "warning:", got.Warning)
+	}
 	return nil
 }

@@ -33,7 +33,8 @@ SQLite database, etc.) sits at the workspace root. Secrets come from
   archiving done on the phone.
 - `whatskept read <chat> [--undo]` — mark a chat read (or unread) on the
   user's own devices through the running `live`, the same hand-off; no
-  read receipts are sent.
+  read receipts are sent. `live` also records reading done on the
+  user's devices, so `v_chats.unread` holds each chat's unread count.
 - `whatskept mcp --database <file>` — the only query surface; serves the
   unified DB over HTTP at `/mcp`, behind a bearer token (or over stdio with
   `--stdio`, for clients that launch it). Read-only, plus `send`,

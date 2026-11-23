@@ -399,8 +399,9 @@ func openRW(path string) (*sql.DB, error) {
 }
 
 // EnsureReady proves the DB is a writable ChatStorage and creates the
-// wa_live_pk ledger and the reaction table, which a workspace imported
-// by an older version doesn't have. Called once at startup so failure is loud and
+// wa_live_pk ledger, the reaction table and the read state behind
+// v_chats.unread, which a workspace imported by an older version
+// doesn't have. Called once at startup so failure is loud and
 // immediate rather than appearing on the first message that matters.
 func (w *Writer) EnsureReady(ctx context.Context) error {
 	db, err := openRW(w.dbPath)
@@ -427,6 +428,13 @@ func (w *Writer) EnsureReady(ctx context.Context) error {
 	}
 	if n > 0 {
 		logf("reactions: %d backfilled from the imported history", n)
+	}
+	n, err = views.EnsureChats(db, time.Now())
+	if err != nil {
+		return fmt.Errorf("prepare read state: %w", err)
+	}
+	if n > 0 {
+		logf("read state: tracking from now, %d chats start as read", n)
 	}
 	return nil
 }

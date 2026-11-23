@@ -250,6 +250,24 @@ func Run(ctx context.Context, root string) error {
 			default:
 				logf("archive chat=%s archived=%v: chat=%d", v.JID, archived, pk)
 			}
+		case *events.Receipt, *events.MarkChatAsRead:
+			// Reading on another device: the user's own read receipts,
+			// or "Mark as read/unread". Receipts from other people
+			// (blue ticks on the user's messages) are not recorded.
+			c, ok := readChangeOf(evt)
+			if !ok {
+				break
+			}
+			pk, found, err := w.SetRead(context.Background(), c.Chat, c.Read, c.At)
+			switch {
+			case err != nil:
+				writeErrs.Add(1)
+				logf("read chat=%s read=%v via=%s: ERROR %v", c.Chat, c.Read, c.Via, err)
+			case !found:
+				logf("read chat=%s read=%v via=%s: chat not in the database", c.Chat, c.Read, c.Via)
+			default:
+				logf("read chat=%s read=%v via=%s: chat=%d", c.Chat, c.Read, c.Via, pk)
+			}
 		case *events.Connected:
 			connects.Add(1)
 			connectedAt.Store(time.Now().Unix())
@@ -336,6 +354,15 @@ func Run(ctx context.Context, root string) error {
 			}
 			return err
 		})
+	recordRead := ops.recordRead
+	ops.recordRead = func(ctx context.Context, t archiveTarget, read bool) error {
+		err := recordRead(ctx, t, read)
+		if err != nil {
+			writeErrs.Add(1)
+			logf("read chat=%s read=%v: sent, but write=ERROR(%v)", t.JID, read, err)
+		}
+		return err
+	}
 	record := ops.record
 	ops.record = func(ctx context.Context, t archiveTarget, archive bool) error {
 		err := record(ctx, t, archive)

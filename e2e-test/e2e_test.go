@@ -670,10 +670,10 @@ func TestArchiveSent(t *testing.T) {
 
 // TestReadSent marks the tester's chat in the workspace account unread
 // with `whatskept read --undo`, then read again, through the running
-// live. Exit 0 means WhatsApp accepted each app-state change; the
-// database keeps no unread state, and whether the phone's badge follows
-// is beyond what the tester number can see. Ending on read leaves the
-// chat as an incoming e2e message would want it.
+// live, and follows v_chats.unread. Exit 0 means WhatsApp accepted each
+// app-state change; whether the phone's badge follows is beyond what
+// the tester number can see. Ending on read leaves the chat as an
+// incoming e2e message would want it.
 func TestReadSent(t *testing.T) {
 	cfg := loadConfig(t)
 	stanza, _ := sendText(t, cfg, "read-me")
@@ -682,17 +682,32 @@ func TestReadSent(t *testing.T) {
 	pk := waitForRow(t, db, stanza)
 
 	var testerChat string
-	if err := db.QueryRow(`SELECT cs.ZCONTACTJID FROM ZWAMESSAGE m
-		JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION WHERE m.Z_PK = ?`, pk).Scan(&testerChat); err != nil {
+	var chatPK int64
+	if err := db.QueryRow(`SELECT cs.ZCONTACTJID, cs.Z_PK FROM ZWAMESSAGE m
+		JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION WHERE m.Z_PK = ?`, pk).Scan(&testerChat, &chatPK); err != nil {
 		t.Fatal(err)
+	}
+	unread := func() int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(`SELECT unread FROM v_chats WHERE chat_id = ?`, chatPK).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
 	}
 
 	out := whatskept(t, cfg, bin, "read", testerChat, "--undo")
 	if !strings.HasPrefix(out, "marked unread chat=") {
 		t.Fatalf("unread output = %q", out)
 	}
+	if n := unread(); n < 1 {
+		t.Errorf("after mark unread: unread = %d, want at least 1", n)
+	}
 	out = whatskept(t, cfg, bin, "read", testerChat)
 	if !strings.HasPrefix(out, "marked read chat=") {
 		t.Fatalf("read output = %q", out)
+	}
+	if n := unread(); n != 0 {
+		t.Errorf("after read: unread = %d, want 0", n)
 	}
 }

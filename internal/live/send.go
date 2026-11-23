@@ -89,13 +89,14 @@ type readReply struct {
 
 // chatOps is what the endpoint changes a chat's app state with: find it
 // in the database, put the archive or read change on the wire, record
-// an archive change. The wire halves are injected so the endpoint is
-// testable without a WhatsApp connection.
+// it. The wire halves are injected so the endpoint is testable without
+// a WhatsApp connection.
 type chatOps struct {
-	target  func(ctx context.Context, to types.JID) (archiveTarget, error)
-	archive func(ctx context.Context, t archiveTarget, archive bool) error
-	record  func(ctx context.Context, t archiveTarget, archive bool) error
-	read    func(ctx context.Context, t archiveTarget, read bool) error
+	target     func(ctx context.Context, to types.JID) (archiveTarget, error)
+	archive    func(ctx context.Context, t archiveTarget, archive bool) error
+	record     func(ctx context.Context, t archiveTarget, archive bool) error
+	read       func(ctx context.Context, t archiveTarget, read bool) error
+	recordRead func(ctx context.Context, t archiveTarget, read bool) error
 }
 
 type endpoint struct {
@@ -293,7 +294,11 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 			reply(http.StatusBadGateway, readReply{Error: verb + " failed: " + err.Error()})
 			return
 		}
-		reply(http.StatusOK, readReply{MarkedRead: MarkedRead{Chat: t.JID.String(), Read: req.Read}})
+		out := readReply{MarkedRead: MarkedRead{Chat: t.JID.String(), Read: req.Read}}
+		if err := ops.recordRead(ctx, t, req.Read); err != nil {
+			out.Warning = "changed on WhatsApp, but not recorded in the database: " + err.Error()
+		}
+		reply(http.StatusOK, out)
 	})
 
 	data, err := json.Marshal(endpoint{Addr: ln.Addr().String(), Token: token})
@@ -365,6 +370,9 @@ func (w *Writer) chatOps(archive, read func(context.Context, archiveTarget, bool
 			return w.recordArchived(ctx, t.PK, archive)
 		},
 		read: read,
+		recordRead: func(ctx context.Context, t archiveTarget, read bool) error {
+			return w.recordRead(ctx, t.PK, read, time.Now())
+		},
 	}
 }
 
@@ -392,8 +400,9 @@ func Archive(ctx context.Context, root, to string, archive bool) (Archived, erro
 }
 
 // MarkRead asks the running live to mark chat `to` (see ParseChat) as
-// read, or with read false as unread, on the user's own devices. No
-// read receipts are sent. The chat must be one the database holds.
+// read, or with read false as unread, on the user's own devices, and
+// records it in v_chats.unread. No read receipts are sent. The chat
+// must be one the database holds.
 func MarkRead(ctx context.Context, root, to string, read bool) (MarkedRead, error) {
 	r, err := post[readReply](ctx, root, "read", readRequest{Chat: to, Read: read})
 	return r.MarkedRead, err

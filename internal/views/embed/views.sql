@@ -87,48 +87,6 @@ CREATE INDEX IF NOT EXISTS wa_document_filename_idx ON wa_document(filename);
 
 
 -- ----------------------------------------------------------------------------
--- v_chats: one row per chat session (1:1 or group).
---   - Cocoa epoch (seconds since 2001-01-01 UTC) converted to UTC ISO.
---   - kind: 'group' if the JID ends in @g.us, otherwise 'dm'.
--- ----------------------------------------------------------------------------
-DROP VIEW IF EXISTS v_chats;
-CREATE VIEW v_chats AS
-SELECT
-    cs.Z_PK                                                    AS chat_id,
-    cs.ZCONTACTJID                                             AS jid,
-    -- For DM chats, resolve the partner's display name in this strict
-    -- preference order (the USER's saved name wins over the partner's
-    -- self-chosen name; opaque identifiers are last resort):
-    --   1. iOS Contacts label (wa_contact).
-    --   2. ZPARTNERNAME, but ONLY when it's a real name — WhatsApp
-    --      mirrors iOS Contacts here, but falls back to a formatted
-    --      phone string ("+971 50 ...") for unsaved contacts; skip those.
-    --   3. WhatsApp push name keyed by the phone JID.
-    --   4. WhatsApp push name keyed by the partner's LID alias.
-    --   5. Raw JID (stable, joinable) as last resort.
-    -- For groups, just the group title.
-    CASE
-        WHEN cs.ZCONTACTJID LIKE '%@g.us' THEN cs.ZPARTNERNAME
-        ELSE COALESCE(
-            (SELECT display_name FROM wa_contact      WHERE jid = cs.ZCONTACTJID),
-            CASE
-                WHEN cs.ZPARTNERNAME IS NULL OR cs.ZPARTNERNAME = '' THEN NULL
-                WHEN cs.ZPARTNERNAME GLOB '+[0-9 ]*'                 THEN NULL
-                ELSE cs.ZPARTNERNAME
-            END,
-            (SELECT ZPUSHNAME FROM ZWAPROFILEPUSHNAME WHERE ZJID = cs.ZCONTACTJID),
-            (SELECT ZPUSHNAME FROM ZWAPROFILEPUSHNAME WHERE ZJID = cs.ZCONTACTIDENTIFIER),
-            cs.ZCONTACTJID
-        )
-    END                                                        AS title,
-    CASE WHEN cs.ZCONTACTJID LIKE '%@g.us' THEN 'group' ELSE 'dm' END AS kind,
-    cs.ZMESSAGECOUNTER                                         AS message_count,
-    datetime(cs.ZLASTMESSAGEDATE + 978307200, 'unixepoch')     AS last_message_at,
-    cs.ZARCHIVED                                               AS archived
-FROM ZWACHATSESSION cs;
-
-
--- ----------------------------------------------------------------------------
 -- v_messages: flattened message view.
 --   - ts: UTC ISO timestamp (Cocoa epoch already converted).
 --   - sender_name: best-effort; 'me' for outgoing. See tier comments below.
@@ -141,7 +99,7 @@ CREATE VIEW v_messages AS
 SELECT
     m.Z_PK                                                     AS rowid,
     m.ZCHATSESSION                                             AS chat_id,
-    -- chat_title mirrors v_chats.title — see that view's comment.
+    -- chat_title mirrors v_chats.title — see that view's comment (chats.sql).
     CASE
         WHEN cs.ZCONTACTJID LIKE '%@g.us' THEN cs.ZPARTNERNAME
         ELSE COALESCE(

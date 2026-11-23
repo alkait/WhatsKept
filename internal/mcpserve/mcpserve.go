@@ -192,6 +192,7 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"clears (or sets) the unread badge on their phone and every linked device. No read receipts " +
 			"are sent: senders see no blue ticks. `chat` is a phone number in international format or a " +
 			"chat JID (v_chats.jid — the only way to address a group); it must be a chat in v_chats. " +
+			"v_chats.unread reflects the change at once. " +
 			"Mark only the chats the user asked for. Needs `whatskept live` running.",
 	}, s.read)
 

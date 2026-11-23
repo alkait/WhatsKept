@@ -73,8 +73,20 @@ it unread. No read receipts are sent — senders see no blue ticks.
 - `chat` takes the same forms as `send`'s `to`, and must be a chat in
   `v_chats`. Resolve names through `v_chats` first; if more than one
   chat matches, ask.
-- The database keeps no unread state: there is no way to list which
-  chats are unread here.
+- `v_chats.unread` reflects the change immediately, and follows reading
+  done on the phone and linked devices while live runs. A `warning`
+  means the change was made but not stored — do not repeat it.
+
+## Unread chats
+
+`v_chats.unread` is the chat's unread count; 0 means read. It counts
+incoming messages since the user last read the chat on any of their
+devices, and is at least 1 for a chat marked unread. Tracking began
+when the workspace was imported or first ran a live with this feature:
+chats unread before then count as read until their next message. If live
+was down a long time, a count can be off until the chat is next read —
+treat it as approximate. Do not read raw `ZWACHATSESSION.ZUNREADCOUNT`:
+it is the backup's snapshot, never updated.
 
 ## No media here — cite instead
 
@@ -131,7 +143,8 @@ checking both tables, and then say why:
 ## Key views (prefer them over raw Z* tables)
 
 - `v_chats` — one row per chat: `chat_id`, `jid`, `title`, `kind`
-  ('dm'/'group'), `message_count`, `last_message_at`.
+  ('dm'/'group'), `message_count`, `last_message_at`, `archived`,
+  `unread` (see above).
 - `v_messages` — flattened messages: `rowid`, `chat_id`, `chat_title`,
   `ts` (UTC ISO, **already epoch-converted**), `is_from_me`,
   `sender_name`, `sender_jid`, `message_type_name`, `text`,

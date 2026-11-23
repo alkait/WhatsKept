@@ -356,14 +356,24 @@ asked for. Archiving or unarchiving on the phone shows up in
 
 `whatskept read <chat>` marks a chat as read in the user's account —
 clearing its unread badge on their phone and every linked device —
-through the running `whatskept live`; `--undo` after the chat marks it
-unread. No read receipts are sent, so senders see no blue ticks.
-`<chat>` takes the same forms as for `send`, and must be a chat already
-in the database. It prints `marked read chat=…` (or `marked unread
-chat=…`) and exits 0 only once WhatsApp has accepted the change. The
-MCP server offers the same as its `read` tool, with `undo`. The
-database keeps no unread state, so there is no listing unread chats —
-mark only the chats the user asked for.
+through the running `whatskept live`, and records it in the database
+(`v_chats.unread`); `--undo` after the chat marks it unread. No read
+receipts are sent, so senders see no blue ticks. `<chat>` takes the
+same forms as for `send`, and must be a chat already in the database.
+It prints `marked read chat=…` (or `marked unread chat=…`) and exits 0
+only once WhatsApp has accepted the change. The MCP server offers the
+same as its `read` tool, with `undo`. Mark only the chats the user
+asked for.
+
+`v_chats.unread` is each chat's unread count, 0 meaning read: incoming
+messages since the user last read the chat on any device, and at least
+1 for a chat marked unread. `live` follows reading done on the phone
+and linked devices. Tracking starts when the workspace is imported or
+first runs a `live` that has it — chats unread before then count as
+read until their next message — and a long `live` outage can leave a
+count off until the chat is next read, so treat it as approximate.
+Raw `ZWACHATSESSION.ZUNREADCOUNT` is the backup's snapshot, never
+updated — don't use it.
 
 ## Bulk operations: pace them
 

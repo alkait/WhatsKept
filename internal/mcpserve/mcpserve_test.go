@@ -515,11 +515,27 @@ func TestRead(t *testing.T) {
 	if got != (live.MarkedRead{Chat: "971501111111@s.whatsapp.net", Read: true}) {
 		t.Errorf("read = %+v", got)
 	}
+	// The change is in v_chats at once.
+	unread := func() any {
+		t.Helper()
+		var out queryOut
+		call(t, sess, "query", map[string]any{"sql": "SELECT unread FROM v_chats WHERE title = 'Sarah'"}, &out)
+		if len(out.Rows) != 1 {
+			t.Fatalf("rows = %v", out.Rows)
+		}
+		return out.Rows[0][0]
+	}
+	if v := unread(); v != float64(0) {
+		t.Errorf("unread after read = %v, want 0", v)
+	}
 	if res := call(t, sess, "read", map[string]any{"chat": "971501111111@s.whatsapp.net", "undo": true}, &got); res.IsError {
 		t.Fatalf("unread: %s", errText(res))
 	}
-	if got.Read {
+	if got.Read || got.Warning != "" {
 		t.Errorf("unread = %+v", got)
+	}
+	if v := unread(); v != float64(1) {
+		t.Errorf("unread after mark unread = %v, want 1", v)
 	}
 
 	res := call(t, sess, "read", map[string]any{"chat": "+971509999999"}, nil)
