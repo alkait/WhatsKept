@@ -28,6 +28,13 @@ Usage:
                                      [--undo] unarchives it instead
   whatskept read <chat>              mark a chat as read through the running live (no read receipts)
                                      [--undo] marks it unread instead
+  whatskept list create <name>       create a chat list (a filter atop the chat list) through the running live
+  whatskept list rename <list> <name>
+                                     rename one of your lists (<list>: its v_lists id or name)
+  whatskept list delete <list>       delete one of your lists (WhatsApp's built-in filters can't be changed)
+  whatskept list add <list> <chat>   add a chat to one of your lists
+  whatskept list remove <list> <chat>
+                                     remove a chat from one of your lists
   whatskept mcp --database <file>    serve a database file over MCP (HTTP) [--addr host:port]
                                      [--stdio] serves over stdin/stdout instead (no token)
   whatskept -v | --version           show the version
@@ -125,6 +132,15 @@ func main() {
 			os.Exit(2)
 		}
 		if err := runRead(os.Args[2], undo); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+	case "list":
+		if len(os.Args) < 3 || listArgs[os.Args[2]] == 0 || len(os.Args) != 3+listArgs[os.Args[2]] {
+			fmt.Fprint(os.Stderr, "list requires one of: create <name>, rename <list> <name>, delete <list>, add <list> <chat>, remove <list> <chat>\n\n"+usage)
+			os.Exit(2)
+		}
+		if err := runListChange(os.Args[2], os.Args[3:]); err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			os.Exit(1)
 		}

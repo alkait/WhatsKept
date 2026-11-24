@@ -58,9 +58,12 @@ require (
 	golang.org/x/crypto v0.58.0 // indirect
 )
 
-// whatsmeow pinned at v0.0.0-20261031222104-5d4657a5c29e plus one patch:
+// whatsmeow pinned at v0.0.0-20261031222104-5d4657a5c29e plus two patches:
 // EncodePatch removes a record written under an earlier app-state key
 // before setting the same index under the current one, as the primary
-// does. Without it the primary's LTHash diverges and app-state writes
-// (read, archive) fail with 409 / "mismatching LTHash".
+// does — without it the primary's LTHash diverges and app-state writes
+// (read, archive) fail with 409 / "mismatching LTHash". And decoding
+// tolerates an LTHash mismatch when every record and patch MAC verifies
+// (upstream #1319 for patches, ours for snapshots), so a collection the
+// primary can no longer sign consistently still syncs.
 replace go.mau.fi/whatsmeow => ./third_party/whatsmeow

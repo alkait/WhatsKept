@@ -8,10 +8,10 @@
 // agent the real CREATE statements, query runs arbitrary read-only
 // SQL, and search is a convenience wrapper over messages_fts.
 //
-// send, archive and read are the tools that are not queries: they hand
-// a message, an archive change or a read change to the `whatskept live`
-// process running beside the database, which makes it. The server itself
-// still never writes.
+// send, archive, read and list are the tools that are not queries: they
+// hand a message, an archive, read or list change to the `whatskept
+// live` process running beside the database, which makes it. The server
+// itself still never writes.
 package mcpserve
 
 import (
@@ -195,6 +195,16 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"v_chats.unread reflects the change at once. " +
 			"Mark only the chats the user asked for. Needs `whatskept live` running.",
 	}, s.read)
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "list",
+		Description: "Change the user's chat lists — the filters at the top of their WhatsApp chat list — " +
+			"on their phone and every linked device. `op` is create (`name`), rename (`list`, `name`), " +
+			"delete (`list`), add or remove (`list`, `chat`). `list` is a v_lists.id or name; only the " +
+			"user's own lists (v_lists.kind = 'custom') can be changed, not WhatsApp's built-in filters. " +
+			"`chat` is a phone number in international format or a chat JID; it must be a chat in v_chats. " +
+			"v_lists and v_list_chats reflect the change at once. Seen by nobody else, but it changes " +
+			"the user's lists: change only what the user asked for. Needs `whatskept live` running.",
+	}, s.list)
 
 	return mcpServer
 }
@@ -427,6 +437,22 @@ type readIn struct {
 // database sits in; live owns the WhatsApp connection.
 func (s *server) read(ctx context.Context, _ *mcp.CallToolRequest, in readIn) (*mcp.CallToolResult, live.MarkedRead, error) {
 	got, err := live.MarkRead(ctx, filepath.Dir(s.dbPath), in.Chat, !in.Undo)
+	return nil, got, err
+}
+
+// --- list ---------------------------------------------------------------
+
+type listIn struct {
+	Op   string `json:"op" jsonschema:"create, rename, delete, add or remove"`
+	List string `json:"list,omitempty" jsonschema:"the list to change: its v_lists.id or name (not for create)"`
+	Name string `json:"name,omitempty" jsonschema:"create and rename: the list's (new) name"`
+	Chat string `json:"chat,omitempty" jsonschema:"add and remove: phone number in international format (+971501234567) or a chat JID from v_chats.jid"`
+}
+
+// list hands the change to the live process of the workspace the
+// database sits in; live owns the WhatsApp connection.
+func (s *server) list(ctx context.Context, _ *mcp.CallToolRequest, in listIn) (*mcp.CallToolResult, live.ListChange, error) {
+	got, err := live.ManageList(ctx, filepath.Dir(s.dbPath), in.Op, in.List, in.Name, in.Chat)
 	return nil, got, err
 }
 

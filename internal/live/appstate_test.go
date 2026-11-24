@@ -6,6 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -138,6 +139,163 @@ func TestArchiveAfterKeyRotation(t *testing.T) {
 		"SET/new", "SET/new")
 	expect("read on a chat with no history", send(newKey, appstate.BuildMarkChatAsRead(other, true, time.Now(), nil)),
 		"SET/new")
+}
+
+// TestToleratesUncountedRecords guards the tolerance in the vendored
+// whatsmeow: a primary that folded a record it never uploaded into its
+// LTHash signs snapshots and patches no client can add up. Those are
+// accepted — like WhatsApp's own linked devices — as long as every
+// record and every patch still verifies on its own; tampering, a bad
+// patch MAC and a skipped version are still refused.
+func TestToleratesUncountedRecords(t *testing.T) {
+	ctx := context.Background()
+	container, err := sqlstore.New(ctx, "sqlite3",
+		"file:"+filepath.Join(t.TempDir(), "session.db")+"?_foreign_keys=on", waLog.Noop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { container.Close() })
+	device := func(user string) *store.Device {
+		dev := container.NewDevice()
+		dev.ID = &types.JID{User: user, Server: types.DefaultUserServer}
+		dev.Account = &waAdv.ADVSignedDeviceIdentity{
+			Details: []byte{}, AccountSignature: make([]byte, 64), AccountSignatureKey: make([]byte, 32), DeviceSignature: make([]byte, 64),
+		}
+		if err := container.PutDevice(ctx, dev); err != nil {
+			t.Fatal(err)
+		}
+		return dev
+	}
+	keyID := []byte{0, 0, 0, 0, 0x7f, 0x12}
+	keyData := bytes.Repeat([]byte{7}, 32)
+	snapKey := hkdfutil.SHA256(keyData, nil, []byte("WhatsApp Mutation Keys"), 160)[96:128]
+	phoneDev, ourDev := device("971500000001"), device("971500000002")
+	for _, d := range []*store.Device{phoneDev, ourDev} {
+		if err := d.AppStateKeys.PutAppStateSyncKey(ctx, keyID, store.AppStateSyncKey{Data: keyData, Fingerprint: []byte{}, Timestamp: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	phone, ours := appstate.NewProcessor(phoneDev, waLog.Noop), appstate.NewProcessor(ourDev, waLog.Noop)
+	name := appstate.WAPatchRegularHigh
+	mute := func(user string) appstate.PatchInfo {
+		return appstate.BuildMute(types.NewJID(user, types.DefaultUserServer), true, 0)
+	}
+	// encode has the phone write a patch on top of its state.
+	encode := func(state appstate.HashState, info appstate.PatchInfo) *waServerSync.SyncdPatch {
+		t.Helper()
+		raw, err := phone.EncodePatch(ctx, keyID, state, info)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var p waServerSync.SyncdPatch
+		if err := proto.Unmarshal(raw, &p); err != nil {
+			t.Fatal(err)
+		}
+		p.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(state.Version + 1)}
+		return &p
+	}
+	valueMAC := func(m *waServerSync.SyncdMutation) []byte {
+		b := m.GetRecord().GetValue().GetBlob()
+		return b[len(b)-32:]
+	}
+
+	// The server holds two records; the phone's hash also counts a third
+	// it never uploaded.
+	a, b, hidden := encode(appstate.HashState{}, mute("971500000010")), encode(appstate.HashState{}, mute("971500000011")),
+		encode(appstate.HashState{}, mute("971500000012"))
+	var phoneState appstate.HashState
+	phoneState.Version = 5
+	lthash.WAPatchIntegrity.SubtractThenAddInPlace(phoneState.Hash[:], nil,
+		[][]byte{valueMAC(a.Mutations[0]), valueMAC(b.Mutations[0]), valueMAC(hidden.Mutations[0])})
+	snapshot := func(records ...*waServerSync.SyncdRecord) *waServerSync.SyncdSnapshot {
+		return &waServerSync.SyncdSnapshot{
+			Version: &waServerSync.SyncdVersion{Version: proto.Uint64(5)},
+			Records: records,
+			Mac:     snapshotMAC(snapKey, phoneState.Hash, 5, name),
+			KeyID:   &waServerSync.KeyId{ID: keyID},
+		}
+	}
+	decode := func(state appstate.HashState, list *appstate.PatchList) (appstate.HashState, error) {
+		_, next, err := ours.DecodePatches(ctx, list, state, true)
+		return next, err
+	}
+
+	ourState, err := decode(appstate.HashState{}, &appstate.PatchList{Name: name,
+		Snapshot: snapshot(a.Mutations[0].Record, b.Mutations[0].Record)})
+	if err != nil {
+		t.Fatalf("snapshot with an uncounted record: %v", err)
+	}
+	if ourState.Version != 5 || ourState.Hash == phoneState.Hash {
+		t.Fatalf("state after snapshot: v%d, hash equal to the phone's: %v", ourState.Version, ourState.Hash == phoneState.Hash)
+	}
+
+	tampered := proto.Clone(a.Mutations[0].Record).(*waServerSync.SyncdRecord)
+	tampered.Value.Blob[20] ^= 1
+	if _, err := decode(appstate.HashState{}, &appstate.PatchList{Name: name,
+		Snapshot: snapshot(tampered, b.Mutations[0].Record)}); err == nil {
+		t.Fatal("snapshot with a tampered record was accepted")
+	}
+
+	// The phone's next patch carries its own hash; ours differs by the
+	// uncounted record, and the patch is still applied.
+	next := encode(phoneState, mute("971500000013"))
+	if _, err := decode(ourState, &appstate.PatchList{Name: name, Patches: []*waServerSync.SyncdPatch{next}}); err != nil {
+		t.Fatalf("validly signed patch on top: %v", err)
+	}
+
+	badMAC := proto.Clone(next).(*waServerSync.SyncdPatch)
+	badMAC.PatchMAC[0] ^= 1
+	if _, err := decode(ourState, &appstate.PatchList{Name: name, Patches: []*waServerSync.SyncdPatch{badMAC}}); err == nil {
+		t.Fatal("patch with a bad patch MAC was accepted")
+	}
+
+	skipped := proto.Clone(next).(*waServerSync.SyncdPatch)
+	skipped.Version = &waServerSync.SyncdVersion{Version: proto.Uint64(7)}
+	if _, err := decode(ourState, &appstate.PatchList{Name: name, Patches: []*waServerSync.SyncdPatch{skipped}}); err == nil {
+		t.Fatal("patch after a skipped version was accepted")
+	}
+}
+
+// TestHealer covers live's answer to a stuck collection: a failed
+// incremental sync becomes one full sync, at most hourly per collection.
+func TestHealer(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	broken := map[appstate.WAPatchName]bool{appstate.WAPatchRegularHigh: true}
+	var calls []string
+	h := newAppStateHealer(func(_ context.Context, name appstate.WAPatchName, full bool) error {
+		kind := "incremental"
+		if full {
+			kind = "full"
+		}
+		calls = append(calls, string(name)+"/"+kind)
+		if !full && broken[name] {
+			return errors.New("failed to verify patch v222: mismatching LTHash")
+		}
+		return nil
+	})
+	h.now = func() time.Time { return now }
+
+	h.syncAll(ctx)
+	want := []string{"critical_block/incremental", "critical_unblock_low/incremental",
+		"regular_high/incremental", "regular_high/full", "regular/incremental", "regular_low/incremental"}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("syncAll: %v, want %v", calls, want)
+	}
+
+	// The same failure reported again by whatsmeow: no second full sync.
+	calls = nil
+	if h.heal(ctx, appstate.WAPatchRegularHigh, errors.New("again")) || len(calls) != 0 {
+		t.Fatalf("second heal within the hour ran: %v", calls)
+	}
+	now = now.Add(30 * time.Minute)
+	if h.heal(ctx, appstate.WAPatchRegularHigh, errors.New("again")) {
+		t.Fatal("heal ran within the hour")
+	}
+	now = now.Add(31 * time.Minute)
+	if !h.heal(ctx, appstate.WAPatchRegularHigh, errors.New("again")) || !slices.Equal(calls, []string{"regular_high/full"}) {
+		t.Fatalf("heal after an hour: %v", calls)
+	}
 }
 
 func decryptIndex(t *testing.T, keyData []byte, m *waServerSync.SyncdMutation) string {

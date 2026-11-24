@@ -19,7 +19,7 @@ already knows.
 ./ChatStorage.sqlite         # the database — messages, chats, SQL views, FTS index
 ./.whatskept/settings.json   # portable workspace configuration (see below)
 ./.whatskept/session.db      # WhatsApp companion-device session (once `live` has linked)
-./.whatskept/live.json       # live's send/archive/read endpoint + token (only while `live` runs; a secret)
+./.whatskept/live.json       # live's send/archive/read/list endpoint + token (only while `live` runs; a secret)
 ./AGENTS.md                  # this guide (the source of truth)
 ./CLAUDE.md                  # one-line stub importing AGENTS.md
 ./MEMORY.md                  # your own notes across sessions (see below; may not exist yet)
@@ -375,11 +375,39 @@ count off until the chat is next read, so treat it as approximate.
 Raw `ZWACHATSESSION.ZUNREADCOUNT` is the backup's snapshot, never
 updated — don't use it.
 
+## Changing chat lists
+
+The user's chat lists — the filters at the top of their chat list:
+Unread, Favorites, Groups and their own — are in `v_lists`, with the
+chats in each in `v_list_chats`. `live` rebuilds them from WhatsApp each
+time it connects and follows changes made on any device.
+
+`whatskept list` changes the user's own lists through the running
+`whatskept live`, on their phone and every linked device:
+
+```
+whatskept list create <name>
+whatskept list rename <list> <name>
+whatskept list delete <list>
+whatskept list add <list> <chat>
+whatskept list remove <list> <chat>
+```
+
+`<list>` is a `v_lists.id` or name; only the user's own lists
+(`kind = 'custom'`) change — WhatsApp's built-in filters are refused.
+`<chat>` takes the same forms as for `send` and must be a chat already
+in the database. Each prints what it did (`created list id=… name=…`,
+`added chat=… to list id=…`, …) and exits 0 only once WhatsApp has
+accepted the change. The MCP server offers the same as its `list` tool.
+Change only what the user asked for; deleting a list leaves its chats
+alone, but confirm before deleting one that has chats.
+
 ## Bulk operations: pace them
 
 When a task runs `whatskept send` (replies and forwards too), `whatskept
-archive` or `whatskept read` across more than a few chats, run one command
-at a time and wait a random 5–15 seconds between commands.
+archive`, `whatskept read` or `whatskept list` across more than a few
+chats, run one command at a time and wait a random 5–15 seconds between
+commands.
 
 ## Serving over MCP
 

@@ -210,7 +210,7 @@ func TestMarkReadRecordFailureWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	wire := &fakeWire{}
-	ops := w.chatOps(wire.archive, wire.read)
+	ops := w.chatOps(wire.archive, wire.read, wire.listOps(w))
 	ops.recordRead = func(context.Context, archiveTarget, bool) error { return errors.New("database is locked") }
 	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil }, ops)
 	if err != nil {

@@ -423,7 +423,7 @@ func TestCLIMCPStdio(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got, want := strings.Join(names, ","), "archive,get_schema,query,read,search,send"; got != want {
+	if got, want := strings.Join(names, ","), "archive,get_schema,list,query,read,search,send"; got != want {
 		t.Errorf("tools = %s, want %s", got, want)
 	}
 }
@@ -772,5 +772,108 @@ func TestCLIReadThroughLive(t *testing.T) {
 	code, _, stderr = run(t, dir, "read", "Sarah")
 	if code != 1 || !strings.Contains(stderr, "invalid chat") {
 		t.Errorf("exit %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestCLIListUsage(t *testing.T) {
+	for _, args := range [][]string{{"list"}, {"list", "create"}, {"list", "create", "a", "b"},
+		{"list", "rename", "a"}, {"list", "delete"}, {"list", "add", "a"}, {"list", "remove", "a", "b", "c"},
+		{"list", "archive", "a"}} {
+		code, _, stderr := run(t, t.TempDir(), args...)
+		if code != 2 || !strings.Contains(stderr, "list requires one of") {
+			t.Errorf("%v: exit %d, stderr = %q", args, code, stderr)
+		}
+	}
+	code, stdout, _ := run(t, t.TempDir(), "--help")
+	if code != 0 || !strings.Contains(stdout, "whatskept list create <name>") || !strings.Contains(stdout, "whatskept list remove <list> <chat>") {
+		t.Errorf("usage missing list: %q", stdout)
+	}
+}
+
+func TestCLIListOutsideWorkspace(t *testing.T) {
+	code, _, stderr := run(t, t.TempDir(), "list", "create", "Clients")
+	if code != 1 || !strings.Contains(stderr, "not a whatskept workspace") {
+		t.Errorf("exit %d, stderr = %q", code, stderr)
+	}
+}
+
+func TestCLIListLiveNotRunning(t *testing.T) {
+	dir := t.TempDir()
+	run(t, dir, "init")
+	code, stdout, stderr := run(t, dir, "list", "create", "Clients")
+	if code != 1 || stdout != "" || !strings.Contains(stderr, "`whatskept live` is not running") {
+		t.Errorf("exit %d, stdout = %q, stderr = %q", code, stdout, stderr)
+	}
+}
+
+func TestCLIListThroughLive(t *testing.T) {
+	dir := sendWorkspace(t)
+	run(t, dir, "send", "+971500000001", "see you at 8") // the chat now exists
+	db, err := sql.Open("sqlite", filepath.Join(dir, backup.ChatStorageName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// The lists live last heard from WhatsApp.
+	if _, err := db.Exec(`INSERT INTO wa_list (id, name, kind, shown, position) VALUES
+		(1, 'Unread', 'unread', 1, 0), (2, 'Favorites', 'favorites', 1, 1), (3, 'Groups', 'groups', 1, 2)`); err != nil {
+		t.Fatal(err)
+	}
+	lists := func() string {
+		t.Helper()
+		var s sql.NullString
+		if err := db.QueryRow(`SELECT GROUP_CONCAT(id || ':' || name || ':' || COALESCE(position, '-'), ',')
+			FROM (SELECT * FROM wa_list ORDER BY id)`).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s.String
+	}
+	members := func() string {
+		t.Helper()
+		var s sql.NullString
+		if err := db.QueryRow(`SELECT GROUP_CONCAT(list_id || ':' || jid, ',') FROM wa_list_chat`).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s.String
+	}
+	expect := func(want string, args ...string) {
+		t.Helper()
+		code, stdout, stderr := run(t, dir, append([]string{"list"}, args...)...)
+		if code != 0 || stdout != want+"\n" || stderr != "" {
+			t.Fatalf("%v: exit %d, stdout = %q, stderr = %q", args, code, stdout, stderr)
+		}
+	}
+
+	expect(`created list id=4 name="Clients"`, "create", "Clients")
+	if got := lists(); got != "1:Unread:0,2:Favorites:1,3:Groups:2,4:Clients:3" {
+		t.Fatalf("lists after create: %q", got)
+	}
+	expect(`added chat=971500000001@s.whatsapp.net to list id=4 name="Clients"`, "add", "clients", "+971 50 000 0001")
+	if got := members(); got != "4:971500000001@s.whatsapp.net" {
+		t.Fatalf("members after add: %q", got)
+	}
+	expect(`removed chat=971500000001@s.whatsapp.net from list id=4 name="Clients"`, "remove", "4", "971500000001@s.whatsapp.net")
+	if got := members(); got != "" {
+		t.Fatalf("members after remove: %q", got)
+	}
+	expect(`renamed list id=4 name="Customers"`, "rename", "Clients", "Customers")
+	expect(`deleted list id=4 name="Customers"`, "delete", "Customers")
+	if got := lists(); got != "1:Unread:0,2:Favorites:1,3:Groups:2" {
+		t.Fatalf("lists after delete: %q", got)
+	}
+
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"rename", "Favorites", "Faves"}, `"Favorites" is one of WhatsApp's built-in filters`},
+		{[]string{"delete", "Nope"}, `no list "Nope"`},
+		{[]string{"create", "groups"}, `a list named "Groups" already exists`},
+		{[]string{"add", "Unread", "+971500000002"}, "is not in the database"},
+	} {
+		code, stdout, stderr := run(t, dir, append([]string{"list"}, c.args...)...)
+		if code != 1 || stdout != "" || !strings.Contains(stderr, c.want) {
+			t.Errorf("%v: exit %d, stdout = %q, stderr = %q", c.args, code, stdout, stderr)
+		}
 	}
 }

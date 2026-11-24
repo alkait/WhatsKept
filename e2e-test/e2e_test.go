@@ -28,6 +28,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -665,6 +666,77 @@ func TestArchiveSent(t *testing.T) {
 	}
 	if v := archived(); v != 0 {
 		t.Errorf("after unarchive: ZARCHIVED = %d, want 0", v)
+	}
+}
+
+// TestListSent creates a list in the workspace account with `whatskept
+// list`, adds the tester's chat, removes it, renames the list and
+// deletes it, through the running live. The list is the suite's own,
+// named uniquely and deleted whatever happens. Exit 0 means WhatsApp
+// accepted each change; v_lists and v_list_chats follow each one.
+func TestListSent(t *testing.T) {
+	cfg := loadConfig(t)
+	stanza, _ := sendText(t, cfg, "list-me")
+	bin := buildWhatskept(t)
+	db := openWorkspaceDB(t, cfg)
+	pk := waitForRow(t, db, stanza)
+
+	var testerChat string
+	var chatPK int64
+	if err := db.QueryRow(`SELECT cs.ZCONTACTJID, cs.Z_PK FROM ZWAMESSAGE m
+		JOIN ZWACHATSESSION cs ON cs.Z_PK = m.ZCHATSESSION WHERE m.Z_PK = ?`, pk).Scan(&testerChat, &chatPK); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("whatskept-e2e-%d", time.Now().UnixNano())
+	out := whatskept(t, cfg, bin, "list", "create", name)
+	var id int64
+	if _, err := fmt.Sscanf(out, "created list id=%d", &id); err != nil || id == 0 {
+		t.Fatalf("create output = %q", out)
+	}
+	t.Cleanup(func() {
+		var n int
+		db.QueryRow(`SELECT COUNT(*) FROM wa_list WHERE id = ?`, id).Scan(&n)
+		if n > 0 {
+			whatskept(t, cfg, bin, "list", "delete", strconv.FormatInt(id, 10))
+		}
+	})
+	count := func(q string, args ...any) int {
+		t.Helper()
+		var n int
+		if err := db.QueryRow(q, args...).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := count(`SELECT COUNT(*) FROM v_lists WHERE id = ? AND name = ? AND kind = 'custom'`, id, name); n != 1 {
+		t.Fatalf("v_lists after create: %d rows", n)
+	}
+
+	out = whatskept(t, cfg, bin, "list", "add", name, testerChat)
+	if !strings.HasPrefix(out, "added chat=") {
+		t.Fatalf("add output = %q", out)
+	}
+	if n := count(`SELECT COUNT(*) FROM v_list_chats WHERE list_id = ? AND chat_id = ?`, id, chatPK); n != 1 {
+		t.Errorf("v_list_chats after add: %d rows for the tester chat", n)
+	}
+	out = whatskept(t, cfg, bin, "list", "remove", strconv.FormatInt(id, 10), testerChat)
+	if !strings.HasPrefix(out, "removed chat=") {
+		t.Fatalf("remove output = %q", out)
+	}
+	if n := count(`SELECT COUNT(*) FROM v_list_chats WHERE list_id = ?`, id); n != 0 {
+		t.Errorf("v_list_chats after remove: %d rows", n)
+	}
+	whatskept(t, cfg, bin, "list", "add", name, testerChat)
+	out = whatskept(t, cfg, bin, "list", "rename", name, name+"-renamed")
+	if !strings.HasPrefix(out, "renamed list id=") || count(`SELECT COUNT(*) FROM v_lists WHERE id = ? AND name = ?`, id, name+"-renamed") != 1 {
+		t.Fatalf("rename: %q", out)
+	}
+	out = whatskept(t, cfg, bin, "list", "delete", name+"-renamed")
+	if !strings.HasPrefix(out, "deleted list id=") {
+		t.Fatalf("delete output = %q", out)
+	}
+	if n := count(`SELECT COUNT(*) FROM wa_list_chat WHERE list_id = ?`, id) + count(`SELECT COUNT(*) FROM wa_list WHERE id = ?`, id); n != 0 {
+		t.Errorf("after delete: %d rows left", n)
 	}
 }
 

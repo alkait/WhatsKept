@@ -12,6 +12,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -286,7 +287,16 @@ func (proc *Processor) decodeSnapshot(
 
 	if validateMACs {
 		_, err = proc.validateSnapshotMAC(ctx, name, currentState, ss.GetKeyID().GetID(), ss.GetMac())
-		if err != nil {
+		if errors.Is(err, ErrMismatchingLTHash) {
+			// whatskept: a primary can fold records into its LTHash that it never
+			// uploads (it re-indexes chats to LIDs locally), so no client can make
+			// the snapshot's total add up. Accept the records anyway: each one's
+			// content and index MACs are still verified in decodeMutations below,
+			// and later patches are checked against this state (validatePatch
+			// tolerates the inherited mismatch when the patch MAC is valid).
+			proc.Log.Warnf("Accepting %s snapshot v%d despite mismatching LTHash; every record's MACs are still verified (warnings: %+v)", name, currentState.Version, warn)
+			err = nil
+		} else if err != nil {
 			if len(warn) > 0 {
 				proc.Log.Warnf("Warnings while updating hash for %s: %+v", name, warn)
 			}
@@ -342,13 +352,23 @@ func (proc *Processor) validatePatch(
 	if validateMACs {
 		var keys ExpandedAppStateKeys
 		keys, err = proc.validateSnapshotMAC(ctx, patchName, newState, patch.GetKeyID().GetID(), patch.GetSnapshotMAC())
-		if err != nil {
+		ltHashMismatch := errors.Is(err, ErrMismatchingLTHash)
+		if err != nil && !ltHashMismatch {
 			return
 		}
+		// Like WhatsApp Web, only ignore the mismatch if local state isn't obviously missing.
+		// A skipped version or an empty hash means a full sync is needed.
+		if ltHashMismatch && (version != currentState.Version+1 || (currentState.Hash == [128]byte{} && version != 1)) {
+			return
+		}
+		err = nil
 		patchMAC := generatePatchMAC(patch, patchName, keys.PatchMAC, patch.GetVersion().GetVersion())
 		if !hmac.Equal(patchMAC, patch.GetPatchMAC()) {
 			err = fmt.Errorf("failed to verify patch v%d: %w", version, ErrMismatchingPatchMAC)
 			return
+		}
+		if ltHashMismatch {
+			proc.Log.Warnf("Ignoring mismatching LTHash in %s v%d as patch MAC is valid (warnings: %+v)", patchName, version, warn)
 		}
 	}
 	return

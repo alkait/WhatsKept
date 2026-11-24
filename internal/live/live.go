@@ -198,6 +198,21 @@ func Run(ctx context.Context, root string) error {
 	// arrives as an event.
 	fetcher := newMediaFetcher(client)
 
+	// A collection that stops syncing is downloaded whole (see appstate.go).
+	// Full syncs emit no per-record events, so settings changed while a
+	// collection was stuck are not replayed into the database.
+	healer := newAppStateHealer(func(ctx context.Context, name appstate.WAPatchName, full bool) error {
+		return client.FetchAppState(ctx, name, full, false)
+	})
+
+	// The user's chat lists, replicated from WhatsApp (see lists.go).
+	lists := &listSync{w: w, decode: decodeLists(client)}
+	healer.afterFull = func(ctx context.Context, name appstate.WAPatchName) {
+		if name == appstate.WAPatchRegular || name == appstate.WAPatchRegularHigh {
+			lists.rebuild(ctx)
+		}
+	}
+
 	client.AddEventHandler(func(evt any) {
 		switch v := evt.(type) {
 		case *events.MediaRetry:
@@ -272,6 +287,19 @@ func Run(ctx context.Context, root string) error {
 			connects.Add(1)
 			connectedAt.Store(time.Now().Unix())
 			logf("connected as %s (connection #%d)", client.Store.ID, connects.Load())
+			go func() {
+				healer.syncAll(ctx)
+				lists.rebuild(ctx)
+			}()
+		case *events.AppState:
+			// Changes to lists, from any device or live's own writes.
+			if isListRecord(v.Index) {
+				lists.apply(context.Background(), v.Index, v.SyncActionValue)
+			}
+		case *events.AppStateSyncError:
+			if !v.FullSync {
+				go healer.heal(ctx, v.Name, v.Error)
+			}
 		case *events.Disconnected:
 			disconnects.Add(1)
 			connectedAt.Store(0)
@@ -353,6 +381,24 @@ func Run(ctx context.Context, root string) error {
 				logf("read chat=%s read=%v: sent, chat=%d", t.JID, read, t.PK)
 			}
 			return err
+		},
+		// List changes come from `whatskept list` and the MCP list tool,
+		// planned from the lists as WhatsApp holds them right now.
+		&listOps{
+			state: func(ctx context.Context) (listState, error) {
+				muts, err := decodeLists(client)(ctx)
+				return listStateOf(muts), err
+			},
+			target: w.archiveTarget,
+			forms:  w.chatForms,
+			write: func(ctx context.Context, p appstate.PatchInfo) error {
+				err := client.SendAppState(ctx, p)
+				if err == nil {
+					logf("list change sent: %s", strings.Join(p.Mutations[0].Index, " "))
+				}
+				return err
+			},
+			record: lists.record,
 		})
 	recordRead := ops.recordRead
 	ops.recordRead = func(ctx context.Context, t archiveTarget, read bool) error {

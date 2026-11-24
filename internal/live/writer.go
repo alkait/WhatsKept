@@ -436,6 +436,9 @@ func (w *Writer) EnsureReady(ctx context.Context) error {
 	if n > 0 {
 		logf("read state: tracking from now, %d chats start as read", n)
 	}
+	if err := views.EnsureLists(db); err != nil {
+		return fmt.Errorf("prepare lists: %w", err)
+	}
 	return nil
 }
 

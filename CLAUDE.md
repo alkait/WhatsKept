@@ -35,19 +35,29 @@ SQLite database, etc.) sits at the workspace root. Secrets come from
   user's own devices through the running `live`, the same hand-off; no
   read receipts are sent. `live` also records reading done on the
   user's devices, so `v_chats.unread` holds each chat's unread count.
+- `whatskept list create|rename|delete|add|remove …` — change the user's
+  own chat lists (the filters atop the chat list) through the running
+  `live`, the same hand-off, written the way the phone writes them.
+  `live` keeps a replica of every list in `v_lists` / `v_list_chats`,
+  rebuilt from WhatsApp at each connect and following changes after.
 - `whatskept mcp --database <file>` — the only query surface; serves the
   unified DB over HTTP at `/mcp`, behind a bearer token (or over stdio with
   `--stdio`, for clients that launch it). Read-only, plus `send`,
-  `archive` and `read` tools that hand off to the live running beside the database.
+  `archive`, `read` and `list` tools that hand off to the live running
+  beside the database.
 
 Enrichment (image descriptions/OCR, voice transcripts, PDF text) runs via
 OpenRouter on both import and live paths. Media, PDFs and voice files are
 deleted once enriched — the text in the DB is the record.
 
 whatsmeow is vendored in `third_party/whatsmeow` (wired in by `replace`
-in `go.mod`) with one patch: an app-state write first removes the
-record's copy under an older key, as the phone does. Re-apply the patch
-when bumping whatsmeow; `TestArchiveAfterKeyRotation` fails without it.
+in `go.mod`) with two patches: an app-state write first removes the
+record's copy under an older key, as the phone does; and app-state sync
+tolerates a hash that cannot add up — the phone folds in records it
+never uploads — as long as every record and patch verifies on its own,
+like WhatsApp's own linked devices (patches: upstream #1319; snapshots:
+ours). Re-apply both when bumping whatsmeow; `TestArchiveAfterKeyRotation`
+and `TestToleratesUncountedRecords` fail without them.
 
 ## Philosophy
 

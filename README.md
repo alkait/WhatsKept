@@ -78,6 +78,7 @@ Web does.
 | `whatskept send <chat> <text>` | Send through the running `live`. Supports `--reply-to` and `--forward`. |
 | `whatskept archive <chat>` | Archive a chat through the running `live`. `--undo` unarchives it. |
 | `whatskept read <chat>` | Mark a chat as read through the running `live`, without sending read receipts. `--undo` marks it unread. |
+| `whatskept list <op> …` | Create, rename or delete your chat lists, or add and remove chats, through the running `live`. |
 | `whatskept mcp --database <file>` | Serve the database over MCP at `/mcp`, behind a bearer token or OAuth. `--stdio` serves over stdin/stdout instead, for clients that launch it. |
 
 ## Privacy & security

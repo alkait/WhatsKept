@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"go.mau.fi/whatsmeow/appstate"
 	"os"
 	"runtime"
 	"strings"
@@ -39,6 +40,28 @@ type fakeWire struct {
 	readErr error
 	readOf  []archiveTarget
 	reads   []bool
+
+	// list stand-in: the patches it was asked to write, or listErr.
+	listErr error
+	lists   []appstate.PatchInfo
+}
+
+// listOps is the endpoint's list operations over w, with this wire
+// standing in for WhatsApp: lists are planned from w's replica.
+func (f *fakeWire) listOps(w *Writer) *listOps {
+	return &listOps{
+		state:  w.replicaState,
+		target: w.archiveTarget,
+		forms:  w.chatForms,
+		write: func(_ context.Context, p appstate.PatchInfo) error {
+			if f.listErr != nil {
+				return f.listErr
+			}
+			f.lists = append(f.lists, p)
+			return nil
+		},
+		record: w.recordList,
+	}
 }
 
 func (f *fakeWire) read(_ context.Context, t archiveTarget, read bool) error {
@@ -92,7 +115,7 @@ func sendFixture(t *testing.T) (*Writer, string, *fakeWire) {
 			_, err := w.Apply(context.Background(), forwardPlan(decide(v, nil), forwardOf))
 			return err
 		},
-		w.chatOps(wire.archive, wire.read))
+		w.chatOps(wire.archive, wire.read, wire.listOps(w)))
 	if err != nil {
 		t.Fatal(err)
 	}

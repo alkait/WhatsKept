@@ -181,7 +181,7 @@ func archiveFixture(t *testing.T) (*Writer, string, *fakeWire) {
 	}
 	wire := &fakeWire{}
 	stop, err := startSend(root, wire.deliver, w.quote, w.forwardSource, wire.fetch,
-		func(*events.Message, int64) error { return nil }, w.chatOps(wire.archive, wire.read))
+		func(*events.Message, int64) error { return nil }, w.chatOps(wire.archive, wire.read, wire.listOps(w)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +266,7 @@ func TestArchiveRecordFailureWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 	wire := &fakeWire{}
-	ops := w.chatOps(wire.archive, wire.read)
+	ops := w.chatOps(wire.archive, wire.read, wire.listOps(w))
 	ops.record = func(context.Context, archiveTarget, bool) error { return errors.New("database is locked") }
 	stop, err := startSend(root, wire.deliver, nil, nil, nil, func(*events.Message, int64) error { return nil }, ops)
 	if err != nil {

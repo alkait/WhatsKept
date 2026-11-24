@@ -646,7 +646,69 @@ func TestHTTPProtocolVersions(t *testing.T) {
 	if status != 200 || res["protocolVersion"] != "2025-06-18" {
 		t.Errorf("initialize: %d protocolVersion=%v", status, res["protocolVersion"])
 	}
-	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 6 {
+	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 7 {
 		t.Errorf("2025-06-18 tools/list: %d %v", status, toolNames(res))
+	}
+}
+
+func TestList(t *testing.T) {
+	path := writeSendWorkspace(t)
+	stop, err := live.StartFakeSend(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(stop)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The lists live last heard from WhatsApp.
+	if _, err := db.Exec(`INSERT INTO wa_list (id, name, kind, shown, position) VALUES
+		(1, 'Unread', 'unread', 1, 0), (2, 'Favorites', 'favorites', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	sess := connect(t, path)
+
+	var got live.ListChange
+	if res := call(t, sess, "list", map[string]any{"op": "create", "name": "Family"}, &got); res.IsError {
+		t.Fatalf("create: %s", errText(res))
+	}
+	if got != (live.ListChange{Op: "create", ID: 3, Name: "Family"}) {
+		t.Errorf("create = %+v", got)
+	}
+	if res := call(t, sess, "list", map[string]any{"op": "add", "list": "Family", "chat": "+971501111111"}, &got); res.IsError {
+		t.Fatalf("add: %s", errText(res))
+	}
+	// The change is in v_list_chats at once.
+	var out queryOut
+	call(t, sess, "query", map[string]any{"sql": "SELECT list, title FROM v_list_chats"}, &out)
+	if len(out.Rows) != 1 || out.Rows[0][0] != "Family" || out.Rows[0][1] != "Sarah" {
+		t.Errorf("v_list_chats rows = %v, want Family/Sarah", out.Rows)
+	}
+	call(t, sess, "query", map[string]any{"sql": "SELECT name, kind, chats FROM v_lists WHERE id = 3"}, &out)
+	if len(out.Rows) != 1 || out.Rows[0][2] != float64(1) {
+		t.Errorf("v_lists rows = %v", out.Rows)
+	}
+
+	for _, c := range []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"op": "delete", "list": "Favorites"}, "built-in filters"},
+		{map[string]any{"op": "add", "list": "Family", "chat": "+971509999999"}, "is not in the database"},
+		{map[string]any{"op": "mute", "list": "Family"}, "unknown list operation"},
+	} {
+		if res := call(t, sess, "list", c.args, nil); !res.IsError || !strings.Contains(errText(res), c.want) {
+			t.Errorf("%v: want %q, got %q", c.args, c.want, errText(res))
+		}
+	}
+}
+
+func TestListWithoutLive(t *testing.T) {
+	sess := connect(t, writeSendWorkspace(t))
+	res := call(t, sess, "list", map[string]any{"op": "create", "name": "Family"}, nil)
+	if !res.IsError || !strings.Contains(errText(res), "`whatskept live` is not running") {
+		t.Errorf("want not-running error, got %q", errText(res))
 	}
 }

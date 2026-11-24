@@ -103,6 +103,36 @@ func mergeForward(livePath, tempPath string) error {
 			return fmt.Errorf("copy wa_reaction rows: %w", err)
 		}
 	}
+	return carryLists(db)
+}
+
+// carryLists keeps live's copy of the user's chat lists across an
+// import: backups don't hold them, and live only rebuilds them when it
+// next connects. Chats are named by JID, so the rows stay valid.
+func carryLists(db *sql.DB) error {
+	var n int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM old.sqlite_master WHERE type = 'table' AND name IN ('wa_list', 'wa_list_chat')`,
+	).Scan(&n); err != nil {
+		return fmt.Errorf("check lists: %w", err)
+	}
+	if n < 2 {
+		return nil
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS main.wa_list (id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+			kind TEXT NOT NULL, shown INTEGER NOT NULL, position INTEGER)`,
+		`CREATE TABLE IF NOT EXISTS main.wa_list_chat (list_id INTEGER NOT NULL, jid TEXT NOT NULL,
+			phone TEXT, PRIMARY KEY (list_id, jid))`,
+		`INSERT OR REPLACE INTO main.wa_list (id, name, kind, shown, position)
+			SELECT id, name, kind, shown, position FROM old.wa_list`,
+		`INSERT OR REPLACE INTO main.wa_list_chat (list_id, jid, phone)
+			SELECT list_id, jid, phone FROM old.wa_list_chat`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("carry lists: %w", err)
+		}
+	}
 	return nil
 }
 

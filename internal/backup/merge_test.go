@@ -242,3 +242,49 @@ func TestMergeForwardReactions(t *testing.T) {
 		t.Errorf("reactions = %q", got)
 	}
 }
+
+// Lists live only in the workspace (backups don't hold them), so an
+// import keeps live's copy; chats are named by JID, so rows stay valid.
+func TestMergeForwardCarriesLists(t *testing.T) {
+	dir := t.TempDir()
+	live := filepath.Join(dir, "live.sqlite")
+	temp := filepath.Join(dir, "temp.sqlite")
+	writeDB(t, live, `
+		CREATE TABLE wa_list (id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+			shown INTEGER NOT NULL, position INTEGER);
+		CREATE TABLE wa_list_chat (list_id INTEGER NOT NULL, jid TEXT NOT NULL, phone TEXT,
+			PRIMARY KEY (list_id, jid));
+		INSERT INTO wa_list VALUES (4, 'Contractors', 'custom', 1, 1), (2, 'Favorites', 'favorites', 1, 3);
+		INSERT INTO wa_list_chat VALUES (4, '110000000003@lid', '971500000003@s.whatsapp.net'),
+			(2, '120363000000000001@g.us', NULL);`)
+	writeDB(t, temp, `CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY);`)
+
+	if err := mergeForward(live, temp); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var lists, chats int
+	if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM wa_list), (SELECT COUNT(*) FROM wa_list_chat)`).Scan(&lists, &chats); err != nil {
+		t.Fatal(err)
+	}
+	if lists != 2 || chats != 2 {
+		t.Fatalf("carried %d lists, %d memberships; want 2, 2", lists, chats)
+	}
+	var phone string
+	if err := db.QueryRow(`SELECT phone FROM wa_list_chat WHERE list_id = 4`).Scan(&phone); err != nil || phone != "971500000003@s.whatsapp.net" {
+		t.Fatalf("membership phone: %q, %v", phone, err)
+	}
+
+	// A live DB from before lists carries nothing and fails nothing.
+	temp2 := filepath.Join(dir, "temp2.sqlite")
+	writeDB(t, temp2, `CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY);`)
+	old := filepath.Join(dir, "old.sqlite")
+	writeDB(t, old, `CREATE TABLE ZWAMESSAGE (Z_PK INTEGER PRIMARY KEY);`)
+	if err := mergeForward(old, temp2); err != nil {
+		t.Fatal(err)
+	}
+}

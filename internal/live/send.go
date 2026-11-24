@@ -3,8 +3,8 @@ package live
 // Sending. The linked session allows one connection and `whatskept
 // live` owns it, so nothing else can put a message on the wire: `send`
 // and the MCP send tool hand the text to the running live process over
-// a loopback HTTP endpoint — as do `archive` and `read` and their MCP
-// tools, with an archive or read change. The address and a random token are
+// a loopback HTTP endpoint — as do `archive`, `read` and `list` and
+// their MCP tools, with an archive, read or list change. The address and a random token are
 // advertised in .whatskept/live.json while live runs — the token is
 // the credential, because any local process can reach a loopback port.
 //
@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -97,6 +98,7 @@ type chatOps struct {
 	record     func(ctx context.Context, t archiveTarget, archive bool) error
 	read       func(ctx context.Context, t archiveTarget, read bool) error
 	recordRead func(ctx context.Context, t archiveTarget, read bool) error
+	lists      *listOps
 }
 
 type endpoint struct {
@@ -301,6 +303,22 @@ func startSend(root string, deliver deliverFunc, quote quoteFunc, source sourceF
 		reply(http.StatusOK, out)
 	})
 
+	mux.HandleFunc("POST /"+token+"/list", func(rw http.ResponseWriter, r *http.Request) {
+		var req listRequest
+		if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, 1<<20)).Decode(&req); err != nil {
+			writeJSON(rw, http.StatusBadRequest, listReply{Error: "bad request: " + err.Error()})
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), sendTimeout)
+		defer cancel()
+		out, status, err := ops.lists.do(ctx, req)
+		if err != nil {
+			writeJSON(rw, status, listReply{Error: err.Error()})
+			return
+		}
+		writeJSON(rw, status, listReply{ListChange: out})
+	})
+
 	data, err := json.Marshal(endpoint{Addr: ln.Addr().String(), Token: token})
 	if err != nil {
 		ln.Close()
@@ -357,13 +375,21 @@ func StartFakeSend(root string) (stop func(), err error) {
 			return err
 		},
 		w.chatOps(func(context.Context, archiveTarget, bool) error { return nil },
-			func(context.Context, archiveTarget, bool) error { return nil }))
+			func(context.Context, archiveTarget, bool) error { return nil },
+			&listOps{
+				state:  w.replicaState,
+				target: w.archiveTarget,
+				forms:  w.chatForms,
+				write:  func(context.Context, appstate.PatchInfo) error { return nil },
+				record: w.recordList,
+			}))
 }
 
 // chatOps is the endpoint's chatOps over this writer, with archive and
 // read putting each change on WhatsApp.
-func (w *Writer) chatOps(archive, read func(context.Context, archiveTarget, bool) error) chatOps {
+func (w *Writer) chatOps(archive, read func(context.Context, archiveTarget, bool) error, lists *listOps) chatOps {
 	return chatOps{
+		lists:   lists,
 		target:  w.archiveTarget,
 		archive: archive,
 		record: func(ctx context.Context, t archiveTarget, archive bool) error {
