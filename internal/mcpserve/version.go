@@ -2,6 +2,7 @@ package mcpserve
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 
@@ -14,13 +15,18 @@ import (
 // stamped binary version.
 var Version = "dev"
 
-// A client keeps the tool list and instructions it got when its
-// conversation began, so a conversation that outlives an upgrade talks
-// to the new server with the old tools. Two signals let the agent tell
-// the user: the instructions name the version the conversation began
-// with, and every tool result ends with the version serving it — the
-// instructions ask the agent to compare them. A call the new server no
-// longer accepts gets the same advice as its error.
+// A client keeps the tool list it got earlier — claude.ai well past
+// an upgrade, even into new conversations — so a conversation can talk
+// to the new server with old tools. The server finds out by asking:
+// every tool is advertised with a required tools_version argument
+// whose only allowed value is this release, so a call made from an
+// older tool list arrives with an older value or none. The call is
+// served all the same, and the result ends with a notice for the agent
+// to pass on. A call the new server no longer accepts gets the same
+// advice as its error.
+
+// toolsVersionArg is the argument every advertised tool carries.
+const toolsVersionArg = "tools_version"
 
 // versionedInstructions fills the version into the embedded
 // instructions.
@@ -39,9 +45,6 @@ func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, O
 	}
 	allowExtraFields(schema)
 	t.OutputSchema = schema
-	// A client may keep its tool list longer than its instructions, so
-	// each description names the version it came from too.
-	t.Description += " (whatskept " + Version + ")"
 	mcp.AddTool(s, t, h)
 }
 
@@ -68,12 +71,21 @@ func staleTools() string {
 		". Tell the user to reconnect the whatskept connector and start a new conversation."
 }
 
-// versionMiddleware stamps the version on every successful tool
-// result and turns calls to removed tools, or with arguments the
-// current tools reject, into the reconnect advice.
+// versionMiddleware advertises tools_version on every tool, takes it
+// back off each call before the tool sees it, ends every successful
+// result with the serving version — and a notice when the call came
+// from an older tool list — and turns calls to removed tools, or with
+// arguments the current tools reject, into the reconnect advice.
 func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		called := ""
+		if call, ok := req.(*mcp.CallToolRequest); ok && method == "tools/call" {
+			called = takeToolsVersion(call.Params)
+		}
 		res, err := next(ctx, method, req)
+		if list, ok := res.(*mcp.ListToolsResult); ok && err == nil {
+			return advertiseToolsVersion(list), nil
+		}
 		if method != "tools/call" {
 			return res, err
 		}
@@ -95,16 +107,68 @@ func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 			}
 			return r, nil
 		}
-		stampVersion(r)
+		// A text block of its own, beside the result — not inside the
+		// structured content, which an older conversation checks
+		// against the schema it began with.
+		note := "server_version: " + Version
+		if called != Version {
+			from := "an earlier version"
+			if called != "" {
+				from = called
+			}
+			note += "\nNOTICE: this conversation is using whatskept tools from " + from +
+				", but whatskept has been updated to " + Version + ". The result above is valid. " +
+				"Tell the user, once in this conversation: whatskept was updated; to use the " +
+				"update, reconnect the whatskept connector and start a new conversation."
+		}
+		r.Content = append(r.Content, &mcp.TextContent{Text: note})
 		return r, nil
 	}
 }
 
-// stampVersion adds the version as a text block of its own, beside the
-// result — not inside the structured content, which an older
-// conversation checks against the schema it began with.
-func stampVersion(r *mcp.CallToolResult) {
-	r.Content = append(r.Content, &mcp.TextContent{Text: "server_version: " + Version})
+// takeToolsVersion removes tools_version from a call's arguments and
+// returns it — "" when the call carries none.
+func takeToolsVersion(p *mcp.CallToolParamsRaw) string {
+	var args map[string]json.RawMessage
+	if p == nil || json.Unmarshal(p.Arguments, &args) != nil {
+		return ""
+	}
+	raw, ok := args[toolsVersionArg]
+	if !ok {
+		return ""
+	}
+	delete(args, toolsVersionArg)
+	p.Arguments, _ = json.Marshal(args)
+	var v string
+	json.Unmarshal(raw, &v)
+	return v
+}
+
+// advertiseToolsVersion returns the tool list with tools_version added
+// to every input schema, as a required argument.
+func advertiseToolsVersion(list *mcp.ListToolsResult) *mcp.ListToolsResult {
+	out := *list
+	out.Tools = make([]*mcp.Tool, len(list.Tools))
+	for i, t := range list.Tools {
+		tool := *t
+		var schema map[string]any
+		raw, _ := json.Marshal(t.InputSchema)
+		json.Unmarshal(raw, &schema)
+		props, _ := schema["properties"].(map[string]any)
+		if props == nil {
+			props = map[string]any{}
+		}
+		props[toolsVersionArg] = map[string]any{
+			"type": "string", "enum": []string{Version},
+			"description": "always pass exactly " + Version,
+		}
+		schema["properties"] = props
+		required, _ := schema["required"].([]any)
+		schema["required"] = append(required, toolsVersionArg)
+		tool.InputSchema = schema
+		out.Tools[i] = &tool
+	}
+	return &out
 }
 
 func resultText(r *mcp.CallToolResult) string {

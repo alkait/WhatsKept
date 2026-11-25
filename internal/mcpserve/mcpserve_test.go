@@ -729,32 +729,54 @@ func TestVersion(t *testing.T) {
 		t.Errorf("server version = %q", init.ServerInfo.Version)
 	}
 
+	// Every tool is advertised with tools_version, required, and
+	// output schemas don't refuse fields a later release adds.
+	tools, err := sess.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		in, _ := json.Marshal(tool.InputSchema)
+		if !strings.Contains(string(in), `"enum":["v9.9.9"]`) || !strings.Contains(string(in), `"tools_version"]`) {
+			t.Errorf("%s input schema doesn't require tools_version: %s", tool.Name, in)
+		}
+		raw, _ := json.Marshal(tool.OutputSchema)
+		if strings.Contains(string(raw), `"additionalProperties":false`) {
+			t.Errorf("%s output schema refuses extra fields: %s", tool.Name, raw)
+		}
+	}
+
+	// A call from the current tool list: the version, no notice, and
+	// nothing added to the structured content.
 	var out queryOut
-	res := call(t, sess, "query", map[string]any{"sql": "SELECT 1"}, &out)
+	res := call(t, sess, "query", map[string]any{"sql": "SELECT 1", "tools_version": "v9.9.9"}, &out)
 	if len(out.Rows) != 1 {
 		t.Errorf("structured = %+v", out)
 	}
 	if !strings.HasSuffix(errText(res), "server_version: v9.9.9") {
 		t.Errorf("text = %q", errText(res))
 	}
-	if sc, _ := json.Marshal(res.StructuredContent); strings.Contains(string(sc), "server_version") {
-		t.Errorf("version leaked into structured content: %v", res.StructuredContent)
+	if sc, _ := json.Marshal(res.StructuredContent); strings.Contains(string(sc), "version") {
+		t.Errorf("version leaked into structured content: %s", sc)
 	}
 
-	// A conversation that began with an older release checks results
-	// against the schema it got then: extra fields must not be refused.
-	tools, err := sess.ListTools(context.Background(), nil)
-	if err != nil {
-		t.Fatal(err)
+	// A call from an older tool list — an older value, or none — is
+	// served, with the notice.
+	for args, from := range map[string]string{"v9.9.8": "tools from v9.9.8", "": "tools from an earlier version"} {
+		in := map[string]any{"sql": "SELECT 1"}
+		if args != "" {
+			in["tools_version"] = args
+		}
+		res := call(t, sess, "query", in, &out)
+		text := errText(res)
+		if res.IsError || !strings.Contains(text, "NOTICE") || !strings.Contains(text, from) ||
+			!strings.Contains(text, "updated to v9.9.9") {
+			t.Errorf("tools_version %q: %q", args, text)
+		}
 	}
-	for _, tool := range tools.Tools {
-		if !strings.HasSuffix(tool.Description, "(whatskept v9.9.9)") {
-			t.Errorf("%s description doesn't name the version: %q", tool.Name, tool.Description)
-		}
-		raw, _ := json.Marshal(tool.OutputSchema)
-		if strings.Contains(string(raw), `"additionalProperties":false`) {
-			t.Errorf("%s output schema refuses extra fields: %s", tool.Name, raw)
-		}
+	// get_schema takes no other argument.
+	if res := call(t, sess, "get_schema", map[string]any{"tools_version": "v9.9.9"}, nil); res.IsError || strings.Contains(errText(res), "NOTICE") {
+		t.Errorf("get_schema: %q", errText(res))
 	}
 }
 
