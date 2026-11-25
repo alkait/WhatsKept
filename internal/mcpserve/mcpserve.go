@@ -156,7 +156,7 @@ func newMCPServer(dbPath string) *mcp.Server {
 		Name: "get_schema",
 		Description: "Return the database schema: every CREATE TABLE / CREATE VIEW / " +
 			"CREATE VIRTUAL TABLE statement. Call this once before writing SQL — the " +
-			"views (v_messages, v_chats, messages_fts, ...) are the intended query surface.",
+			"views (v_messages, v_chats, v_lists, messages_fts, ...) are the intended query surface.",
 	}, s.getSchema)
 	addTool(mcpServer, &mcp.Tool{
 		Name: "query",
