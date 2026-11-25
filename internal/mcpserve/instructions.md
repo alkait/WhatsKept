@@ -17,11 +17,14 @@ the three query tools:
 
 ## Version: tell the user when these tools are out of date
 
-Every tool result ends with a `server_version: …` line. If it differs from
-{{version}}, whatskept was updated after this conversation began and
-the tools and instructions here are out of date: tell the user, once,
-to reconnect the whatskept connector and start a new conversation.
-Carry on with the tools you have meanwhile.
+Three things name a whatskept version: the line above ({{version}}),
+the end of every whatskept tool description — `(whatskept {{version}})`
+— and the `server_version: …` line ending every tool result. If a tool
+description lacks its version or names another, or a result's
+`server_version` differs from {{version}}, whatskept was updated and
+this conversation's tools or instructions are out of date: tell the
+user, once, to reconnect the whatskept connector and start a new
+conversation. Carry on with the tools you have meanwhile.
 
 ## Bulk operations: pace them
 

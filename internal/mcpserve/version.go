@@ -39,6 +39,9 @@ func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, O
 	}
 	allowExtraFields(schema)
 	t.OutputSchema = schema
+	// A client may keep its tool list longer than its instructions, so
+	// each description names the version it came from too.
+	t.Description += " (whatskept " + Version + ")"
 	mcp.AddTool(s, t, h)
 }
 

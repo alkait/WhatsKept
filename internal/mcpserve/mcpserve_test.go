@@ -748,6 +748,9 @@ func TestVersion(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tool := range tools.Tools {
+		if !strings.HasSuffix(tool.Description, "(whatskept v9.9.9)") {
+			t.Errorf("%s description doesn't name the version: %q", tool.Name, tool.Description)
+		}
 		raw, _ := json.Marshal(tool.OutputSchema)
 		if strings.Contains(string(raw), `"additionalProperties":false`) {
 			t.Errorf("%s output schema refuses extra fields: %s", tool.Name, raw)
