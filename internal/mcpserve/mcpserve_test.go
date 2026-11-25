@@ -792,13 +792,13 @@ func TestStaleCalls(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
-		if !res.IsError || !strings.Contains(errText(res), "reconnect the whatskept connector and start a new conversation") {
+		if !res.IsError || !strings.Contains(errText(res), "start a new conversation to use the update") {
 			t.Errorf("%s: %q", name, errText(res))
 		}
 	}
 	// An ordinary failure is not mistaken for staleness.
 	res := call(t, sess, "query", map[string]any{"sql": "SELECT nope FROM nowhere"}, nil)
-	if !res.IsError || strings.Contains(errText(res), "reconnect") {
+	if !res.IsError || strings.Contains(errText(res), "new conversation") {
 		t.Errorf("plain error = %q", errText(res))
 	}
 }

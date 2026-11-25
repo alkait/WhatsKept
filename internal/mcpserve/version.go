@@ -64,11 +64,18 @@ func allowExtraFields(s *jsonschema.Schema) {
 	allowExtraFields(s.Items)
 }
 
+// howToUpdate is what a user does about a conversation on older
+// tools. claude.ai hands new conversations a saved tool list that
+// catches up minutes after an upgrade, sooner once the connector's
+// tool list is refreshed.
+const howToUpdate = "start a new conversation to use the update; if a new conversation says this too, " +
+	"refresh the whatskept connector's tool list (or reconnect it) and start another in a few minutes."
+
 // staleTools is the advice for a call the running server no longer
 // accepts.
 func staleTools() string {
 	return "this conversation's whatskept tools are out of date — the server is now " + Version +
-		". Tell the user to reconnect the whatskept connector and start a new conversation."
+		". Tell the user to " + howToUpdate
 }
 
 // versionMiddleware advertises tools_version on every tool, takes it
@@ -118,8 +125,7 @@ func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 			}
 			note += "\nNOTICE: this conversation is using whatskept tools from " + from +
 				", but whatskept has been updated to " + Version + ". The result above is valid. " +
-				"Tell the user, once in this conversation: whatskept was updated; to use the " +
-				"update, reconnect the whatskept connector and start a new conversation."
+				"Tell the user, once in this conversation: whatskept was updated; " + howToUpdate
 		}
 		r.Content = append(r.Content, &mcp.TextContent{Text: note})
 		return r, nil
