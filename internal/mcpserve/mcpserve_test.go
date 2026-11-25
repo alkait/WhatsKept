@@ -802,3 +802,46 @@ func TestStaleCalls(t *testing.T) {
 		t.Errorf("plain error = %q", errText(res))
 	}
 }
+
+// TestNewerRelease: while GitHub reports a later release than the one
+// running, every result says so; an equal, older or unreadable one —
+// or a failed check — says nothing.
+func TestNewerRelease(t *testing.T) {
+	oldVersion, oldURL := Version, releaseURL
+	Version = "v0.1.9"
+	tag := "v0.1.10"
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if tag == "" {
+			http.Error(w, "rate limited", http.StatusForbidden)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]string{"tag_name": tag})
+	}))
+	releaseURL = gh.URL
+	t.Cleanup(func() {
+		Version, releaseURL = oldVersion, oldURL
+		latestRelease.Store("")
+		gh.Close()
+	})
+	sess := connect(t, writeFixtureDB(t))
+	args := map[string]any{"sql": "SELECT 1", "tools_version": "v0.1.9"}
+
+	checkRelease(context.Background())
+	text := errText(call(t, sess, "query", args, nil))
+	if !strings.Contains(text, "NOTICE: whatskept v0.1.10 is available; this server runs v0.1.9") {
+		t.Errorf("newer release: %q", text)
+	}
+	// A failed check keeps what was last known.
+	tag = ""
+	checkRelease(context.Background())
+	if newerRelease() != "v0.1.10" {
+		t.Errorf("failed check forgot the release: %q", newerRelease())
+	}
+	for _, same := range []string{"v0.1.9", "v0.1.8", "nightly"} {
+		tag = same
+		checkRelease(context.Background())
+		if text := errText(call(t, sess, "query", args, nil)); strings.Contains(text, "NOTICE") {
+			t.Errorf("release %s: %q", same, text)
+		}
+	}
+}

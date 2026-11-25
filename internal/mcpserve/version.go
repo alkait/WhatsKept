@@ -127,6 +127,10 @@ func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 				", but whatskept has been updated to " + Version + ". The result above is valid. " +
 				"Tell the user, once in this conversation: whatskept was updated; " + howToUpdate
 		}
+		if latest := newerRelease(); latest != "" {
+			note += "\nNOTICE: whatskept " + latest + " is available; this server runs " + Version +
+				". Tell the user, once in this conversation, to update whatskept where it is installed."
+		}
 		r.Content = append(r.Content, &mcp.TextContent{Text: note})
 		return r, nil
 	}

@@ -45,6 +45,11 @@ SQLite database, etc.) sits at the workspace root. Secrets come from
   `--stdio`, for clients that launch it). Read-only, plus `send`,
   `archive`, `read` and `list` tools that hand off to the live running
   beside the database.
+  Every tool result ends with the serving version, plus a notice for
+  the agent to pass on when the call came from an older tool list
+  (each tool carries a required `tools_version` argument naming the
+  release) or when GitHub lists a newer release (checked at start and
+  hourly; release builds only).
 
 Enrichment (image descriptions/OCR, voice transcripts, PDF text) runs via
 OpenRouter on both import and live paths. Media, PDFs and voice files are

@@ -81,6 +81,7 @@ func Serve(ctx context.Context, dbPath, addr, token string) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
+	go watchReleases(ctx)
 	errCh := make(chan error, 1)
 	go func() { errCh <- httpServer.ListenAndServe() }()
 	// The token is never printed — logs are not a place for secrets.
@@ -113,6 +114,7 @@ func ServeStdio(ctx context.Context, dbPath string) error {
 	fmt.Fprintln(os.Stderr, "MCP over stdio")
 	fmt.Fprintf(os.Stderr, "Database:      %s\n", dbState)
 	fmt.Fprintf(os.Stderr, "Version:       %s\n", Version)
+	go watchReleases(ctx)
 	return newMCPServer(dbPath).Run(ctx, &mcp.StdioTransport{})
 }
 

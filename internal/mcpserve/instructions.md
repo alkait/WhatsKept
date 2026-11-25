@@ -15,11 +15,12 @@ the three query tools:
 - `search` — full-text search across every text surface. Reach for this
   first on any "did anyone mention / send / talk about X" question.
 
-## Version: tell the user when these tools are out of date
+## Version: pass on update notices
 
 Every tool takes `tools_version`: always pass the value its schema
-names. When a result ends with a `NOTICE:` line saying whatskept has
-been updated, tell the user what it says, once in the conversation,
+names. A result may end with `NOTICE:` lines — this conversation's
+tools are older than the server, or a newer whatskept release is
+available. Tell the user what each says, once in the conversation,
 and carry on with the tools you have.
 
 ## Bulk operations: pace them
