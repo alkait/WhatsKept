@@ -1,5 +1,7 @@
 # WhatsApp history — query surface
 
+This conversation began with whatskept {{version}}.
+
 You are connected to a read-only SQLite copy of the user's WhatsApp
 history (seeded from an iOS backup and kept current by live capture),
 with SQL views, an FTS5 index, and — once enrichment has run — image,
@@ -12,6 +14,14 @@ the three query tools:
 - `query` — arbitrary read-only SQL. Writes are blocked server-side.
 - `search` — full-text search across every text surface. Reach for this
   first on any "did anyone mention / send / talk about X" question.
+
+## Version: tell the user when these tools are out of date
+
+Every tool result carries `server_version`. If it differs from
+{{version}}, whatskept was updated after this conversation began and
+the tools and instructions here are out of date: tell the user, once,
+to reconnect the whatskept connector and start a new conversation.
+Carry on with the tools you have meanwhile.
 
 ## Bulk operations: pace them
 

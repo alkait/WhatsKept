@@ -712,3 +712,55 @@ func TestListWithoutLive(t *testing.T) {
 		t.Errorf("want not-running error, got %q", errText(res))
 	}
 }
+
+// TestVersion: the instructions name the version the conversation
+// began with, and every result carries the version serving it.
+func TestVersion(t *testing.T) {
+	old := Version
+	Version = "v9.9.9"
+	t.Cleanup(func() { Version = old })
+	sess := connect(t, writeFixtureDB(t))
+
+	init := sess.InitializeResult()
+	if !strings.Contains(init.Instructions, "began with whatskept v9.9.9") {
+		t.Errorf("instructions don't name the version")
+	}
+	if init.ServerInfo.Version != "v9.9.9" {
+		t.Errorf("server version = %q", init.ServerInfo.Version)
+	}
+
+	var out struct {
+		ServerVersion string `json:"server_version"`
+		Rows          [][]any
+	}
+	res := call(t, sess, "query", map[string]any{"sql": "SELECT 1"}, &out)
+	if out.ServerVersion != "v9.9.9" || len(out.Rows) != 1 {
+		t.Errorf("structured = %+v", out)
+	}
+	if !strings.Contains(errText(res), `"server_version":"v9.9.9"`) {
+		t.Errorf("text = %q", errText(res))
+	}
+}
+
+// TestStaleCalls: a call made with an older tool list — a tool that
+// is gone, or an argument that is — gets the reconnect advice.
+func TestStaleCalls(t *testing.T) {
+	sess := connect(t, writeFixtureDB(t))
+	for name, args := range map[string]map[string]any{
+		"gone_tool": {},
+		"query":     {"sql": "SELECT 1", "gone_arg": true},
+	} {
+		res, err := sess.CallTool(context.Background(), &mcp.CallToolParams{Name: name, Arguments: args})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !res.IsError || !strings.Contains(errText(res), "reconnect the whatskept connector and start a new conversation") {
+			t.Errorf("%s: %q", name, errText(res))
+		}
+	}
+	// An ordinary failure is not mistaken for staleness.
+	res := call(t, sess, "query", map[string]any{"sql": "SELECT nope FROM nowhere"}, nil)
+	if !res.IsError || strings.Contains(errText(res), "reconnect") {
+		t.Errorf("plain error = %q", errText(res))
+	}
+}

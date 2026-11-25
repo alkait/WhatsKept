@@ -33,6 +33,7 @@ func runMCP(args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	mcpserve.Version = version
 	if *stdio {
 		return mcpserve.ServeStdio(ctx, *database)
 	}

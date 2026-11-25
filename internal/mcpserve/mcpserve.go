@@ -86,6 +86,7 @@ func Serve(ctx context.Context, dbPath, addr, token string) error {
 	// The token is never printed — logs are not a place for secrets.
 	fmt.Printf("MCP endpoint:  http://%s/mcp (send header `Authorization: Bearer $%s`, or connect with OAuth and approve with it)\n", addr, TokenEnv)
 	fmt.Printf("Database:      %s\n", dbState)
+	fmt.Printf("Version:       %s\n", Version)
 
 	select {
 	case <-ctx.Done():
@@ -111,6 +112,7 @@ func ServeStdio(ctx context.Context, dbPath string) error {
 	}
 	fmt.Fprintln(os.Stderr, "MCP over stdio")
 	fmt.Fprintf(os.Stderr, "Database:      %s\n", dbState)
+	fmt.Fprintf(os.Stderr, "Version:       %s\n", Version)
 	return newMCPServer(dbPath).Run(ctx, &mcp.StdioTransport{})
 }
 
@@ -146,29 +148,30 @@ func newMCPServer(dbPath string) *mcp.Server {
 	s := &server{dbPath: dbPath}
 
 	mcpServer := mcp.NewServer(
-		&mcp.Implementation{Name: "whatskept", Title: "WhatsKept", Version: "dev"},
-		&mcp.ServerOptions{Instructions: instructions},
+		&mcp.Implementation{Name: "whatskept", Title: "WhatsKept", Version: Version},
+		&mcp.ServerOptions{Instructions: versionedInstructions()},
 	)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	mcpServer.AddReceivingMiddleware(versionMiddleware)
+	addTool(mcpServer, &mcp.Tool{
 		Name: "get_schema",
 		Description: "Return the database schema: every CREATE TABLE / CREATE VIEW / " +
 			"CREATE VIRTUAL TABLE statement. Call this once before writing SQL — the " +
 			"views (v_messages, v_chats, messages_fts, ...) are the intended query surface.",
 	}, s.getSchema)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "query",
 		Description: "Run a read-only SQL statement against the WhatsApp workspace database " +
 			"and return rows as JSON. Writes are blocked at the connection level. Always " +
 			"aggregate or LIMIT; results are capped at " + fmt.Sprint(maxRowCap) + " rows.",
 	}, s.query)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "search",
 		Description: "Full-text search across ALL surfaces — typed messages, image OCR and " +
 			"descriptions, voice-note transcripts, document filenames and PDF body text. " +
 			"FTS5 syntax: \"exact phrase\", AND, OR, NOT, NEAR/3, prefix*. Use this first " +
 			"for any 'did anyone mention X' question; fall back to query for joins and aggregates.",
 	}, s.search)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "send",
 		Description: "Send a WhatsApp text message from the user's own account, or forward one. " +
 			"`to` is a phone number in international format or a chat JID (v_chats.jid — the only " +
@@ -178,7 +181,7 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"seen by real people: send only what the user explicitly asked for, to the chat they " +
 			"named. Needs `whatskept live` running.",
 	}, s.send)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "archive",
 		Description: "Archive a WhatsApp chat in the user's own account, or with `undo` unarchive it — " +
 			"on their phone and every linked device. `chat` is a phone number in international format " +
@@ -186,7 +189,7 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"v_chats. Seen by nobody else and reversible, but it changes the user's chat list: archive " +
 			"only the chats the user asked for. Needs `whatskept live` running.",
 	}, s.archive)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "read",
 		Description: "Mark a WhatsApp chat as read in the user's own account, or with `undo` as unread — " +
 			"clears (or sets) the unread badge on their phone and every linked device. No read receipts " +
@@ -195,7 +198,7 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"v_chats.unread reflects the change at once. " +
 			"Mark only the chats the user asked for. Needs `whatskept live` running.",
 	}, s.read)
-	mcp.AddTool(mcpServer, &mcp.Tool{
+	addTool(mcpServer, &mcp.Tool{
 		Name: "list",
 		Description: "Change the user's chat lists — the filters at the top of their WhatsApp chat list — " +
 			"on their phone and every linked device. `op` is create (`name`), rename (`list`, `name`), " +
