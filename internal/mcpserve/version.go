@@ -2,9 +2,7 @@ package mcpserve
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"strconv"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -20,7 +18,7 @@ var Version = "dev"
 // conversation began, so a conversation that outlives an upgrade talks
 // to the new server with the old tools. Two signals let the agent tell
 // the user: the instructions name the version the conversation began
-// with, and every tool result carries the version serving it — the
+// with, and every tool result ends with the version serving it — the
 // instructions ask the agent to compare them. A call the new server no
 // longer accepts gets the same advice as its error.
 
@@ -30,20 +28,34 @@ func versionedInstructions() string {
 	return strings.ReplaceAll(instructions, "{{version}}", Version)
 }
 
-// addTool registers a tool whose output schema also allows the
-// server_version field stampVersion adds to every result.
+// addTool registers a tool whose output schema allows fields it does
+// not name: a client checks results against the schema it got when its
+// conversation began, so a field a later release adds must not make an
+// older conversation reject every result.
 func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h mcp.ToolHandlerFor[In, Out]) {
 	schema, err := jsonschema.For[Out](nil)
 	if err != nil {
 		panic(err)
 	}
-	if schema.Properties == nil {
-		schema.Properties = map[string]*jsonschema.Schema{}
-	}
-	schema.Properties["server_version"] = &jsonschema.Schema{Type: "string",
-		Description: "the whatskept version serving this call"}
+	allowExtraFields(schema)
 	t.OutputSchema = schema
 	mcp.AddTool(s, t, h)
+}
+
+// allowExtraFields lifts additionalProperties: false throughout a
+// schema.
+func allowExtraFields(s *jsonschema.Schema) {
+	if s == nil {
+		return
+	}
+	s.AdditionalProperties = nil
+	for _, p := range s.Properties {
+		allowExtraFields(p)
+	}
+	for _, d := range s.Defs {
+		allowExtraFields(d)
+	}
+	allowExtraFields(s.Items)
 }
 
 // staleTools is the advice for a call the running server no longer
@@ -53,7 +65,7 @@ func staleTools() string {
 		". Tell the user to reconnect the whatskept connector and start a new conversation."
 }
 
-// versionMiddleware stamps server_version on every successful tool
+// versionMiddleware stamps the version on every successful tool
 // result and turns calls to removed tools, or with arguments the
 // current tools reject, into the reconnect advice.
 func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
@@ -85,25 +97,11 @@ func versionMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
-// stampVersion adds server_version to a result's structured content
-// and the JSON text mirroring it.
+// stampVersion adds the version as a text block of its own, beside the
+// result — not inside the structured content, which an older
+// conversation checks against the schema it began with.
 func stampVersion(r *mcp.CallToolResult) {
-	raw, ok := r.StructuredContent.(json.RawMessage)
-	if !ok || len(raw) < 2 || raw[0] != '{' {
-		return
-	}
-	field := `"server_version":` + strconv.Quote(Version)
-	rest := strings.TrimSpace(string(raw[1:]))
-	if rest != "}" {
-		field += ","
-	}
-	stamped := json.RawMessage("{" + field + rest)
-	r.StructuredContent = stamped
-	if len(r.Content) == 1 {
-		if tc, ok := r.Content[0].(*mcp.TextContent); ok && tc.Text == string(raw) {
-			r.Content = []mcp.Content{&mcp.TextContent{Text: string(stamped)}}
-		}
-	}
+	r.Content = append(r.Content, &mcp.TextContent{Text: "server_version: " + Version})
 }
 
 func resultText(r *mcp.CallToolResult) string {

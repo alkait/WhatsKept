@@ -729,16 +729,29 @@ func TestVersion(t *testing.T) {
 		t.Errorf("server version = %q", init.ServerInfo.Version)
 	}
 
-	var out struct {
-		ServerVersion string `json:"server_version"`
-		Rows          [][]any
-	}
+	var out queryOut
 	res := call(t, sess, "query", map[string]any{"sql": "SELECT 1"}, &out)
-	if out.ServerVersion != "v9.9.9" || len(out.Rows) != 1 {
+	if len(out.Rows) != 1 {
 		t.Errorf("structured = %+v", out)
 	}
-	if !strings.Contains(errText(res), `"server_version":"v9.9.9"`) {
+	if !strings.HasSuffix(errText(res), "server_version: v9.9.9") {
 		t.Errorf("text = %q", errText(res))
+	}
+	if sc, _ := json.Marshal(res.StructuredContent); strings.Contains(string(sc), "server_version") {
+		t.Errorf("version leaked into structured content: %v", res.StructuredContent)
+	}
+
+	// A conversation that began with an older release checks results
+	// against the schema it got then: extra fields must not be refused.
+	tools, err := sess.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tools.Tools {
+		raw, _ := json.Marshal(tool.OutputSchema)
+		if strings.Contains(string(raw), `"additionalProperties":false`) {
+			t.Errorf("%s output schema refuses extra fields: %s", tool.Name, raw)
+		}
 	}
 }
 

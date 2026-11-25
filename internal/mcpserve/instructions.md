@@ -17,7 +17,7 @@ the three query tools:
 
 ## Version: tell the user when these tools are out of date
 
-Every tool result carries `server_version`. If it differs from
+Every tool result ends with a `server_version: …` line. If it differs from
 {{version}}, whatskept was updated after this conversation began and
 the tools and instructions here are out of date: tell the user, once,
 to reconnect the whatskept connector and start a new conversation.
