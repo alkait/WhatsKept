@@ -423,7 +423,7 @@ func TestCLIMCPStdio(t *testing.T) {
 	for _, tool := range tools {
 		names = append(names, tool.(map[string]any)["name"].(string))
 	}
-	if got, want := strings.Join(names, ","), "archive,get_schema,list,query,read,search,send"; got != want {
+	if got, want := strings.Join(names, ","), "archive,get_schema,list,ping,query,read,search,send"; got != want {
 		t.Errorf("tools = %s, want %s", got, want)
 	}
 }

@@ -210,8 +210,20 @@ func newMCPServer(dbPath string) *mcp.Server {
 			"v_lists and v_list_chats reflect the change at once. Seen by nobody else, but it changes " +
 			"the user's lists: change only what the user asked for. Needs `whatskept live` running.",
 	}, s.list)
+	// TEMPORARY — exists only to test how a client picks up a tool a
+	// release adds; remove it in the release after.
+	addTool(mcpServer, &mcp.Tool{
+		Name:        "ping",
+		Description: "Temporary test tool: returns \"pong\". Call it only when the user asks for a ping.",
+	}, func(context.Context, *mcp.CallToolRequest, any) (*mcp.CallToolResult, pingOut, error) {
+		return nil, pingOut{Reply: "pong"}, nil
+	})
 
 	return mcpServer
+}
+
+type pingOut struct {
+	Reply string `json:"reply"`
 }
 
 // openDB opens the database read-only for a single tool call. The
