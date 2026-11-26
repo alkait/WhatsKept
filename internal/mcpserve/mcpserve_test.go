@@ -646,7 +646,7 @@ func TestHTTPProtocolVersions(t *testing.T) {
 	if status != 200 || res["protocolVersion"] != "2025-06-18" {
 		t.Errorf("initialize: %d protocolVersion=%v", status, res["protocolVersion"])
 	}
-	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 8 {
+	if status, res := rpc("2025-06-18", "tools/list", 2, map[string]any{}); status != 200 || len(toolNames(res)) != 7 {
 		t.Errorf("2025-06-18 tools/list: %d %v", status, toolNames(res))
 	}
 }
